@@ -1,0 +1,135 @@
+<p align="center">
+  <img src="assets/logo.png" alt="uGDS Logo" width="500">
+</p>
+
+<p align="center">
+  <b>User-Space GPU Direct Storage Development Kit</b>
+</p>
+
+<p align="center">
+  uGDS is a user-space GPU Direct Storage library where the CPU constructs NVMe commands and the SSD DMAs data directly to/from GPU memory over PCIe, bypassing the kernel NVMe driver. With a GDS-compatible API, uGDS achieves up to 5.3x higher bandwidth and 108x lower 4KB latency (5.2μs vs 561μs) compared to NVIDIA GDS.
+</p>
+
+---
+
+## Key Features
+
+- **User-space IO stack** — bypasses the kernel NVMe driver and filesystem entirely; CPU builds NVMe commands and polls completions in user space
+- **cuFile API compatible** — existing GDS applications work with minimal changes (relink to `libugds.so`, change `cuFile` prefix to `uGDS`)
+- **Fully open-source** — BSD 3-Clause licensed; no proprietary runtime dependencies beyond the NVIDIA GPU driver
+- **High performance** — busy-poll CQ completion with `_mm_pause()`, multi-queue round-robin IO, achieving up to 2.7x read and 28x write bandwidth over NVIDIA GDS
+
+## Architecture
+
+```
+┌──────────────┐
+│  Application │    uGDSRead / uGDSWrite
+└──────┬───────┘
+       │
+┌──────▼───────┐
+│  libugds.so  │    NVMe command construction + SQ/CQ management
+└──────┬───────┘
+       │          DMA: SSD ←→ GPU memory (P2P over PCIe)
+┌──────▼───────┐
+│  ugds_drv.ko │    PCI BAR mapping + GPU page pinning
+└──────┬───────┘
+       │
+┌──────▼───────┐
+│   NVMe SSD   │
+└──────────────┘
+```
+
+No kernel NVMe driver, no page cache — the CPU only touches doorbell registers and completion queue entries.
+
+## Performance
+
+16-thread sequential read bandwidth on A100-40GB + Samsung 990 PRO (PCIe Gen4 x4):
+
+![Sequential Read: GDS vs uGDS](assets/ugds_vs_gds_16t_read.png)
+
+![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_16t_write.png)
+
+uGDS bypasses the kernel NVMe driver, achieving up to **2.7x** higher read bandwidth and **28x** higher write bandwidth than NVIDIA GDS at small IO sizes.
+
+## Quick Start
+
+```cpp
+#include <ugds.h>
+#include <cuda_runtime.h>
+
+// 1. Initialize
+uGDSDriverOpen();
+
+// 2. Register device handle
+int fd = open("/dev/ugds_drv0", O_RDWR);
+uGDSDescr_t desc = {.type = UGDS_HANDLE_TYPE_OPAQUE_FD, .handle.fd = fd};
+uGDSHandle_t fh;
+uGDSHandleRegister(&fh, &desc);
+
+// 3. Allocate and register GPU buffer
+void* gpu_buf;
+cudaMalloc(&gpu_buf, 4096);
+uGDSBufRegister(gpu_buf, 4096, 0);
+
+// 4. Direct GPU ←→ SSD transfer
+uGDSWrite(fh, gpu_buf, 4096, /*file_offset=*/0, /*buf_offset=*/0);
+uGDSRead(fh, gpu_buf, 4096, /*file_offset=*/0, /*buf_offset=*/0);
+
+// 5. Cleanup
+uGDSBufDeregister(gpu_buf);
+uGDSHandleDeregister(fh);
+uGDSDriverClose();
+```
+
+See [examples/01_basic_read_write.cu](examples/01_basic_read_write.cu) for a complete working example.
+
+For build instructions, environment setup, and driver management, see the **[Installation Guide](docs/installation.md)**.
+
+## Testing
+
+```bash
+# Run functional tests only
+scripts/run_tests.sh functional
+
+# Run uGDS performance benchmark
+scripts/run_tests.sh perf
+
+# Run uGDS vs GDS comparison (auto-switches driver mode)
+scripts/run_tests.sh compare
+
+# Run all (functional + comparison)
+scripts/run_tests.sh all
+```
+
+## API Coverage
+
+| API | Status | Notes |
+|-----|:------:|-------|
+| `uGDSDriverOpen / Close` | ✅ | |
+| `uGDSHandleRegister / Deregister` | ✅ | Block device fd (no filesystem) |
+| `uGDSBufRegister / Deregister` | ✅ | GPU memory only |
+| `uGDSRead / Write` | ✅ | Synchronous, block-aligned |
+| `uGDSBatchIOSetUp / Submit / GetStatus` | 🔜 | Batch doorbell optimization |
+| `uGDSReadAsync / WriteAsync` | 🔜 | CUDA stream integration |
+
+## Roadmap
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 1 | Core synchronous API + test suite | ✅ |
+| 2 | Batch IO API (multi-command doorbell) | 🔜 |
+| 3 | Async Stream API (CUDA stream integration) | 🔜 |
+| 4 | Hugepage support (larger QP depth) | 🔜 |
+| 5 | SGL support (scatter-gather lists) | 🔜 |
+| 6 | Interrupt mode (MSI-X + eventfd) | 🔜 |
+| 7 | Filesystem compatibility (POSIX file path support) | 🔜 |
+
+## References
+
+- [ssd-gpu-dma](https://github.com/enfiskutensykkel/ssd-gpu-dma) — User-space NVMe driver with GPU support
+- [BaM](https://github.com/ZaidQureshi/bam) — Big accelerator Memory, GPU-orchestrated NVMe access
+- [Phoenix](https://github.com/xPU-IO/phoenix) — GPU Direct Storage Optimization
+
+## License
+
+BSD 3-Clause License. See [LICENSE](LICENSE).

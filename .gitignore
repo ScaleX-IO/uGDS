@@ -1,0 +1,12 @@
+build/
+cufile.log
+
+# Kernel module build artifacts
+drv/*.o
+drv/*.ko
+drv/*.mod
+drv/*.mod.c
+drv/*.order
+drv/*.symvers
+drv/.*.cmd
+drv/.tmp_versions/
