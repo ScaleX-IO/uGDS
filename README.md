@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  uGDS is a user-space GPU Direct Storage library where the CPU constructs NVMe commands and the SSD DMAs data directly to/from GPU memory over PCIe, bypassing the kernel NVMe driver. With a GDS-compatible API, uGDS achieves up to 5.3x higher bandwidth and 108x lower 4KB latency (5.2μs vs 561μs) compared to NVIDIA GDS.
+  uGDS is the first production-oriented user-space GPU Direct Storage library where the CPU constructs NVMe commands and the SSD DMAs data directly to/from GPU memory over PCIe, bypassing the kernel NVMe driver. With a GDS-compatible API, uGDS achieves up to 5.3x higher bandwidth and 108x lower 4KB latency (5.2μs vs 561μs) compared to NVIDIA GDS.
 </p>
 
 ---
@@ -129,6 +129,11 @@ scripts/run_tests.sh all
 - [ssd-gpu-dma](https://github.com/enfiskutensykkel/ssd-gpu-dma) — User-space NVMe driver with GPU support
 - [BaM](https://github.com/ZaidQureshi/bam) — Big accelerator Memory, GPU-orchestrated NVMe access
 - [Phoenix](https://github.com/xPU-IO/phoenix) — GPU Direct Storage Optimization
+
+## Contact
+
+- Guanyi Chen — felixlinker02@gmail.com — [chengy-sysu.github.io](https://chengy-sysu.github.io)
+- Jian Zhang — jianz@hkust-gz.edu.cn — [sosp.dev](https://sosp.dev)
 
 ## License
 
