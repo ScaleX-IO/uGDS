@@ -287,8 +287,7 @@ static void run_ugds_bench(BenchOpts& opts) {
 
     uint64_t prog_time_ns = ts_diff_ns(prog_start, prog_end);
 
-    int report_depth = opts.is_batch ? 1 : opts.io_depth;
-    report_results(label, threads, opts.io_size, report_depth, prog_time_ns, opts.json);
+    report_results(label, threads, opts.io_size, prog_time_ns, opts.json);
 
     for (int i = 0; i < num_threads; i++) {
         uGDSBufDeregister(threads[i].gpu_buffer);

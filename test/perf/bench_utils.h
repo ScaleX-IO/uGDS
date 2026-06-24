@@ -58,7 +58,7 @@ static inline void get_percentile(std::vector<uint64_t>& vec, double p) {
 }
 
 static inline void report_results(const char* label, std::vector<ThreadData>& threads,
-                                  size_t io_size, int io_depth,
+                                  size_t io_size,
                                   uint64_t prog_time_ns, bool json) {
     uint64_t total_ops = 0;
     long long total_io_time = 0;
@@ -72,14 +72,13 @@ static inline void report_results(const char* label, std::vector<ThreadData>& th
 
     std::sort(all_lat.begin(), all_lat.end());
 
-    double bw_mbps = (total_ops * io_size * io_depth * 1.0 / MB) / (prog_time_ns / 1e9);
+    double bw_mbps = (total_ops * io_size * 1.0 / MB) / (prog_time_ns / 1e9);
     double avg_lat_us = total_ops > 0 ? (double)total_io_time / (total_ops * 1000.0) : 0;
 
     if (json) {
         printf("{\n");
         printf("  \"label\": \"%s\",\n", label);
         printf("  \"io_size\": %zu,\n", io_size);
-        printf("  \"io_depth\": %d,\n", io_depth);
         printf("  \"threads\": %zu,\n", threads.size());
         printf("  \"total_ops\": %llu,\n", (unsigned long long)total_ops);
         printf("  \"bandwidth_mbps\": %.2f,\n", bw_mbps);
@@ -95,7 +94,18 @@ static inline void report_results(const char* label, std::vector<ThreadData>& th
         printf("[%s]\n", label);
         printf("  Total IO operations: %llu\n", (unsigned long long)total_ops);
         printf("  Bandwidth: %.2f MB/s\n", bw_mbps);
-        printf("  Avg latency: %.2f us\n", avg_lat_us);
+        bool is_batched = (!all_lat.empty() && all_lat.size() != total_ops);
+        if (is_batched) {
+            printf("  Avg latency: %.2f us (amortized per-IO)\n", avg_lat_us);
+            size_t n_batches = all_lat.size();
+            double batch_avg_us = 0;
+            for (auto& l : all_lat) batch_avg_us += l;
+            batch_avg_us /= (n_batches * 1000.0);
+            printf("  Avg batch latency: %.2f us (%llu batches)\n",
+                   batch_avg_us, (unsigned long long)n_batches);
+        } else {
+            printf("  Avg latency: %.2f us\n", avg_lat_us);
+        }
         if (!all_lat.empty()) {
             get_percentile(all_lat, 0.50);
             get_percentile(all_lat, 0.95);
