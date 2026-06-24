@@ -15,6 +15,7 @@
 
 #include <mutex>
 #include <vector>
+#include <array>
 #include <memory>
 #include <atomic>
 #include <unordered_map>
@@ -23,6 +24,8 @@
 
 #define UGDS_DEFAULT_NUM_QPS     16
 #define UGDS_DEFAULT_QUEUE_DEPTH 64
+#define UGDS_MAX_BATCH_IO_SIZE   128
+#define UGDS_PRP_POOL_PAGES      16
 
 struct IOQueuePair {
     nvm_queue_t    sq;
@@ -61,6 +64,51 @@ struct DriverState {
 };
 
 extern DriverState g_driver;
+
+struct PRPPool {
+    nvm_dma_t*  dma       = nullptr;
+    void*       buf       = nullptr;
+    size_t      n_pages   = 0;
+    uint64_t    free_bitmap = 0;
+};
+
+struct CmdSlot {
+    uint16_t    io_idx      = 0;
+    size_t      chunk_bytes = 0;
+    uint16_t    prp_page_idx = UINT16_MAX;
+    bool        active      = false;
+};
+
+struct BatchIOEntry {
+    void*               cookie        = nullptr;
+    void*               devPtr_base   = nullptr;
+    off_t               file_offset   = 0;
+    off_t               devPtr_offset = 0;
+    size_t              size          = 0;
+    uint8_t             opcode        = 0;
+
+    uGDSBatchStatus_t   status        = UGDS_BATCH_WAITING;
+    ssize_t             bytes_done    = 0;
+    ssize_t             error_code    = 0;
+    uint16_t            n_cmds        = 0;
+    uint16_t            n_cmds_done   = 0;
+    bool                event_returned = false;
+};
+
+struct BatchState {
+    unsigned    capacity      = 0;
+    unsigned    n_entries     = 0;
+    unsigned    n_completed   = 0;
+    unsigned    n_events_read = 0;
+
+    std::vector<BatchIOEntry> entries;
+    std::vector<std::array<CmdSlot, UGDS_DEFAULT_QUEUE_DEPTH>> cmd_map;
+    std::vector<uint16_t> qp_in_flight;
+    std::vector<PRPPool>  prp_pools;
+
+    HandleState* hs = nullptr;
+    std::mutex   lock;
+};
 
 static inline uGDSError_t make_error(uGDSOpError err) {
     uGDSError_t e;

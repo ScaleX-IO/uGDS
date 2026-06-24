@@ -23,6 +23,7 @@ struct BenchOpts {
     int num_threads = 1;
     int io_depth = 1;
     bool is_write = false;
+    bool is_batch = false;
     bool json = false;
 };
 
@@ -139,7 +140,11 @@ static inline bool parse_bench_opts(int argc, char** argv, BenchOpts& opts) {
         case 'd': opts.gpu_id = atoi(optarg); break;
         case 't': opts.num_threads = atoi(optarg); break;
         case 'i': opts.io_depth = atoi(optarg); break;
-        case 'm': opts.is_write = (strcmp(optarg, "write") == 0); break;
+        case 'm':
+            if (strcmp(optarg, "write") == 0) { opts.is_write = true; }
+            else if (strcmp(optarg, "batch-read") == 0) { opts.is_batch = true; opts.is_write = false; }
+            else if (strcmp(optarg, "batch-write") == 0) { opts.is_batch = true; opts.is_write = true; }
+            break;
         case 'j': opts.json = true; break;
         case 'h':
         default:

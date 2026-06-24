@@ -110,7 +110,7 @@ scripts/run_tests.sh all
 | `uGDSHandleRegister / Deregister` | ✅ | Block device fd (no filesystem) |
 | `uGDSBufRegister / Deregister` | ✅ | GPU memory only |
 | `uGDSRead / Write` | ✅ | Synchronous, block-aligned |
-| `uGDSBatchIOSetUp / Submit / GetStatus` | 🔜 | Batch doorbell optimization |
+| `uGDSBatchIOSetUp / Submit / GetStatus / Destroy` | ✅ | Submit/poll separation, up to 128 IOs per batch |
 | `uGDSReadAsync / WriteAsync` | 🔜 | CUDA stream integration |
 
 ## Roadmap
@@ -119,7 +119,7 @@ scripts/run_tests.sh all
 |-------|-------------|--------|
 | 1 | Core synchronous API + test suite | ✅ |
 | 1.5 | Unified multi-backend (NVIDIA CUDA + AMD HIP/ROCm) | 🔧 |
-| 2 | Batch IO API (multi-command doorbell) | 🔜 |
+| 2 | Batch IO API (multi-command doorbell) | ✅ |
 | 3 | Async Stream API (CUDA stream integration) | 🔜 |
 | 4 | Hugepage support (larger QP depth) | 🔜 |
 | 5 | SGL support (scatter-gather lists) | 🔜 |

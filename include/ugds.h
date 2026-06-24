@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,8 @@ typedef enum uGDSOpError {
     UGDS_NVFS_SETUP_ERROR            = UGDS_BASE_ERR + 33,
     UGDS_IO_DISABLED                 = UGDS_BASE_ERR + 34,
     UGDS_GPU_MEMORY_PINNING_FAILED   = UGDS_BASE_ERR + 36,
+
+    UGDS_BATCH_CAPACITY_EXCEEDED     = UGDS_BASE_ERR + 40,
 } uGDSOpError;
 
 static inline const char* uGDS_status_error(uGDSOpError status) {
@@ -63,6 +66,7 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
     case UGDS_MEMORY_NOT_REGISTERED:       return "memory not registered";
     case UGDS_INTERNAL_ERROR:              return "internal error";
     case UGDS_GPU_MEMORY_PINNING_FAILED:   return "GPU memory pinning failed";
+    case UGDS_BATCH_CAPACITY_EXCEEDED:     return "batch capacity exceeded";
     default:                                  return "unknown uGDS error";
     }
 }
@@ -108,6 +112,51 @@ ssize_t uGDSRead(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 
 ssize_t uGDSWrite(uGDSHandle_t fh, const void* bufPtr_base, size_t size,
                     off_t file_offset, off_t bufPtr_offset);
+
+/* ── Batch IO ── */
+
+typedef void* uGDSBatchHandle_t;
+
+typedef enum uGDSOpcode {
+    UGDS_READ  = 0,
+    UGDS_WRITE = 1,
+} uGDSOpcode_t;
+
+typedef enum uGDSBatchStatus {
+    UGDS_BATCH_WAITING   = 0x01,
+    UGDS_BATCH_PENDING   = 0x02,
+    UGDS_BATCH_INVALID   = 0x04,
+    UGDS_BATCH_COMPLETE  = 0x10,
+    UGDS_BATCH_TIMEOUT   = 0x20,
+    UGDS_BATCH_FAILED    = 0x40,
+} uGDSBatchStatus_t;
+
+typedef struct uGDSIOParams {
+    void*           devPtr_base;
+    off_t           file_offset;
+    off_t           devPtr_offset;
+    size_t          size;
+    uGDSOpcode_t    opcode;
+    void*           cookie;
+} uGDSIOParams_t;
+
+typedef struct uGDSIOEvents {
+    void*               cookie;
+    uGDSBatchStatus_t   status;
+    ssize_t             ret;
+} uGDSIOEvents_t;
+
+uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch, uGDSHandle_t fh,
+                               unsigned nr);
+
+uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
+                               uGDSIOParams_t* iocb, unsigned flags);
+
+uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch, unsigned min_nr,
+                                  unsigned* nr, uGDSIOEvents_t* events,
+                                  struct timespec* timeout);
+
+void uGDSBatchIODestroy(uGDSBatchHandle_t batch);
 
 #ifdef __cplusplus
 }

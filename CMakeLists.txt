@@ -23,6 +23,7 @@ set(UGDS_SOURCES
     src/ugds_handle.cpp
     src/ugds_buf.cpp
     src/ugds_io.cpp
+    src/ugds_batch.cpp
 )
 
 add_library(ugds SHARED ${UGDS_SOURCES})
@@ -58,6 +59,12 @@ if(CMAKE_CUDA_COMPILER)
         test_alignment_errors
         test_multi_offset
         test_concurrent_qps
+        test_batch_basic
+        test_batch_mixed_sizes
+        test_batch_mixed_ops
+        test_batch_errors
+        test_batch_reuse
+        test_batch_deep
     )
 
     foreach(test_name ${FUNCTIONAL_TESTS})

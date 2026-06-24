@@ -25,6 +25,11 @@
 #define UGDS_SUCCESS      CU_FILE_SUCCESS
 #define UGDS_HANDLE_TYPE_OPAQUE_FD  CU_FILE_HANDLE_TYPE_OPAQUE_FD
 #define uGDS_status_error cufileop_status_error
+#define uGDSBatchHandle_t    CUfileBatchHandle_t
+#define uGDSIOEvents_t       CUfileIOEvents_t
+#define uGDSBatchIOGetStatus cuFileBatchIOGetStatus
+#define uGDSBatchIODestroy   cuFileBatchIODestroy
+#define UGDS_BATCH_COMPLETE  CU_FILE_BATCH_IO_COMPLETE
 #else
 #include <ugds.h>
 #endif
@@ -94,6 +99,90 @@ static void* sync_rw_thread(void* arg) {
     return NULL;
 }
 
+static void* batch_rw_thread(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+    struct timespec batch_start, batch_end;
+    uGDSHandle_t cf_handle = *(uGDSHandle_t*)data->handler;
+    size_t batch_size = data->depth;
+    size_t done_bytes = 0;
+
+    uGDSBatchHandle_t batch = nullptr;
+#ifdef USE_NVIDIA_GDS
+    uGDSError_t bst = cuFileBatchIOSetUp(&batch, static_cast<unsigned>(batch_size));
+#else
+    uGDSError_t bst = uGDSBatchIOSetUp(&batch, cf_handle,
+        static_cast<unsigned>(batch_size));
+#endif
+    if (bst.err != UGDS_SUCCESS) {
+        fprintf(stderr, "thread %d: BatchIOSetUp failed\n", data->thread_id);
+        return nullptr;
+    }
+
+#ifdef USE_NVIDIA_GDS
+    std::vector<CUfileIOParams_t> params(batch_size);
+#else
+    std::vector<uGDSIOParams_t> params(batch_size);
+#endif
+    std::vector<uGDSIOEvents_t> events(batch_size);
+
+    clock_gettime(CLOCK_MONOTONIC, &data->start_time);
+
+    while (done_bytes < data->size) {
+        unsigned nr = 0;
+        for (size_t i = 0; i < batch_size && done_bytes + i * data->io_size < data->size; i++) {
+            memset(&params[i], 0, sizeof(params[0]));
+#ifdef USE_NVIDIA_GDS
+            params[i].mode = CUFILE_BATCH;
+            params[i].u.batch.devPtr_base = data->gpu_buffer;
+            params[i].u.batch.file_offset = data->offset + done_bytes + i * data->io_size;
+            params[i].u.batch.devPtr_offset = (done_bytes + i * data->io_size) % data->size;
+            params[i].u.batch.size = data->io_size;
+            params[i].fh = cf_handle;
+            params[i].opcode = data->mode ? CUFILE_WRITE : CUFILE_READ;
+#else
+            params[i].devPtr_base = data->gpu_buffer;
+            params[i].file_offset = data->offset + done_bytes + i * data->io_size;
+            params[i].devPtr_offset = (done_bytes + i * data->io_size) % data->size;
+            params[i].size = data->io_size;
+            params[i].opcode = data->mode ? UGDS_WRITE : UGDS_READ;
+#endif
+            nr++;
+        }
+        if (nr == 0) break;
+
+        clock_gettime(CLOCK_MONOTONIC, &batch_start);
+
+#ifdef USE_NVIDIA_GDS
+        uGDSError_t st = cuFileBatchIOSubmit(batch, nr, params.data(), 0);
+#else
+        uGDSError_t st = uGDSBatchIOSubmit(batch, nr, params.data(), 0);
+#endif
+        if (st.err != UGDS_SUCCESS) {
+            fprintf(stderr, "thread %d: BatchIOSubmit failed\n", data->thread_id);
+            break;
+        }
+
+        unsigned nr_out = nr;
+        st = uGDSBatchIOGetStatus(batch, nr, &nr_out, events.data(), nullptr);
+        if (st.err != UGDS_SUCCESS) {
+            fprintf(stderr, "thread %d: BatchIOGetStatus failed\n", data->thread_id);
+            break;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &batch_end);
+
+        uint64_t batch_time = ts_diff_ns(batch_start, batch_end);
+        data->latency_vec.push_back(batch_time);
+        data->total_io_time += batch_time;
+        data->io_operations += nr;
+        done_bytes += nr * data->io_size;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &data->end_time);
+    uGDSBatchIODestroy(batch);
+    return nullptr;
+}
+
 static void run_ugds_bench(BenchOpts& opts) {
     struct timespec prog_start, prog_end;
     uGDSError_t status;
@@ -101,7 +190,18 @@ static void run_ugds_bench(BenchOpts& opts) {
     uGDSHandle_t cf_handle;
     int file_fd;
 
-    const char* label = opts.is_write ? "uGDS-write" : "uGDS-read";
+    const char* label;
+#ifdef USE_NVIDIA_GDS
+    if (opts.is_batch)
+        label = opts.is_write ? "GDS-batch-write" : "GDS-batch-read";
+    else
+        label = opts.is_write ? "GDS-write" : "GDS-read";
+#else
+    if (opts.is_batch)
+        label = opts.is_write ? "uGDS-batch-write" : "uGDS-batch-read";
+    else
+        label = opts.is_write ? "uGDS-write" : "uGDS-read";
+#endif
 
     printf("=== uGDS Benchmark ===\n");
     printf("  File:       %s\n", opts.file_path);
@@ -171,7 +271,9 @@ static void run_ugds_bench(BenchOpts& opts) {
     clock_gettime(CLOCK_MONOTONIC, &prog_start);
 
     for (int i = 0; i < num_threads; i++) {
-        if (pthread_create(&pthreads[i], NULL, sync_rw_thread, &threads[i]) != 0) {
+        void* (*thread_fn)(void*) = sync_rw_thread;
+        if (opts.is_batch) thread_fn = batch_rw_thread;
+        if (pthread_create(&pthreads[i], NULL, thread_fn, &threads[i]) != 0) {
             perror("pthread_create failed");
             exit(EXIT_FAILURE);
         }
@@ -185,7 +287,8 @@ static void run_ugds_bench(BenchOpts& opts) {
 
     uint64_t prog_time_ns = ts_diff_ns(prog_start, prog_end);
 
-    report_results(label, threads, opts.io_size, opts.io_depth, prog_time_ns, opts.json);
+    int report_depth = opts.is_batch ? 1 : opts.io_depth;
+    report_results(label, threads, opts.io_size, report_depth, prog_time_ns, opts.json);
 
     for (int i = 0; i < num_threads; i++) {
         uGDSBufDeregister(threads[i].gpu_buffer);
