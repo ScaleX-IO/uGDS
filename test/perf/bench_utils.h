@@ -42,6 +42,7 @@ struct ThreadData {
     struct timespec end_time;
     long long total_io_time;
     unsigned long long io_operations;
+    size_t total_bytes;
     std::vector<uint64_t> latency_vec;
     int device_id;
 };

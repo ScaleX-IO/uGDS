@@ -94,6 +94,7 @@ static void* sync_rw_thread(void* arg) {
         data->latency_vec.push_back(io_time);
         data->total_io_time += io_time;
         data->io_operations++;
+        data->total_bytes += result;
         done_bytes += result;
     }
 
@@ -179,10 +180,13 @@ static void* batch_rw_thread(void* arg) {
             fprintf(stderr, "thread %d: batch incomplete: submitted %u, completed %u\n",
                     data->thread_id, nr, nr_out);
         }
+        size_t completed_bytes = 0;
         for (unsigned i = 0; i < nr_out; i++) {
             if ((ssize_t)events[i].ret < 0) {
                 fprintf(stderr, "thread %d: batch event[%u] error: ret=%zd\n",
                         data->thread_id, i, (ssize_t)events[i].ret);
+            } else {
+                completed_bytes += events[i].ret;
             }
         }
 
@@ -192,6 +196,7 @@ static void* batch_rw_thread(void* arg) {
         data->latency_vec.push_back(batch_time);
         data->total_io_time += batch_time;
         data->io_operations += nr_out;
+        data->total_bytes += completed_bytes;
         done_bytes += batch_bytes;
     }
 
@@ -277,6 +282,7 @@ static void run_ugds_bench(BenchOpts& opts) {
         td->handler = &cf_handle;
         td->total_io_time = 0;
         td->io_operations = 0;
+        td->total_bytes = 0;
         td->device_id = opts.gpu_id;
 
         CHECK_CUDA(cudaMalloc(&td->gpu_buffer, chunk_size));
@@ -310,7 +316,7 @@ static void run_ugds_bench(BenchOpts& opts) {
 
     size_t actual_bytes = 0;
     for (auto& t : threads)
-        actual_bytes += t.io_operations * opts.io_size;
+        actual_bytes += t.total_bytes;
 
     report_results(label, threads, opts.io_size, actual_bytes, prog_time_ns, opts.json);
 
