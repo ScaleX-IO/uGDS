@@ -157,6 +157,11 @@ run_functional() {
         test_batch_errors
         test_batch_reuse
         test_batch_deep
+        test_async_basic
+        test_async_stream_order
+        test_async_late_binding
+        test_async_errors
+        test_async_multi_stream
     )
 
     for t in "${tests[@]}"; do

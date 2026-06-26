@@ -30,6 +30,10 @@
 #define uGDSBatchIOGetStatus cuFileBatchIOGetStatus
 #define uGDSBatchIODestroy   cuFileBatchIODestroy
 #define UGDS_BATCH_COMPLETE  CU_FILE_BATCH_IO_COMPLETE
+#define uGDSReadAsync        cuFileReadAsync
+#define uGDSWriteAsync       cuFileWriteAsync
+static inline uGDSError_t uGDSStreamRegister(cudaStream_t s) { return cuFileStreamRegister(s, 0); }
+#define uGDSStreamDeregister cuFileStreamDeregister
 #else
 #include <ugds.h>
 #endif
@@ -205,6 +209,76 @@ static void* batch_rw_thread(void* arg) {
     return nullptr;
 }
 
+static void* async_rw_thread(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+    struct timespec io_start, io_end;
+    uGDSHandle_t cf_handle = *(uGDSHandle_t*)data->handler;
+    size_t done_bytes = 0;
+
+    cudaStream_t stream;
+    CHECK_CUDA(cudaSetDevice(data->device_id));
+    CHECK_CUDA(cudaStreamCreate(&stream));
+
+    uGDSError_t reg_st = uGDSStreamRegister(stream);
+    if (reg_st.err != UGDS_SUCCESS) {
+        fprintf(stderr, "thread %d: StreamRegister failed\n", data->thread_id);
+    }
+
+    size_t size;
+    off_t file_off;
+    off_t buf_off;
+    ssize_t result;
+
+    clock_gettime(CLOCK_MONOTONIC, &data->start_time);
+
+    while (done_bytes < data->size) {
+        size_t remaining = data->size - done_bytes;
+        size_t this_io = (remaining < data->io_size) ? remaining : data->io_size;
+
+        size = this_io;
+        file_off = data->offset + done_bytes;
+        buf_off = done_bytes;
+        result = 0;
+
+        clock_gettime(CLOCK_MONOTONIC, &io_start);
+
+        uGDSError_t st;
+        if (data->mode == 1) {
+            st = uGDSWriteAsync(cf_handle, data->gpu_buffer, &size,
+                                &file_off, &buf_off, &result, stream);
+        } else {
+            st = uGDSReadAsync(cf_handle, data->gpu_buffer, &size,
+                               &file_off, &buf_off, &result, stream);
+        }
+        if (st.err != UGDS_SUCCESS) {
+            fprintf(stderr, "thread %d: async IO enqueue failed\n", data->thread_id);
+            break;
+        }
+
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+
+        if (result != (ssize_t)this_io) {
+            fprintf(stderr, "thread %d: async IO error, result=%zd, expected=%zu\n",
+                    data->thread_id, result, this_io);
+            break;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &io_end);
+
+        uint64_t io_time = ts_diff_ns(io_start, io_end);
+        data->latency_vec.push_back(io_time);
+        data->total_io_time += io_time;
+        data->io_operations++;
+        data->total_bytes += result;
+        done_bytes += result;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &data->end_time);
+    uGDSStreamDeregister(stream);
+    cudaStreamDestroy(stream);
+    return NULL;
+}
+
 static void run_ugds_bench(BenchOpts& opts) {
     struct timespec prog_start, prog_end;
     uGDSError_t status;
@@ -214,12 +288,16 @@ static void run_ugds_bench(BenchOpts& opts) {
 
     const char* label;
 #ifdef USE_NVIDIA_GDS
-    if (opts.is_batch)
+    if (opts.is_async)
+        label = opts.is_write ? "GDS-async-write" : "GDS-async-read";
+    else if (opts.is_batch)
         label = opts.is_write ? "GDS-batch-write" : "GDS-batch-read";
     else
         label = opts.is_write ? "GDS-write" : "GDS-read";
 #else
-    if (opts.is_batch)
+    if (opts.is_async)
+        label = opts.is_write ? "uGDS-async-write" : "uGDS-async-read";
+    else if (opts.is_batch)
         label = opts.is_write ? "uGDS-batch-write" : "uGDS-batch-read";
     else
         label = opts.is_write ? "uGDS-write" : "uGDS-read";
@@ -236,7 +314,9 @@ static void run_ugds_bench(BenchOpts& opts) {
     printf("  Threads:    %d\n", opts.num_threads);
     printf("  IO depth:   %d\n", opts.io_depth);
     printf("  GPU:        %d\n", opts.gpu_id);
-    printf("  Mode:       %s\n", opts.is_write ? "write" : "read");
+    printf("  Mode:       %s%s\n",
+           opts.is_async ? "async-" : (opts.is_batch ? "batch-" : ""),
+           opts.is_write ? "write" : "read");
     printf("\n");
 
     CHECK_CUDA(cudaSetDevice(opts.gpu_id));
@@ -299,7 +379,8 @@ static void run_ugds_bench(BenchOpts& opts) {
 
     for (int i = 0; i < num_threads; i++) {
         void* (*thread_fn)(void*) = sync_rw_thread;
-        if (opts.is_batch) thread_fn = batch_rw_thread;
+        if (opts.is_async) thread_fn = async_rw_thread;
+        else if (opts.is_batch) thread_fn = batch_rw_thread;
         if (pthread_create(&pthreads[i], NULL, thread_fn, &threads[i]) != 0) {
             perror("pthread_create failed");
             exit(EXIT_FAILURE);

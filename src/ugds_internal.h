@@ -119,4 +119,17 @@ static inline uGDSError_t make_error(uGDSOpError err) {
 
 #define UGDS_OK make_error(UGDS_SUCCESS)
 
+ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
+                       off_t file_offset, off_t bufPtr_offset, uint8_t opcode);
+
+struct AsyncRequest {
+    uGDSHandle_t    fh;
+    void*           bufPtr_base;
+    size_t*         size_p;
+    off_t*          file_offset_p;
+    off_t*          bufPtr_offset_p;
+    ssize_t*        bytes_done_p;
+    uint8_t         opcode;
+};
+
 #endif /* __UGDS_INTERNAL_H__ */
