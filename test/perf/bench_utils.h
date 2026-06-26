@@ -24,6 +24,7 @@ struct BenchOpts {
     int io_depth = 1;
     bool is_write = false;
     bool is_batch = false;
+    bool is_async = false;
     bool json = false;
 };
 
@@ -36,7 +37,6 @@ struct ThreadData {
     size_t io_size;
     size_t depth;
     void* gpu_buffer;
-    void** gpu_buffers;
     void* handler;
     struct timespec start_time;
     struct timespec end_time;
@@ -158,6 +158,8 @@ static inline bool parse_bench_opts(int argc, char** argv, BenchOpts& opts) {
             if (strcmp(optarg, "write") == 0) { opts.is_write = true; }
             else if (strcmp(optarg, "batch-read") == 0) { opts.is_batch = true; opts.is_write = false; }
             else if (strcmp(optarg, "batch-write") == 0) { opts.is_batch = true; opts.is_write = true; }
+            else if (strcmp(optarg, "async-read") == 0) { opts.is_async = true; opts.is_write = false; }
+            else if (strcmp(optarg, "async-write") == 0) { opts.is_async = true; opts.is_write = true; }
             break;
         case 'j': opts.json = true; break;
         case 'h':

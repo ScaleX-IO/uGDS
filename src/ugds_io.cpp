@@ -5,8 +5,8 @@
 #include <atomic>
 #include <algorithm>
 
-static ssize_t do_io(uGDSHandle_t fh, void* bufPtr_base, size_t size,
-                     off_t file_offset, off_t bufPtr_offset, uint8_t opcode)
+ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
+                       off_t file_offset, off_t bufPtr_offset, uint8_t opcode)
 {
     HandleState* hs = static_cast<HandleState*>(fh);
 
@@ -202,12 +202,12 @@ static ssize_t do_io(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 extern "C" ssize_t uGDSRead(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                               off_t file_offset, off_t bufPtr_offset)
 {
-    return do_io(fh, bufPtr_base, size, file_offset, bufPtr_offset, NVM_IO_READ);
+    return do_io_internal(fh, bufPtr_base, size, file_offset, bufPtr_offset, NVM_IO_READ);
 }
 
 extern "C" ssize_t uGDSWrite(uGDSHandle_t fh, const void* bufPtr_base, size_t size,
                                off_t file_offset, off_t bufPtr_offset)
 {
-    return do_io(fh, const_cast<void*>(bufPtr_base), size, file_offset, bufPtr_offset,
+    return do_io_internal(fh, const_cast<void*>(bufPtr_base), size, file_offset, bufPtr_offset,
                  NVM_IO_WRITE);
 }
