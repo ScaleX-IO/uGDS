@@ -115,6 +115,7 @@ target_include_directories(ugds
 if(UGDS_BACKEND_CUDA)
     target_include_directories(ugds PRIVATE ${UGDS_CUDA_INCLUDES})
     target_compile_definitions(ugds PRIVATE _CUDA)
+    target_link_libraries(ugds PRIVATE CUDA::cudart)
 endif()
 
 if(UGDS_BACKEND_HIP)
@@ -245,7 +246,7 @@ if(UGDS_BACKEND_HIP)
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/functional
             )
-            target_link_libraries(${test_name}${HIP_SUFFIX} ugds hip::host ${HSA_RUNTIME_LIB})
+            target_link_libraries(${test_name}${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS})
             target_compile_definitions(${test_name}${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
             set_target_properties(${test_name}${HIP_SUFFIX} PROPERTIES
                 HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
@@ -268,7 +269,7 @@ if(UGDS_BACKEND_HIP)
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
         )
-        target_link_libraries(bench_ugds${HIP_SUFFIX} ugds hip::host ${HSA_RUNTIME_LIB})
+        target_link_libraries(bench_ugds${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS})
         target_compile_definitions(bench_ugds${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
         set_target_properties(bench_ugds${HIP_SUFFIX} PROPERTIES
             HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
