@@ -102,8 +102,10 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         return make_error(UGDS_INVALID_VALUE);
 
     auto bs = new (std::nothrow) BatchState();
-    if (!bs)
+    if (!bs) {
+        hs->batch_active.store(false);
         return make_error(UGDS_INTERNAL_ERROR);
+    }
 
     bs->capacity = nr;
     bs->hs = hs;
@@ -116,6 +118,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
 
     if (posix_memalign(&pool.buf, 4096, pool_bytes) != 0) {
         delete bs;
+        hs->batch_active.store(false);
         return make_error(UGDS_INTERNAL_ERROR);
     }
     std::memset(pool.buf, 0, pool_bytes);
@@ -125,6 +128,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         free(pool.buf);
         pool.buf = nullptr;
         delete bs;
+        hs->batch_active.store(false);
         return make_error(UGDS_INTERNAL_ERROR);
     }
     pool.n_pages = UGDS_PRP_POOL_PAGES;
