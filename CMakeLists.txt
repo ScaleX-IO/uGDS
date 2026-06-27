@@ -25,6 +25,7 @@ set(UGDS_SOURCES
     src/ugds_io.cpp
     src/ugds_batch.cpp
     src/ugds_async.cpp
+    src/ugds_hugepage.cpp
 )
 
 add_library(ugds SHARED ${UGDS_SOURCES})

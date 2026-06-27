@@ -1,8 +1,10 @@
 #include "ugds_internal.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <sys/mman.h>
 
 static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp) {
     if (qp->sq_dma) {
@@ -17,6 +19,18 @@ static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp) {
     free(qp->sq_buf);
     free(qp->cq_buf);
     free(qp->prp_buf);
+}
+
+static void cleanup_batch_qp(nvm_aq_ref aq_ref, IOQueuePairHuge* bqp) {
+    // Null out hugepage-backed bufs so cleanup_qp calls free(nullptr) for those
+    if (bqp->sq_huge) bqp->qp.sq_buf = nullptr;
+    if (bqp->cq_huge) bqp->qp.cq_buf = nullptr;
+    cleanup_qp(aq_ref, &bqp->qp);
+
+    if (bqp->sq_huge)
+        hugepage_free(bqp->sq_huge, bqp->sq_huge_size);
+    if (bqp->cq_huge)
+        hugepage_free(bqp->cq_huge, bqp->cq_huge_size);
 }
 
 extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
@@ -101,16 +115,21 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     }
 
     uint16_t avail = std::min(n_cqs, n_sqs);
-    hs->num_qps = std::min<uint16_t>(avail, UGDS_DEFAULT_NUM_QPS);
+    // Need at least 2 IO QPs: 1 sync + 1 batch
+    if (avail < 2) {
+        nvm_aq_destroy(hs->aq_ref);
+        nvm_dma_unmap(hs->aq_dma);
+        free(hs->aq_buf);
+        nvm_ctrl_free(hs->ctrl);
+        return make_error(UGDS_INTERNAL_ERROR);
+    }
+    uint16_t total_qps = std::min<uint16_t>(avail, UGDS_DEFAULT_NUM_QPS);
+    uint16_t sync_qps = total_qps - 1;
+    hs->num_qps = sync_qps;
 
-    for (uint16_t i = 0; i < hs->num_qps; ++i) {
+    // Create sync IO QPs (shallow depth, 4KB pages)
+    for (uint16_t i = 0; i < sync_qps; ++i) {
         auto qp = std::make_unique<IOQueuePair>();
-        qp->sq_dma = nullptr;
-        qp->cq_dma = nullptr;
-        qp->prp_dma = nullptr;
-        qp->sq_buf = nullptr;
-        qp->cq_buf = nullptr;
-        qp->prp_buf = nullptr;
 
         // CQ
         if (posix_memalign(&qp->cq_buf, 4096, page_size) != 0)
@@ -160,6 +179,108 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         return make_error(UGDS_INTERNAL_ERROR);
     }
 
+    // Create batch IO QP (deep depth, hugepage-backed)
+    {
+        uint16_t batch_qp_id = sync_qps + 1;
+        uint16_t batch_depth = std::min<uint16_t>(
+            UGDS_BATCH_QUEUE_DEPTH, hs->ctrl->max_qs);
+        auto bqp = std::make_unique<IOQueuePairHuge>();
+        size_t sq_data_size = batch_depth * sizeof(nvm_cmd_t);
+        size_t cq_data_size = batch_depth * sizeof(nvm_cpl_t);
+
+        bool need_hugepage_sq = (sq_data_size > page_size);
+        bool need_hugepage_cq = false;
+
+        // SQ allocation: try hugepage, fall back to 4KB page with reduced depth
+        if (need_hugepage_sq) {
+            bqp->qp.sq_buf = hugepage_alloc(sq_data_size, &bqp->sq_huge_size);
+            if (bqp->qp.sq_buf)
+                bqp->sq_huge = bqp->qp.sq_buf;
+        }
+        if (!bqp->qp.sq_buf) {
+            if (need_hugepage_sq)
+                fprintf(stderr, "uGDS: hugepage alloc failed for batch SQ, "
+                        "falling back to 4KB page (depth %u → %zu)\n",
+                        batch_depth, page_size / sizeof(nvm_cmd_t));
+            size_t alloc = std::max(sq_data_size, page_size);
+            if (posix_memalign(&bqp->qp.sq_buf, 4096, alloc) != 0)
+                goto batch_fail;
+            std::memset(bqp->qp.sq_buf, 0, alloc);
+            if (need_hugepage_sq)
+                batch_depth = static_cast<uint16_t>(page_size / sizeof(nvm_cmd_t));
+            sq_data_size = batch_depth * sizeof(nvm_cmd_t);
+            cq_data_size = batch_depth * sizeof(nvm_cpl_t);
+        }
+
+        // CQ allocation: try hugepage if SQ got hugepage, else 4KB page
+        need_hugepage_cq = (cq_data_size > page_size);
+        if (need_hugepage_cq && bqp->sq_huge) {
+            bqp->qp.cq_buf = hugepage_alloc(cq_data_size, &bqp->cq_huge_size);
+            if (bqp->qp.cq_buf)
+                bqp->cq_huge = bqp->qp.cq_buf;
+        }
+        if (!bqp->qp.cq_buf) {
+            if (need_hugepage_cq)
+                fprintf(stderr, "uGDS: hugepage alloc failed for batch CQ, "
+                        "falling back to 4KB page\n");
+            size_t alloc = std::max(cq_data_size, page_size);
+            if (posix_memalign(&bqp->qp.cq_buf, 4096, alloc) != 0)
+                goto batch_fail;
+            std::memset(bqp->qp.cq_buf, 0, alloc);
+            if (need_hugepage_cq)
+                batch_depth = std::min(batch_depth,
+                    static_cast<uint16_t>(page_size / sizeof(nvm_cpl_t)));
+        }
+        sq_data_size = batch_depth * sizeof(nvm_cmd_t);
+        cq_data_size = batch_depth * sizeof(nvm_cpl_t);
+
+        status = nvm_dma_map_host(&bqp->qp.cq_dma, hs->ctrl,
+                                   bqp->qp.cq_buf, cq_data_size);
+        if (!nvm_ok(status)) goto batch_fail;
+        status = nvm_admin_cq_create(hs->aq_ref, &bqp->qp.cq, batch_qp_id,
+                                     bqp->qp.cq_dma, 0, batch_depth);
+        if (!nvm_ok(status)) {
+            nvm_dma_unmap(bqp->qp.cq_dma);
+            bqp->qp.cq_dma = nullptr;
+            goto batch_fail;
+        }
+
+        status = nvm_dma_map_host(&bqp->qp.sq_dma, hs->ctrl,
+                                   bqp->qp.sq_buf, sq_data_size);
+        if (!nvm_ok(status)) goto batch_fail;
+        status = nvm_admin_sq_create(hs->aq_ref, &bqp->qp.sq, &bqp->qp.cq,
+                                     batch_qp_id, bqp->qp.sq_dma, 0, batch_depth);
+        if (!nvm_ok(status)) {
+            nvm_dma_unmap(bqp->qp.sq_dma);
+            bqp->qp.sq_dma = nullptr;
+            goto batch_fail;
+        }
+
+        // PRP list page for batch QP (regular 4KB page is fine)
+        if (posix_memalign(&bqp->qp.prp_buf, 4096, page_size) != 0)
+            goto batch_fail;
+        std::memset(bqp->qp.prp_buf, 0, page_size);
+        status = nvm_dma_map_host(&bqp->qp.prp_dma, hs->ctrl,
+                                   bqp->qp.prp_buf, page_size);
+        if (!nvm_ok(status)) goto batch_fail;
+
+        hs->batch_qp = std::move(bqp);
+        hs->batch_queue_depth = batch_depth;
+        goto batch_done;
+
+    batch_fail:
+        cleanup_batch_qp(hs->aq_ref, bqp.get());
+        for (auto& done : hs->qps)
+            cleanup_qp(hs->aq_ref, done.get());
+        hs->qps.clear();
+        nvm_aq_destroy(hs->aq_ref);
+        nvm_dma_unmap(hs->aq_dma);
+        free(hs->aq_buf);
+        nvm_ctrl_free(hs->ctrl);
+        return make_error(UGDS_INTERNAL_ERROR);
+    batch_done:;
+    }
+
     {
         std::lock_guard<std::mutex> g(g_driver.lock);
         if (g_driver.default_ctrl == nullptr)
@@ -175,6 +296,10 @@ extern "C" void uGDSHandleDeregister(uGDSHandle_t fh)
     if (fh == nullptr) return;
 
     HandleState* hs = reinterpret_cast<HandleState*>(fh);
+
+    if (hs->batch_qp)
+        cleanup_batch_qp(hs->aq_ref, hs->batch_qp.get());
+    hs->batch_qp.reset();
 
     for (auto it = hs->qps.rbegin(); it != hs->qps.rend(); ++it)
         cleanup_qp(hs->aq_ref, it->get());

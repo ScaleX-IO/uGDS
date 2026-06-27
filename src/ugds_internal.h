@@ -24,19 +24,29 @@
 
 #define UGDS_DEFAULT_NUM_QPS     16
 #define UGDS_DEFAULT_QUEUE_DEPTH 64
+#define UGDS_BATCH_QUEUE_DEPTH   512
 #define UGDS_MAX_BATCH_IO_SIZE   128
-#define UGDS_PRP_POOL_PAGES      16
+#define UGDS_PRP_POOL_PAGES      64
+#define UGDS_HUGEPAGE_SIZE       (2UL * 1024 * 1024)
 
 struct IOQueuePair {
-    nvm_queue_t    sq;
-    nvm_queue_t    cq;
-    nvm_dma_t*     sq_dma;
-    nvm_dma_t*     cq_dma;
-    nvm_dma_t*     prp_dma;
-    void*          sq_buf;
-    void*          cq_buf;
-    void*          prp_buf;
+    nvm_queue_t    sq{};
+    nvm_queue_t    cq{};
+    nvm_dma_t*     sq_dma  = nullptr;
+    nvm_dma_t*     cq_dma  = nullptr;
+    nvm_dma_t*     prp_dma = nullptr;
+    void*          sq_buf  = nullptr;
+    void*          cq_buf  = nullptr;
+    void*          prp_buf = nullptr;
     std::mutex     lock;
+};
+
+struct IOQueuePairHuge {
+    IOQueuePair                 qp;
+    void*                       sq_huge      = nullptr;
+    void*                       cq_huge      = nullptr;
+    size_t                      sq_huge_size = 0;
+    size_t                      cq_huge_size = 0;
 };
 
 struct HandleState {
@@ -54,6 +64,9 @@ struct HandleState {
     uint16_t                    num_qps;
     std::vector<std::unique_ptr<IOQueuePair>> qps;
     std::atomic<uint32_t>       rr_counter{0};
+    std::unique_ptr<IOQueuePairHuge> batch_qp;
+    uint16_t                    batch_queue_depth;
+    std::atomic<bool>           batch_active{false};
 };
 
 struct DriverState {
@@ -102,9 +115,9 @@ struct BatchState {
     unsigned    n_events_read = 0;
 
     std::vector<BatchIOEntry> entries;
-    std::vector<std::array<CmdSlot, UGDS_DEFAULT_QUEUE_DEPTH>> cmd_map;
-    std::vector<uint16_t> qp_in_flight;
-    std::vector<PRPPool>  prp_pools;
+    std::vector<CmdSlot>      cmd_map;
+    uint16_t                  in_flight = 0;
+    PRPPool                   prp_pool;
 
     HandleState* hs = nullptr;
     std::mutex   lock;
@@ -131,5 +144,8 @@ struct AsyncRequest {
     ssize_t*        bytes_done_p;
     uint8_t         opcode;
 };
+
+void* hugepage_alloc(size_t size, size_t* alloc_size_out);
+void  hugepage_free(void* ptr, size_t alloc_size);
 
 #endif /* __UGDS_INTERNAL_H__ */

@@ -174,7 +174,7 @@ static void* batch_rw_thread(void* arg) {
             break;
         }
 
-        unsigned nr_out = 0;
+        unsigned nr_out = nr;
         st = uGDSBatchIOGetStatus(batch, nr, &nr_out, events.data(), nullptr);
         if (st.err != UGDS_SUCCESS) {
             fprintf(stderr, "thread %d: BatchIOGetStatus failed\n", data->thread_id);
