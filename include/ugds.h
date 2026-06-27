@@ -6,6 +6,7 @@
 #include <sys/types.h>
 #include <libnvm/nvm_dma.h>  /* NVM_MAP_DMABUF */
 #include <time.h>
+#include <cuda_runtime.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -161,6 +162,25 @@ uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch, unsigned min_nr,
                                   struct timespec* timeout);
 
 void uGDSBatchIODestroy(uGDSBatchHandle_t batch);
+
+/* ── Async Stream IO ──
+ * Pointer params (size_p, file_offset_p, etc.) must be host-accessible.
+ * Use cudaHostAlloc for GPU-writable pinned memory (late binding).
+ */
+
+uGDSError_t uGDSReadAsync(uGDSHandle_t fh, void *bufPtr_base,
+                           size_t *size_p, off_t *file_offset_p,
+                           off_t *bufPtr_offset_p, ssize_t *bytes_read_p,
+                           cudaStream_t stream);
+
+uGDSError_t uGDSWriteAsync(uGDSHandle_t fh, void *bufPtr_base,
+                            size_t *size_p, off_t *file_offset_p,
+                            off_t *bufPtr_offset_p, ssize_t *bytes_written_p,
+                            cudaStream_t stream);
+
+uGDSError_t uGDSStreamRegister(cudaStream_t stream);
+
+uGDSError_t uGDSStreamDeregister(cudaStream_t stream);
 
 #ifdef __cplusplus
 }

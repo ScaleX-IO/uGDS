@@ -127,7 +127,8 @@ scripts/run_tests.sh all
 | `uGDSBufRegister / Deregister` | ✅ | GPU memory only |
 | `uGDSRead / Write` | ✅ | Synchronous, block-aligned |
 | `uGDSBatchIOSetUp / Submit / GetStatus / Destroy` | ✅ | Submit/poll separation, up to 128 IOs per batch |
-| `uGDSReadAsync / WriteAsync` | 🔜 | CUDA stream integration |
+| `uGDSReadAsync / WriteAsync` | ✅ | CUDA stream integration, late-binding pointers |
+| `uGDSStreamRegister / Deregister` | ✅ | Optional (no-op, uGDS has no bounce buffer) |
 
 ## Roadmap
 
@@ -136,11 +137,13 @@ scripts/run_tests.sh all
 | 1 | Core synchronous API + test suite | ✅ |
 | 1.5 | Unified multi-backend (NVIDIA CUDA + AMD HIP/ROCm) | 🔧 |
 | 2 | Batch IO API (multi-command doorbell) | ✅ |
-| 3 | Async Stream API (CUDA stream integration) | 🔜 |
+| 3 | Async Stream API (CUDA stream integration) | ✅ |
 | 4 | Hugepage support (larger QP depth) | 🔜 |
 | 5 | SGL support (scatter-gather lists) | 🔜 |
 | 6 | Interrupt mode (MSI-X + eventfd) | 🔜 |
-| 7 | Filesystem compatibility (POSIX file path support) | 🔜 |
+| 7 | Multi-SSD support (multi-handle aggregation) | 🔜 |
+| 8 | Striping (automatic IO distribution across SSDs) | 🔜 |
+| 9 | Filesystem compatibility (POSIX file path support) | 🔜 |
 
 ## Citation
 

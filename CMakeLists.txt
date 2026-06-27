@@ -101,6 +101,7 @@ set(UGDS_SOURCES
     src/ugds_buf.cpp
     src/ugds_io.cpp
     src/ugds_batch.cpp
+    src/ugds_async.cpp
 )
 
 add_library(ugds SHARED ${UGDS_SOURCES})
@@ -112,6 +113,8 @@ target_include_directories(ugds
 )
 
 # Backend includes and compile definitions (independent)
+target_link_libraries(ugds PRIVATE Threads::Threads)
+
 if(UGDS_BACKEND_CUDA)
     target_include_directories(ugds PRIVATE ${UGDS_CUDA_INCLUDES})
     target_compile_definitions(ugds PRIVATE _CUDA)
@@ -147,6 +150,11 @@ set(FUNCTIONAL_TESTS
     test_batch_errors
     test_batch_reuse
     test_batch_deep
+    test_async_basic
+    test_async_stream_order
+    test_async_late_binding
+    test_async_errors
+    test_async_multi_stream
 )
 
 # CUDA tests (compiled with nvcc)
@@ -191,6 +199,20 @@ if(UGDS_BACKEND_CUDA)
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )
 
+        # bench_overlap: async IO + GPU compute overlap benchmark
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_overlap.cu)
+            add_executable(bench_overlap${CUDA_SUFFIX} test/perf/bench_overlap.cu)
+            target_include_directories(bench_overlap${CUDA_SUFFIX} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+            )
+            target_link_libraries(bench_overlap${CUDA_SUFFIX} ugds CUDA::cudart)
+            set_target_properties(bench_overlap${CUDA_SUFFIX} PROPERTIES
+                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+                BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+            )
+        endif()
+
         # bench_gds: NVIDIA GDS comparison (optional)
         set(CUFILE_LIB "" CACHE FILEPATH "Path to NVIDIA libcufile.so for GDS comparison benchmark")
         set(CUFILE_INCLUDE "" CACHE PATH "Path to NVIDIA cuFile headers (if different from ours)")
@@ -207,6 +229,22 @@ if(UGDS_BACKEND_CUDA)
             target_link_libraries(bench_gds ${CUFILE_LIB} CUDA::cudart)
             target_compile_definitions(bench_gds PRIVATE USE_O_DIRECT USE_NVIDIA_GDS)
             set_target_properties(bench_gds PROPERTIES
+                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+            )
+
+            # bench_overlap_gds: overlap benchmark linked against libcufile.so
+            add_executable(bench_overlap_gds test/perf/bench_overlap.cu)
+            target_include_directories(bench_overlap_gds PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+            )
+            if(CUFILE_INCLUDE)
+                target_include_directories(bench_overlap_gds PRIVATE ${CUFILE_INCLUDE})
+            else()
+                target_include_directories(bench_overlap_gds PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+            endif()
+            target_link_libraries(bench_overlap_gds ${CUFILE_LIB} CUDA::cudart)
+            target_compile_definitions(bench_overlap_gds PRIVATE USE_O_DIRECT USE_NVIDIA_GDS)
+            set_target_properties(bench_overlap_gds PROPERTIES
                 CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
             )
         endif()
