@@ -35,7 +35,7 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
     if (!cpl) return false;
 
     uint16_t cid = *NVM_CPL_CID(cpl);
-    uint16_t status = (cpl->dword[3] >> 17) & 0x7FF;
+    uint16_t status = UGDS_CPL_STATUS(cpl);
 
     nvm_sq_update(&qp.sq);
     std::atomic_thread_fence(std::memory_order_seq_cst);

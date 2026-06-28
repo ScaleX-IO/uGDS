@@ -123,7 +123,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                     result = -EIO;
                     goto out;
                 }
-                uint16_t st = (drain->dword[3] >> 17) & 0x7FF;
+                uint16_t st = UGDS_CPL_STATUS(drain);
                 nvm_sq_update(&qp.sq);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 nvm_cq_update(&qp.cq);
@@ -176,7 +176,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 goto out;
             }
 
-            uint16_t status = (cpl->dword[3] >> 17) & 0x7FF;
+            uint16_t status = UGDS_CPL_STATUS(cpl);
 
             nvm_sq_update(&qp.sq);
             std::atomic_thread_fence(std::memory_order_seq_cst);
