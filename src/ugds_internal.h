@@ -29,9 +29,8 @@
 #define UGDS_PRP_POOL_PAGES      64
 #define UGDS_HUGEPAGE_SIZE       (2UL * 1024 * 1024)
 
-/* Extract the combined SCT+SC (Status Code Type + Status Code) 11-bit field
- * from an NVMe completion queue entry. A value of 0 indicates success. */
-#define UGDS_CPL_STATUS(cpl)     (((cpl)->dword[3] >> 17) & 0x7FF)
+/* SCT+SC (11-bit) from an NVMe completion: 0 = success. See NVMe Base Spec §4.6.1. */
+#define UGDS_CPL_SCT_SC(cpl)     (((cpl)->dword[3] >> 17) & 0x7FF)
 
 struct IOQueuePair {
     nvm_queue_t    sq{};
