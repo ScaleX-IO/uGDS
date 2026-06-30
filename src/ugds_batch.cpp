@@ -75,7 +75,7 @@ static size_t compute_max_xfer(HandleState* hs)
     const size_t prp_capacity = page_size / sizeof(uint64_t);
 
     size_t max_xfer = hs->max_transfer_size;
-    if (max_xfer == 0) max_xfer = 128 * 1024;
+    if (max_xfer == 0) max_xfer = UGDS_DEFAULT_MAX_TRANSFER_SIZE;
     if (max_xfer < page_size) max_xfer = page_size;
 
     size_t prp_max = (prp_capacity + 1) * page_size;

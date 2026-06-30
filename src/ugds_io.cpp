@@ -70,7 +70,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 
     size_t max_xfer = hs->max_transfer_size;
     if (max_xfer == 0) {
-        max_xfer = 128 * 1024;
+        max_xfer = UGDS_DEFAULT_MAX_TRANSFER_SIZE;
     }
     if (max_xfer < page_size) {
         max_xfer = page_size;

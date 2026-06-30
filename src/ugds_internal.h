@@ -29,6 +29,10 @@
 #define UGDS_PRP_POOL_PAGES      64
 #define UGDS_HUGEPAGE_SIZE       (2UL * 1024 * 1024)
 
+/* Fallback maximum data-transfer size (bytes) for a single I/O when the controller
+ * reports MDTS = 0 (no limit). Keeps one transfer within a single PRP list. */
+#define UGDS_DEFAULT_MAX_TRANSFER_SIZE (128UL * 1024)
+
 /* SCT+SC (11-bit) from an NVMe completion: 0 = success. See NVMe Base Spec §4.6.1. */
 #define UGDS_CPL_SCT_SC(cpl)     (((cpl)->dword[3] >> 17) & 0x7FF)
 
