@@ -1,6 +1,6 @@
 #include "ugds_internal.h"
 
-extern "C" uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int /*flags*/) {
+extern "C" uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int flags) {
     if (!g_driver.initialized) {
         return make_error(UGDS_DRIVER_NOT_INITIALIZED);
     }
@@ -20,8 +20,9 @@ extern "C" uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, i
     }
 
     nvm_dma_t* dma = nullptr;
-    int status = nvm_dma_map_device(&dma, g_driver.default_ctrl,
-                                    const_cast<void*>(bufPtr_base), length);
+    int status = nvm_dma_map_device_ex(&dma, g_driver.default_ctrl,
+                                       const_cast<void*>(bufPtr_base), length,
+                                       flags);
     if (status != 0 || dma == nullptr) {
         return make_error(UGDS_GPU_MEMORY_PINNING_FAILED);
     }

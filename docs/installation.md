@@ -2,6 +2,8 @@
 
 ## Prerequisites
 
+### NVIDIA CUDA Backend
+
 | Dependency | Version | Notes |
 |-----------|---------|-------|
 | Linux kernel headers | matching running kernel | tested on 6.8 |
@@ -10,9 +12,39 @@
 | CMake | >= 3.18 | |
 | GCC | C++17 support | |
 
+### AMD Infinity Storage (HIP/ROCm) Backend
+
+The HIP backend implements AMD Infinity Storage (AIS) using the standard Linux DMA-buf framework. It does not depend on NVIDIA-specific APIs.
+
+| Dependency | Version | Notes |
+|-----------|---------|-------|
+| Linux kernel headers | >= 5.12 (6.4+ recommended) | `CONFIG_PCI_P2PDMA=y`, `CONFIG_DMABUF_MOVE_NOTIFY=y`. `MODULE_IMPORT_NS("DMA_BUF")` requires >= 6.4; on older kernels, remove or guard the import. |
+| ROCm | >= 5.6 (7.0+ recommended) | `hsa_amd_portable_export_dmabuf_v2()` with `HSA_AMD_DMABUF_MAPPING_TYPE_PCIE` |
+| HIP runtime | >= 5.6 | `hipMalloc`, `hipMemcpy` |
+| HSA runtime | >= 5.6 | `libhsa-runtime64.so` |
+| GPU | Large BAR | MI300X, MI250 (Full BAR exposes VRAM via PCIe) |
+| CMake | >= 3.18 (CUDA), >= 3.21 (HIP) | |
+| GCC | C++17 support | |
+
+**Kernel requirements (mandatory):**
+- `CONFIG_PCI_P2PDMA=y` -- PCIe P2P DMA support (required)
+- `CONFIG_DMABUF_MOVE_NOTIFY=y` -- DMA-buf dynamic attach (required)
+- AMD HSA P2P support in kernel (`CONFIG_HSA_AMD_P2P=y`, depends on `HSA_AMD && PCI_P2PDMA && DMABUF_MOVE_NOTIFY`)
+- IOMMU passthrough recommended: `iommu=pt` or `amd_iommu=off`
+
+**Driver notes:**
+The kernel-side code uses standard upstream DMA-buf APIs (`dma_buf_dynamic_attach`, `dma_buf_pin`, `dma_buf_map_attachment`). The userspace side uses `hsa_amd_portable_export_dmabuf_v2()` from the ROCm runtime. No vendor-specific amdgpu extensions are required beyond upstream `CONFIG_HSA_AMD_P2P` support.
+
+**Synchronization contract:**
+Buffers registered with `uGDSBufRegister()` must not be modified by the GPU (HIP kernel writes) while NVMe I/O is in flight on the same buffer. Concurrent GPU access during DMA can cause data corruption. This mirrors the NVIDIA GDS requirement.
+
+**Important:** Each backend used at runtime must be enabled in both the kernel module and the userspace library. For example, a CUDA-only kernel module will reject HIP `uGDSBufRegister()` calls. In dual-backend builds, use `uGDSBufRegister(ptr, size, UGDS_REGISTER_DMABUF)` for AMD buffers and `uGDSBufRegister(ptr, size, 0)` for NVIDIA buffers (default).
+
 ## Step 1: Build the Kernel Module
 
 The kernel module (`ugds_drv.ko`) provides PCI BAR mapping and GPU page pinning for user-space NVMe access.
+
+### NVIDIA CUDA Backend (default)
 
 ```bash
 cd drv
@@ -28,6 +60,15 @@ If auto-detection fails, specify manually:
 ```bash
 make KERNEL=/path/to/kernel/build NVIDIA_DIR=/usr/src/nvidia-550.54.14
 ```
+
+### AMD Infinity Storage (HIP) Backend
+
+```bash
+cd drv
+make BUILD_HIP=1 BUILD_CUDA=0
+```
+
+No NVIDIA driver headers needed -- the HIP path uses standard Linux DMA-buf framework. Kernel headers (`/lib/modules/$(uname -r)/build`) are still required.
 
 ## Step 2: Load the Kernel Module
 
@@ -59,9 +100,19 @@ scripts/env_switch.sh status
 
 ## Step 3: Build the Library
 
+### NVIDIA CUDA (default)
+
 ```bash
 mkdir build && cd build
 cmake ..
+make -j$(nproc)
+```
+
+### AMD HIP/ROCm
+
+```bash
+mkdir build && cd build
+cmake .. -DUGDS_BACKEND_CUDA=OFF -DUGDS_BACKEND_HIP=ON
 make -j$(nproc)
 ```
 
@@ -99,7 +150,7 @@ Run the functional test suite:
 ```bash
 for t in build/test_*; do
     echo "=== $(basename $t) ==="
-    $t -f /dev/ugds_drv0 -d 0
+    $t /dev/ugds_drv0 0
 done
 ```
 

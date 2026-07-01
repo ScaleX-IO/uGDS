@@ -17,11 +17,11 @@ int main(int argc, char** argv) {
     if (!d_buf) TEST_FAIL("cudaMalloc failed");
 
     // 1. Register -> OK
-    st = uGDSBufRegister(d_buf, buf_size, 0);
+    st = uGDSBufRegister(d_buf, buf_size, TEST_BUF_FLAGS);
     ASSERT_OK(st, "BufRegister");
 
     // 2. Double register -> MEMORY_ALREADY_REGISTERED
-    st = uGDSBufRegister(d_buf, buf_size, 0);
+    st = uGDSBufRegister(d_buf, buf_size, TEST_BUF_FLAGS);
     ASSERT_ERR(st, UGDS_MEMORY_ALREADY_REGISTERED, "double BufRegister");
 
     // 3. Deregister -> OK
@@ -33,16 +33,16 @@ int main(int argc, char** argv) {
     ASSERT_ERR(st, UGDS_MEMORY_NOT_REGISTERED, "double BufDeregister");
 
     // 5. Re-register after deregister -> OK
-    st = uGDSBufRegister(d_buf, buf_size, 0);
+    st = uGDSBufRegister(d_buf, buf_size, TEST_BUF_FLAGS);
     ASSERT_OK(st, "re-register after deregister");
     uGDSBufDeregister(d_buf);
 
     // 6. Null ptr -> INVALID_VALUE
-    st = uGDSBufRegister(nullptr, buf_size, 0);
+    st = uGDSBufRegister(nullptr, buf_size, TEST_BUF_FLAGS);
     ASSERT_ERR(st, UGDS_INVALID_VALUE, "null ptr BufRegister");
 
     // 7. Zero length -> INVALID_VALUE
-    st = uGDSBufRegister(d_buf, 0, 0);
+    st = uGDSBufRegister(d_buf, 0, TEST_BUF_FLAGS);
     ASSERT_ERR(st, UGDS_INVALID_VALUE, "zero length BufRegister");
 
     cudaFree(d_buf);

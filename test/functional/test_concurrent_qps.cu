@@ -18,7 +18,7 @@ static void worker(int id, uGDSHandle_t fh) {
         return;
     }
 
-    uGDSError_t st = uGDSBufRegister(d_buf, alloc_size, 0);
+    uGDSError_t st = uGDSBufRegister(d_buf, alloc_size, TEST_BUF_FLAGS);
     if (st.err != UGDS_SUCCESS) {
         fprintf(stderr, "worker %d: BufRegister failed: %s\n", id, uGDS_status_error(st.err));
         cudaFree(d_buf);

@@ -11,6 +11,7 @@
 #include "list.h"
 #include <linux/types.h>
 #include <linux/mm_types.h>
+#include <linux/atomic.h>
 
 
 /* Forward declaration */
@@ -35,6 +36,7 @@ struct map
     void*               data;           /* Custom data */
     release             release;        /* Custom callback for unmapping and releasing memory */
     unsigned long       n_addrs;        /* Number of mapped pages */
+    atomic_t            invalid;        /* Set by dmabuf move_notify */
     uint64_t            addrs[1];       /* Bus addresses */
 };
 
@@ -63,10 +65,38 @@ struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 va
 
 
 
+#ifdef _HIP
+/*
+ * Map GPU memory via standard Linux DMA-buf framework.
+ * Used by AMD HIP/ROCm backend.
+ */
+struct map* map_dmabuf(struct list* list, const struct ctrl* ctrl,
+                        u64 gpu_ptr, int dmabuf_fd,
+                        u64 dmabuf_offset, unsigned long n_pages,
+                        size_t ioaddrs_capacity);
+#endif
+
+
+
 /*
  * Find memory mapping from vaddr and current task
  */
 struct map* map_find(const struct list* list, u64 vaddr);
+
+
+#ifdef _HIP
+/* Forward declaration -- avoids pulling <linux/scatterlist.h> into map.h */
+struct sg_table;
+
+/*
+ * Flatten an SG table into per-page DMA addresses.
+ * Called by map_dmabuf_memory() and KUnit tests.
+ */
+int sg_flatten_to_addrs(struct sg_table* sgt, u64* addrs,
+                        unsigned long expected_pages,
+                        unsigned long ctrl_page_size,
+                        u64 hsa_offset);
+#endif
 
 
 #endif /* __UGDS_DRV_MAP_H__ */

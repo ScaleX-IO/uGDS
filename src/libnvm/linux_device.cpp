@@ -64,6 +64,29 @@ static int ioctl_map(const struct device* dev, const struct va_range* va, uint64
             type = NVM_MAP_DEVICE_MEMORY;
             break;
 
+#ifdef _HIP
+        case MAP_TYPE_DMABUF:
+        {
+            /* DMA-buf path: pass fd + offset + gpu_ptr to kernel */
+            struct nvm_ioctl_dmabuf request = {
+                .gpu_ptr          = (uint64_t) m->buffer,
+                .dmabuf_fd        = m->dmabuf_fd,
+                .__pad            = 0,
+                .dmabuf_offset    = m->dmabuf_offset,
+                .size             = (uint64_t)(va->page_size * va->n_pages),
+                .ioaddrs_capacity = (uint64_t)va->n_pages,
+                .ioaddrs          = (uint64_t)(uintptr_t)ioaddrs,
+            };
+            int err = ioctl(dev->fd, NVM_MAP_DMABUF_MEMORY, &request);
+            if (err < 0)
+            {
+                dprintf("DMA-buf kernel request failed: %s\n", strerror(errno));
+                return errno;
+            }
+            return 0;
+        }
+#endif
+
         default:
             dprintf("Unknown memory type in map for device");
             return EINVAL;

@@ -6,7 +6,26 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <cuda_runtime.h>
+
+#ifdef __HIP_PLATFORM_AMD__
+  #include <hip/hip_runtime.h>
+  #define cudaMalloc            hipMalloc
+  #define cudaFree              hipFree
+  #define cudaMemcpy           hipMemcpy
+  #define cudaMemset            hipMemset
+  #define cudaSetDevice         hipSetDevice
+  #define cudaDeviceSynchronize hipDeviceSynchronize
+  #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+  #define cudaSuccess           hipSuccess
+  #define cudaError_t           hipError_t
+  #define cudaGetErrorString    hipGetErrorString
+  #define cudaStreamSynchronize hipStreamSynchronize
+  /* HIP builds must use dmabuf path */
+  #define TEST_BUF_FLAGS  UGDS_REGISTER_DMABUF
+#else
+  #include <cuda_runtime.h>
+  #define TEST_BUF_FLAGS  0
+#endif
 
 #ifdef USE_NVIDIA_GDS
 #include <cufile.h>
@@ -369,7 +388,7 @@ static void run_ugds_bench(BenchOpts& opts) {
         CHECK_CUDA(cudaMemset(td->gpu_buffer, 0x00, chunk_size));
         CHECK_CUDA(cudaStreamSynchronize(0));
 
-        CHECK_UGDS(uGDSBufRegister(td->gpu_buffer, chunk_size, 0),
+        CHECK_UGDS(uGDSBufRegister(td->gpu_buffer, chunk_size, TEST_BUF_FLAGS),
                      "uGDSBufRegister");
 
         td->latency_vec.reserve(chunk_size / opts.io_size + 10);
