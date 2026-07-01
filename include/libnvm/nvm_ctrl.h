@@ -68,7 +68,8 @@ void nvm_ctrl_free(nvm_ctrl_t* ctrl);
  * Note: This function is implicitly called by the controller manager, so it
  *       should not be necessary to call it directly.
  */
-int nvm_raw_ctrl_reset(const nvm_ctrl_t* ctrl, uint64_t acq_ioaddr, uint64_t asq_ioaddr);
+int nvm_raw_ctrl_reset(const nvm_ctrl_t* ctrl, uint64_t acq_ioaddr, uint64_t asq_ioaddr,
+                       uint32_t acq_entries, uint32_t asq_entries);
 
 
 
