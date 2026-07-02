@@ -54,4 +54,11 @@ int _nvm_dma_init(nvm_dma_t** handle,
 const struct va_range* _nvm_dma_va(const nvm_dma_t* handle);
 
 
+/*
+ * Set dmabuf metadata on a DMA handle's internal map.
+ * Called by linux_dma.cpp AFTER the retain/close decision.
+ */
+int _nvm_dma_set_dmabuf_info(nvm_dma_t* handle,
+                              int fd, uint64_t offset, size_t length);
+
 #endif /* __NVM_INTERNAL_DMA_H__ */

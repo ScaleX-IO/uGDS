@@ -34,6 +34,11 @@ struct map
 
     va_range_free_t     release;// Callback for releasing address range
     va_unmap_t          unmap;// Callback for unmapping address range
+
+    /* dmabuf export metadata (valid only for MAP_TYPE_DMABUF*) */
+    int                 dmabuf_fd;       /* -1 if not dmabuf */
+    uint64_t            dmabuf_offset;   /* 0 if not dmabuf */
+    size_t              dmabuf_length;   /* 0 if not dmabuf */
 };
 
 
@@ -100,6 +105,10 @@ static int create_map(struct map** md, const nvm_ctrl_t* ctrl, struct va_range* 
     m->va = va;
     m->release = release;
     m->unmap = NULL;
+
+    m->dmabuf_fd = -1;
+    m->dmabuf_offset = 0;
+    m->dmabuf_length = 0;
 
     *md = m;
     return 0;
@@ -478,5 +487,31 @@ const struct va_range* _nvm_dma_va(const nvm_dma_t* handle)
     }
 
     return NULL;
+}
+
+
+int _nvm_dma_set_dmabuf_info(nvm_dma_t* handle,
+                              int fd, uint64_t offset, size_t length)
+{
+    if (handle == NULL) return -1;
+    struct container* c = _nvm_container_of(handle, struct container, handle);
+    c->map->dmabuf_fd = fd;
+    c->map->dmabuf_offset = offset;
+    c->map->dmabuf_length = length;
+    return 0;
+}
+
+int nvm_dma_get_dmabuf_info(const nvm_dma_t* handle,
+                             int* out_fd, uint64_t* out_offset, size_t* out_length)
+{
+    if (handle == NULL) return -1;
+    const struct container* c = _nvm_container_of(handle, struct container, handle);
+
+    if (c->map->dmabuf_fd < 0) return -1;
+
+    if (out_fd)     *out_fd = c->map->dmabuf_fd;
+    if (out_offset) *out_offset = c->map->dmabuf_offset;
+    if (out_length) *out_length = c->map->dmabuf_length;
+    return 0;
 }
 

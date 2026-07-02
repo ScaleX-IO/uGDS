@@ -35,8 +35,33 @@ The HIP backend implements AMD Infinity Storage (AIS) using the standard Linux D
 **Driver notes:**
 The kernel-side code uses standard upstream DMA-buf APIs (`dma_buf_dynamic_attach`, `dma_buf_pin`, `dma_buf_map_attachment`). The userspace side uses `hsa_amd_portable_export_dmabuf_v2()` from the ROCm runtime. No vendor-specific amdgpu extensions are required beyond upstream `CONFIG_HSA_AMD_P2P` support.
 
-**Synchronization contract:**
-Buffers registered with `uGDSBufRegister()` must not be modified by the GPU (HIP kernel writes) while NVMe I/O is in flight on the same buffer. Concurrent GPU access during DMA can cause data corruption. This mirrors the NVIDIA GDS requirement.
+**Synchronization contract (producer/consumer model):**
+
+All GPU memory accessors are classified as **producers** (write to GPU VRAM) or **consumers** (read from GPU VRAM):
+
+| Accessor | Direction | Role |
+|----------|-----------|------|
+| NVMe **Read** | SSD -> GPU VRAM | **Producer** (writes VRAM) |
+| NVMe **Write** | GPU VRAM -> SSD | **Consumer** (reads VRAM) |
+| RDMA **Send/Write** | GPU VRAM -> Network | **Consumer** (reads VRAM) |
+| RDMA **Recv/Read** | Network -> GPU VRAM | **Producer** (writes VRAM) |
+| GPU **Kernel Write** | GPU ALU -> VRAM | **Producer** |
+| GPU **Kernel Read** | VRAM -> GPU ALU | **Consumer** |
+
+**Rules:**
+1. A producer and consumer must NOT access the same buffer region simultaneously.
+2. After a producer completes, an explicit barrier is required before a consumer accesses the buffer:
+   - NVMe I/O: `uGDSRead()`/`uGDSWrite()` return value (synchronous) or batch completion poll
+   - RDMA: `ibv_poll_cq` for Work Completion
+   - GPU: `cudaStreamSynchronize()` / `hipStreamSynchronize()`
+3. Two consumers may safely overlap (e.g., NVMe Write + RDMA Send both reading GPU VRAM).
+4. A running GPU kernel must NOT overlap any third-party producer (NVMe/RDMA) on the same region.
+5. `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` is set automatically for RDMA-enabled CUDA buffers to ensure BAR consistency, but it does NOT replace explicit stream/CQ barriers.
+
+For **RDMA** buffers (registered with `enable_rdma=1`), additional lifetime rules apply:
+- All RDMA completions (`ibv_poll_cq`) and `ibv_dereg_mr()` MUST complete before `uGDSBufDeregister()`.
+- If using `uGDSRDMARegister()` (tracked API), `uGDSBufDeregister()` will fail with `UGDS_RDMA_MR_STILL_ACTIVE` if MRs are still registered.
+- `uGDSDriverClose()` also fails with `UGDS_RDMA_MR_STILL_ACTIVE` if any RDMA MRs are outstanding.
 
 **Important:** Each backend used at runtime must be enabled in both the kernel module and the userspace library. For example, a CUDA-only kernel module will reject HIP `uGDSBufRegister()` calls. In dual-backend builds, use `uGDSBufRegister(ptr, size, UGDS_REGISTER_DMABUF)` for AMD buffers and `uGDSBufRegister(ptr, size, 0)` for NVIDIA buffers (default).
 

@@ -17,11 +17,11 @@ struct nvm_ioctl_map
     uint64_t*   ioaddrs;
 };
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
 struct nvm_ioctl_dmabuf
 {
     uint64_t  gpu_ptr;           /* Original GPU VA -- unmap identity */
-    int32_t   dmabuf_fd;         /* DMA-buf fd from HSA export */
+    int32_t   dmabuf_fd;         /* DMA-buf fd from GPU export */
     uint32_t  __pad;             /* Alignment */
     uint64_t  dmabuf_offset;     /* Offset within dmabuf allocation */
     uint64_t  size;              /* Total buffer size in bytes */
@@ -38,7 +38,7 @@ enum nvm_ioctl_type
     NVM_MAP_HOST_MEMORY         = _IOW(NVM_IOCTL_TYPE, 1, struct nvm_ioctl_map),
     NVM_MAP_DEVICE_MEMORY       = _IOW(NVM_IOCTL_TYPE, 2, struct nvm_ioctl_map),
     NVM_UNMAP_MEMORY            = _IOW(NVM_IOCTL_TYPE, 3, uint64_t),
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
     NVM_MAP_DMABUF_MEMORY       = _IOWR(NVM_IOCTL_TYPE, 4, struct nvm_ioctl_dmabuf),
 #endif
 };

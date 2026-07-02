@@ -480,7 +480,7 @@ struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 va
 
 /* - AMD HIP / DMA-buf backend ------------------ */
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
 #include <linux/dma-buf.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-resv.h>

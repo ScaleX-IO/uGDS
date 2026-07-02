@@ -31,7 +31,7 @@
 
 MODULE_DESCRIPTION("UserSpace-GDS NVMe DMA helper");
 MODULE_LICENSE("Dual BSD/GPL");
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
 MODULE_IMPORT_NS("DMA_BUF");
 #endif
 MODULE_VERSION("1.0");
@@ -159,7 +159,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             break;
 #endif
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
         case NVM_MAP_DMABUF_MEMORY:
         {
             struct nvm_ioctl_dmabuf dreq;
@@ -270,7 +270,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             }
 #endif
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
             map = map_find(&device_list, addr);
             if (map != NULL)
             {
@@ -356,7 +356,7 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
     // Enable DMA
     pci_set_master(dev);
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
     /* HIP backend requires 64-bit DMA for P2P VRAM addresses (large BAR).
      * 32-bit fallback is intentionally a hard failure -- AMD GPU P2P
      * DMA requires 64-bit addressing. */

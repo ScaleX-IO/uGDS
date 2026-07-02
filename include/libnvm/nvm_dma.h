@@ -88,7 +88,16 @@ int nvm_dma_map_device(nvm_dma_t** map, const nvm_ctrl_t* ctrl, void* devptr, si
  * flags: 0 for NVIDIA CUDA (default), NVM_MAP_DMABUF for AMD HIP.
  */
 #define NVM_MAP_DMABUF  0x1
+#define NVM_MAP_RDMA    0x2    /* Retain dmabuf fd for RDMA use */
 int nvm_dma_map_device_ex(nvm_dma_t** map, const nvm_ctrl_t* ctrl, void* devptr, size_t size, int flags);
+
+/*
+ * Retrieve dmabuf metadata from a DMA handle.
+ * Returns 0 on success, -1 if handle is not dmabuf-backed.
+ * Does NOT dup() — returns internal fd.
+ */
+int nvm_dma_get_dmabuf_info(const nvm_dma_t* handle,
+                             int* out_fd, uint64_t* out_offset, size_t* out_length);
 
 //#endif /* __CUDA__ */
 

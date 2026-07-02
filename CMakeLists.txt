@@ -26,6 +26,7 @@ set(UGDS_CUDA_ARCHITECTURES "80;90")
 if(UGDS_BACKEND_CUDA)
     find_package(CUDAToolkit REQUIRED)
     set(UGDS_CUDA_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+    list(APPEND UGDS_CUDA_LIBS CUDA::cudart CUDA::cuda_driver)
 endif()
 
 # - HIP backend setup (independent) ------------
@@ -85,6 +86,32 @@ if(NOT UGDS_BACKEND_CUDA AND NOT UGDS_BACKEND_HIP)
     message(WARNING "No GPU backend selected, building library only")
 endif()
 
+# - RDMA support (optional) --------------------
+option(UGDS_ENABLE_RDMA "Enable tracked RDMA convenience API (libibverbs)" OFF)
+
+if(UGDS_ENABLE_RDMA)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(IBVERBS REQUIRED libibverbs)
+endif()
+
+# - CUDA dma-buf detection ----------------------
+if(UGDS_BACKEND_CUDA)
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES "${UGDS_CUDA_INCLUDES}")
+    set(CMAKE_REQUIRED_LIBRARIES "${UGDS_CUDA_LIBS}")
+    check_cxx_source_compiles("
+        #include <cuda.h>
+        int main() {
+            int fd; void* h = &fd;
+            cuMemGetHandleForAddressRange(h, (CUdeviceptr)0, 0,
+                CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+                CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
+            return 0;
+        }" HAVE_CUDA_DMABUF)
+    set(CMAKE_REQUIRED_INCLUDES)
+    set(CMAKE_REQUIRED_LIBRARIES)
+endif()
+
 # Library sources
 set(UGDS_SOURCES
     src/libnvm/admin.cpp
@@ -100,10 +127,11 @@ set(UGDS_SOURCES
     src/ugds_handle.cpp
     src/ugds_buf.cpp
     src/ugds_io.cpp
-    src/ugds_batch.cpp
-    src/ugds_async.cpp
-    src/ugds_hugepage.cpp
 )
+
+if(UGDS_ENABLE_RDMA)
+    list(APPEND UGDS_SOURCES src/ugds_rdma.cpp)
+endif()
 
 add_library(ugds SHARED ${UGDS_SOURCES})
 
@@ -114,23 +142,37 @@ target_include_directories(ugds
 )
 
 # Backend includes and compile definitions (independent)
-target_link_libraries(ugds PRIVATE Threads::Threads)
-
 if(UGDS_BACKEND_CUDA)
     target_include_directories(ugds PRIVATE ${UGDS_CUDA_INCLUDES})
     target_compile_definitions(ugds PRIVATE _CUDA)
-    target_link_libraries(ugds PRIVATE CUDA::cudart)
+    target_link_libraries(ugds PRIVATE ${UGDS_CUDA_LIBS})
+    if(HAVE_CUDA_DMABUF)
+        target_compile_definitions(ugds PRIVATE HAVE_CUDA_DMABUF)
+    endif()
 endif()
 
 if(UGDS_BACKEND_HIP)
     target_include_directories(ugds PRIVATE ${UGDS_HIP_INCLUDES})
     target_link_libraries(ugds PRIVATE ${UGDS_HIP_LIBS})
-    target_compile_definitions(ugds PRIVATE _HIP)
+    target_compile_definitions(ugds PRIVATE _HIP __HIP_PLATFORM_AMD__)
     if(HAVE_HSA_DMABUF_V2)
         target_compile_definitions(ugds PRIVATE HAVE_HSA_DMABUF_V2)
     endif()
 endif()
 
+# UGDS_HAVE_DMABUF: unified dmabuf guard (HIP or CUDA-dmabuf)
+if(UGDS_BACKEND_HIP OR (UGDS_BACKEND_CUDA AND HAVE_CUDA_DMABUF))
+    target_compile_definitions(ugds PRIVATE UGDS_HAVE_DMABUF)
+endif()
+
+# RDMA support
+if(UGDS_ENABLE_RDMA)
+    target_include_directories(ugds PRIVATE ${IBVERBS_INCLUDE_DIRS})
+    target_link_libraries(ugds PRIVATE ${IBVERBS_LIBRARIES})
+    target_compile_definitions(ugds PRIVATE _RDMA)
+endif()
+
+target_link_libraries(ugds PRIVATE Threads::Threads)
 target_compile_options(ugds PRIVATE -Wall -O2)
 
 # - Tests and benchmarks -----------------------
@@ -155,6 +197,7 @@ set(FUNCTIONAL_TESTS
     test_async_late_binding
     test_async_errors
     test_async_multi_stream
+    test_rdma_export
 )
 
 # CUDA tests (compiled with nvcc)
@@ -199,20 +242,6 @@ if(UGDS_BACKEND_CUDA)
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )
 
-        # bench_overlap: async IO + GPU compute overlap benchmark
-        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_overlap.cu)
-            add_executable(bench_overlap${CUDA_SUFFIX} test/perf/bench_overlap.cu)
-            target_include_directories(bench_overlap${CUDA_SUFFIX} PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
-            )
-            target_link_libraries(bench_overlap${CUDA_SUFFIX} ugds CUDA::cudart)
-            set_target_properties(bench_overlap${CUDA_SUFFIX} PROPERTIES
-                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
-                BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
-            )
-        endif()
-
         # bench_gds: NVIDIA GDS comparison (optional)
         set(CUFILE_LIB "" CACHE FILEPATH "Path to NVIDIA libcufile.so for GDS comparison benchmark")
         set(CUFILE_INCLUDE "" CACHE PATH "Path to NVIDIA cuFile headers (if different from ours)")
@@ -229,22 +258,6 @@ if(UGDS_BACKEND_CUDA)
             target_link_libraries(bench_gds ${CUFILE_LIB} CUDA::cudart)
             target_compile_definitions(bench_gds PRIVATE USE_O_DIRECT USE_NVIDIA_GDS)
             set_target_properties(bench_gds PROPERTIES
-                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
-            )
-
-            # bench_overlap_gds: overlap benchmark linked against libcufile.so
-            add_executable(bench_overlap_gds test/perf/bench_overlap.cu)
-            target_include_directories(bench_overlap_gds PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
-            )
-            if(CUFILE_INCLUDE)
-                target_include_directories(bench_overlap_gds PRIVATE ${CUFILE_INCLUDE})
-            else()
-                target_include_directories(bench_overlap_gds PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-            endif()
-            target_link_libraries(bench_overlap_gds ${CUFILE_LIB} CUDA::cudart)
-            target_compile_definitions(bench_overlap_gds PRIVATE USE_O_DIRECT USE_NVIDIA_GDS)
-            set_target_properties(bench_overlap_gds PROPERTIES
                 CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
             )
         endif()

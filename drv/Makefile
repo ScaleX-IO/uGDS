@@ -52,6 +52,19 @@ ifneq ($(KERNELRELEASE),)
  endif
  endif
 
+	# dmabuf backend available when HIP or CUDA is enabled
+UGDS_HAVE_DMABUF := 0
+ifeq ($(BUILD_HIP),1)
+  UGDS_HAVE_DMABUF := 1
+endif
+ifeq ($(ENABLE_CUDA),1)
+  UGDS_HAVE_DMABUF := 1
+endif
+
+ifeq ($(UGDS_HAVE_DMABUF),1)
+  ccflags-y += -DUGDS_HAVE_DMABUF
+endif
+
 else
 
 .PHONY: default reload unload load clean
