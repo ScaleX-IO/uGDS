@@ -225,7 +225,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             std::lock_guard<std::mutex> drv_lock(g_driver.lock);
             auto it = g_driver.buf_registry.find(entry.devPtr_base);
             if (it != g_driver.buf_registry.end())
-                buf_dma = it->second;
+                buf_dma = it->second.dma;
         }
 
         if (buf_dma == nullptr) {

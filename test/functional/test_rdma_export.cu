@@ -1,5 +1,7 @@
 #include "test_utils.h"
 #include <sys/stat.h>
+#include <errno.h>
+#include <dirent.h>
 
 /* Test: RDMA dmabuf export lifecycle
  *
@@ -45,7 +47,7 @@ int main(int argc, char** argv) {
             cudaFree(d_buf);
             close_handle(fh);
             uGDSDriverClose();
-            return 0;
+            return 77;  /* skip exit code (automake convention) */
         }
         TEST_FAIL("BufRegisterEx (RDMA): %s", UGDS_ERRSTR(st.err));
     }
@@ -117,11 +119,20 @@ int main(int argc, char** argv) {
     st = uGDSExportDmabuf(d_buf2, &exp3);
     ASSERT_ERR(st, UGDS_MEMORY_NOT_REGISTERED, "export on unregistered buffer");
 
-    /* ── 8. fd leak check: repeated register/export/deregister ── */
-    int fd_before = open("/dev/null", O_RDONLY);
-    close(fd_before);
-    /* The fd number should be recycled, so after full cycle the fd
-     * count should return to baseline */
+    /* ── 8. fd leak check: count /proc/self/fd before/after ── */
+    auto count_fds = []() -> int {
+        DIR* d = opendir("/proc/self/fd");
+        if (!d) return -1;
+        int count = 0;
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (ent->d_name[0] != '.') count++;
+        }
+        closedir(d);
+        return count;
+    };
+
+    int fd_before = count_fds();
     for (int i = 0; i < 10; i++) {
         st = uGDSBufRegisterEx(d_buf, buf_size, &cfg);
         ASSERT_OK(st, "BufRegisterEx loop");
@@ -135,9 +146,9 @@ int main(int argc, char** argv) {
         ASSERT_OK(st, "BufDeregister loop");
     }
 
-    int fd_after = open("/dev/null", O_RDONLY);
-    close(fd_after);
-    if (fd_after != fd_before)
+    int fd_after = count_fds();
+    /* Allow runtime libraries to hold internal fds, but flag large leaks */
+    if (fd_before > 0 && fd_after > fd_before + 2)
         TEST_FAIL("fd leak: before=%d after=%d", fd_before, fd_after);
 
     cudaFree(d_buf);

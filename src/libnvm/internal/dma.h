@@ -61,4 +61,12 @@ const struct va_range* _nvm_dma_va(const nvm_dma_t* handle);
 int _nvm_dma_set_dmabuf_info(nvm_dma_t* handle,
                               int fd, uint64_t offset, size_t length);
 
+/*
+ * Retrieve dmabuf metadata from a DMA handle (internal only).
+ * Returns 0 on success, -1 if handle is not dmabuf-backed.
+ * Does NOT dup() — returns internal fd. Callers must NOT close it.
+ */
+int nvm_dma_get_dmabuf_info(const nvm_dma_t* handle,
+                             int* out_fd, uint64_t* out_offset, size_t* out_length);
+
 #endif /* __NVM_INTERNAL_DMA_H__ */

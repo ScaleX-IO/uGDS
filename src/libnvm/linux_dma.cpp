@@ -422,8 +422,13 @@ int nvm_dma_map_device_ex(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devp
                 dprintf("sysconf(_SC_PAGESIZE) failed\n");
                 return EINVAL;
             }
+            /* Overflow guard: size + hps - 1 can wrap for huge sizes */
+            if ((size_t)hps > 0 && size > SIZE_MAX - ((size_t)hps - 1)) {
+                dprintf("Buffer size %zu overflows alignment computation\n", size);
+                return EINVAL;
+            }
             size_t offset_in_alloc = (uintptr_t)devptr - (uintptr_t)base_ptr;
-            size_t aligned_size = (size + hps - 1) & ~((size_t)hps - 1);
+            size_t aligned_size = (size + (size_t)hps - 1) & ~((size_t)hps - 1);
 
             if (offset_in_alloc + aligned_size > alloc_size) {
                 dprintf("Buffer range %p+%zu exceeds CUDA allocation %p+%zu\n",

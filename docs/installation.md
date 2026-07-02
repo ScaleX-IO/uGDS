@@ -49,21 +49,34 @@ All GPU memory accessors are classified as **producers** (write to GPU VRAM) or 
 | GPU **Kernel Read** | VRAM -> GPU ALU | **Consumer** |
 
 **Rules:**
-1. A producer and consumer must NOT access the same buffer region simultaneously.
-2. After a producer completes, an explicit barrier is required before a consumer accesses the buffer:
+1. Any producer requires exclusive ownership of the region. Two producers must NOT overlap (e.g., NVMe Read + RDMA Recv on the same VRAM is a data race).
+2. Two consumers may safely overlap (e.g., NVMe Write + RDMA Send both reading GPU VRAM).
+3. Any transition involving a producer requires the previous operation's completion barrier:
+   - Consumer → Producer: drain all consumer completions before starting the producer.
+   - Producer → Consumer: wait for producer completion before starting the consumer.
+4. After a producer completes, an explicit barrier is required before any dependent operation:
    - NVMe I/O: `uGDSRead()`/`uGDSWrite()` return value (synchronous) or batch completion poll
    - RDMA: `ibv_poll_cq` for Work Completion
    - GPU: `cudaStreamSynchronize()` / `hipStreamSynchronize()`
-3. Two consumers may safely overlap (e.g., NVMe Write + RDMA Send both reading GPU VRAM).
-4. A running GPU kernel must NOT overlap any third-party producer (NVMe/RDMA) on the same region.
-5. `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` is set automatically for RDMA-enabled CUDA buffers to ensure BAR consistency, but it does NOT replace explicit stream/CQ barriers.
+5. A running GPU kernel must NOT overlap any third-party producer (NVMe/RDMA) on the same region.
+6. `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` is set automatically for RDMA-enabled CUDA buffers to ensure BAR consistency, but it does NOT replace explicit stream/CQ barriers.
 
 For **RDMA** buffers (registered with `enable_rdma=1`), additional lifetime rules apply:
 - All RDMA completions (`ibv_poll_cq`) and `ibv_dereg_mr()` MUST complete before `uGDSBufDeregister()`.
-- If using `uGDSRDMARegister()` (tracked API), `uGDSBufDeregister()` will fail with `UGDS_RDMA_MR_STILL_ACTIVE` if MRs are still registered.
-- `uGDSDriverClose()` also fails with `UGDS_RDMA_MR_STILL_ACTIVE` if any RDMA MRs are outstanding.
+- If using the tracked API (`uGDSRDMARegister()`), `uGDSBufDeregister()` will fail with `UGDS_RDMA_MR_STILL_ACTIVE` if MRs are still registered.
+- If using the raw export API (`uGDSExportDmabuf()`), uGDS does not track MRs — the caller is responsible for ensuring all MRs are deregistered before calling `uGDSBufDeregister()`.
+- `uGDSDriverClose()` fails with `UGDS_RDMA_MR_STILL_ACTIVE` if any tracked MRs are outstanding.
 
-**Important:** Each backend used at runtime must be enabled in both the kernel module and the userspace library. For example, a CUDA-only kernel module will reject HIP `uGDSBufRegister()` calls. In dual-backend builds, use `uGDSBufRegister(ptr, size, UGDS_REGISTER_DMABUF)` for AMD buffers and `uGDSBufRegister(ptr, size, 0)` for NVIDIA buffers (default).
+**Important:** Each backend used at runtime must be enabled in both the kernel module and the userspace library. For example, a CUDA-only kernel module will reject HIP `uGDSBufRegister()` calls. In dual-backend builds, use `uGDSBufRegisterEx()` with explicit `uGDSBackend_t`.
+
+**CUDA dma-buf / RDMA:** The userspace CMake auto-detects CUDA dma-buf support (`HAVE_CUDA_DMABUF`). When enabled, the kernel module must also be built with the same flag:
+
+```bash
+cd drv
+make BUILD_CUDA=1 HAVE_CUDA_DMABUF=1
+```
+
+Without this flag, the kernel module will not include the `NVM_MAP_DMABUF_MEMORY` ioctl handler, and `uGDSBufRegisterEx()` with `enable_rdma=1` will fail at runtime.
 
 ## Step 1: Build the Kernel Module
 

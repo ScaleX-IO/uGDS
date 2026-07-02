@@ -80,7 +80,13 @@ struct DriverState {
     bool                                          initialized = false;
     std::mutex                                    lock;
     nvm_ctrl_t*                                   default_ctrl = nullptr;
-    std::unordered_map<const void*, nvm_dma_t*>   buf_registry;
+
+    /* Buffer registry with backend tracking for dual-backend dispatch */
+    struct BufEntry {
+        nvm_dma_t*       dma;
+        uGDSBackend_t    backend;
+    };
+    std::unordered_map<const void*, BufEntry>     buf_registry;
 
     /* RDMA MR tracking */
     typedef enum {
@@ -173,7 +179,7 @@ struct AsyncRequest {
     uint8_t         opcode;
 };
 
-void* hugepage_alloc(size_t size, size_t* alloc_size_out);
-void  hugepage_free(void* ptr, size_t alloc_size);
+/* Internal stream type — void* for backend neutrality */
+typedef void* ugsd_stream_t;
 
 #endif /* __UGDS_INTERNAL_H__ */

@@ -37,7 +37,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         std::lock_guard<std::mutex> drv_lock(g_driver.lock);
         auto it = g_driver.buf_registry.find(bufPtr_base);
         if (it != g_driver.buf_registry.end()) {
-            buf_dma = it->second;
+            buf_dma = it->second.dma;
         }
     }
 

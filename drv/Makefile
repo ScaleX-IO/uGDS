@@ -52,13 +52,18 @@ ifneq ($(KERNELRELEASE),)
  endif
  endif
 
-	# dmabuf backend available when HIP or CUDA is enabled
+	# dmabuf backend available when HIP is enabled, or when CUDA
+	# explicitly requests it via HAVE_CUDA_DMABUF=1. The userspace
+	# CMake detects this with check_cxx_source_compiles. Pass the same
+	# flag to the kernel build: make BUILD_CUDA=1 HAVE_CUDA_DMABUF=1
 UGDS_HAVE_DMABUF := 0
 ifeq ($(BUILD_HIP),1)
   UGDS_HAVE_DMABUF := 1
 endif
-ifeq ($(ENABLE_CUDA),1)
-  UGDS_HAVE_DMABUF := 1
+ifdef HAVE_CUDA_DMABUF
+  ifneq ($(HAVE_CUDA_DMABUF),0)
+    UGDS_HAVE_DMABUF := 1
+  endif
 endif
 
 ifeq ($(UGDS_HAVE_DMABUF),1)

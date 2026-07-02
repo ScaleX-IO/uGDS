@@ -25,7 +25,7 @@ extern "C" uGDSError_t uGDSDriverClose(void) {
     }
 
     for (auto& entry : g_driver.buf_registry) {
-        nvm_dma_unmap(entry.second);
+        nvm_dma_unmap(entry.second.dma);
     }
     g_driver.buf_registry.clear();
     g_driver.rdma_records.clear();
