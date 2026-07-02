@@ -135,7 +135,7 @@ scripts/run_tests.sh all
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Core synchronous API + test suite | ✅ |
-| 1.5 | Unified multi-backend (NVIDIA CUDA + AMD HIP/ROCm) | 🔧 |
+| 1.5 | Unified multi-backend (NVIDIA CUDA + AMD HIP/ROCm) | ✅ |
 | 2 | Batch IO API (multi-command doorbell) | ✅ |
 | 3 | Async Stream API (CUDA stream integration) | ✅ |
 | 4 | Hugepage support (larger QP depth) | ✅ |
