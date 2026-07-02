@@ -27,11 +27,7 @@ extern "C" uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, i
                                        const_cast<void*>(bufPtr_base), length,
                                        flags);
     if (status != 0 || dma == nullptr) {
-        /* ENOTSUP or EINVAL when dmabuf flags are set indicates the
-         * kernel module was not built with HAVE_CUDA_DMABUF and the
-         * ioctl fell into its default case returning EINVAL. */
-        if (status == ENOTSUP ||
-            (status == EINVAL && (flags & NVM_MAP_DMABUF)))
+        if (status == ENOTSUP || status == EOPNOTSUPP)
             return make_error(UGDS_IO_NOT_SUPPORTED);
         return make_error(UGDS_GPU_MEMORY_PINNING_FAILED);
     }
@@ -64,20 +60,28 @@ extern "C" uGDSError_t uGDSBufRegisterEx(const void* bufPtr_base, size_t length,
     int flags = 0;
     switch (config->backend) {
     case UGDS_BACKEND_DEFAULT:
+        /* Export requires an explicit backend so the correct dma-buf
+         * path is selected. DEFAULT relies on auto-probe which does
+         * not retain an exportable fd. */
+        if (config->enable_export)
+            return make_error(UGDS_INVALID_VALUE);
         break;
     case UGDS_BACKEND_HIP:
 #ifndef _HIP
         return make_error(UGDS_PLATFORM_NOT_SUPPORTED);
 #else
         flags |= NVM_MAP_DMABUF;
-        flags |= NVM_MAP_RDMA;  /* retain dmabuf fd for export */
+        if (config->enable_export)
+            flags |= NVM_MAP_RDMA;  /* retain dmabuf fd for export */
 #endif
         break;
     case UGDS_BACKEND_CUDA:
 #ifndef _CUDA
         return make_error(UGDS_PLATFORM_NOT_SUPPORTED);
 #else
-        flags |= NVM_MAP_RDMA;  /* enable dmabuf export path */
+        flags |= NVM_MAP_FORCE_CUDA;  /* skip auto-probe in dual-backend */
+        if (config->enable_export)
+            flags |= NVM_MAP_RDMA;    /* enable dmabuf export path */
 #endif
         break;
     default:
@@ -151,16 +155,10 @@ extern "C" uGDSError_t uGDSExportDmabuf(const void* bufPtr_base,
         return make_error(UGDS_IO_NOT_SUPPORTED);
     }
 
-    /* C-02 fix: dup() so caller owns the fd */
-    int dup_fd = dup(internal_fd);
+    /* Atomically dup with CLOEXEC to prevent fd leaking into child
+     * processes across fork/exec in multithreaded callers. */
+    int dup_fd = fcntl(internal_fd, F_DUPFD_CLOEXEC, 0);
     if (dup_fd < 0) {
-        return make_error(UGDS_INTERNAL_ERROR);
-    }
-
-    /* Set FD_CLOEXEC on the dup'd fd — fail hard on error (security) */
-    int fd_flags = fcntl(dup_fd, F_GETFD);
-    if (fd_flags < 0 || fcntl(dup_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
-        close(dup_fd);
         return make_error(UGDS_INTERNAL_ERROR);
     }
 

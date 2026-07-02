@@ -87,8 +87,9 @@ int nvm_dma_map_device(nvm_dma_t** map, const nvm_ctrl_t* ctrl, void* devptr, si
  * Extended version with flags for backend selection.
  * flags: 0 for NVIDIA CUDA (default), NVM_MAP_DMABUF for AMD HIP.
  */
-#define NVM_MAP_DMABUF  0x1
-#define NVM_MAP_RDMA    0x2    /* Retain dmabuf fd for RDMA use */
+#define NVM_MAP_DMABUF      0x1
+#define NVM_MAP_RDMA        0x2    /* Retain dmabuf fd for RDMA use */
+#define NVM_MAP_FORCE_CUDA  0x4    /* Force CUDA path (skip auto-probe) */
 int nvm_dma_map_device_ex(nvm_dma_t** map, const nvm_ctrl_t* ctrl, void* devptr, size_t size, int flags);
 
 /* (nvm_dma_get_dmabuf_info is internal-only — declared in internal/dma.h) */

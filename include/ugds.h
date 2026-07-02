@@ -3,13 +3,15 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <time.h>
 
 /* Buffer registration flags (defined locally to avoid pulling in
  * libnvm/nvm_dma.h, which transitively includes C++ <atomic>) */
-#define NVM_MAP_DMABUF  0x1
-
+#define NVM_MAP_DMABUF      0x1
+#define NVM_MAP_RDMA        0x2    /* Retain dmabuf fd for RDMA use */
+#define NVM_MAP_FORCE_CUDA  0x4    /* Force CUDA path (skip auto-probe) */
 /* GPU runtime headers are NOT included in the public header.
  * cuda_runtime.h and hip_runtime_api.h define conflicting types
  * (vector types, stream types) that cannot coexist in a single TU.
@@ -137,6 +139,7 @@ typedef enum uGDSBackend {
 
 typedef struct uGDSBufConfig {
     uGDSBackend_t   backend;
+    bool            enable_export;  /* request dma-buf fd for RDMA/peer export */
 } uGDSBufConfig_t;
 
 uGDSError_t uGDSBufRegisterEx(const void* bufPtr_base, size_t length,

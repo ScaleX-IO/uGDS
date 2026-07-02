@@ -214,11 +214,27 @@ int nvm_dma_map_device_ex(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devp
 #endif
 
     /* Reject unknown flags */
-    if (flags & ~(NVM_MAP_DMABUF | NVM_MAP_RDMA))
+    if (flags & ~(NVM_MAP_DMABUF | NVM_MAP_RDMA | NVM_MAP_FORCE_CUDA))
     {
         dprintf("nvm_dma_map_device: unknown flags 0x%x\n", flags);
         return EINVAL;
     }
+
+    /* Reject conflicting backend flags */
+    if ((flags & NVM_MAP_DMABUF) && (flags & NVM_MAP_FORCE_CUDA))
+    {
+        dprintf("nvm_dma_map_device: NVM_MAP_DMABUF and NVM_MAP_FORCE_CUDA are mutually exclusive\n");
+        return EINVAL;
+    }
+
+    /* Reject FORCE_CUDA when CUDA is not compiled in */
+#ifndef _CUDA
+    if (flags & NVM_MAP_FORCE_CUDA)
+    {
+        dprintf("nvm_dma_map_device: NVM_MAP_FORCE_CUDA requested but CUDA backend not compiled in\n");
+        return ENOTSUP;
+    }
+#endif
 
     /* Determine which backend to use at runtime */
     int use_hip = 0;
@@ -232,6 +248,13 @@ int nvm_dma_map_device_ex(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devp
     if (flags & NVM_MAP_DMABUF)
     {
         use_hip = 1;
+    }
+    else if (flags & NVM_MAP_FORCE_CUDA)
+    {
+        /* Explicit CUDA selection — skip auto-probe to avoid accepting
+         * a HIP pointer or rejecting a valid non-current-context CUDA
+         * pointer. */
+        use_hip = 0;
     }
     else if (!(flags & NVM_MAP_RDMA))
     {
@@ -472,6 +495,12 @@ int nvm_dma_map_device_ex(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devp
 
             if (cu_err != CUDA_SUCCESS || dmabuf_fd < 0) {
                 dprintf("cuMemGetHandleForAddressRange failed: %d\n", cu_err);
+                /* CUDA_ERROR_NOT_SUPPORTED means the GPU/driver supports
+                 * the query but not the PCIe dmabuf export path. Translate
+                 * to ENOTSUP so callers get UGDS_IO_NOT_SUPPORTED and can
+                 * skip or fall back gracefully. */
+                if (cu_err == CUDA_ERROR_NOT_SUPPORTED)
+                    return ENOTSUP;
                 return EIO;
             }
             dmabuf_offset = 0;

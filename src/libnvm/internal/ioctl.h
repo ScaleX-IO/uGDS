@@ -17,7 +17,9 @@ struct nvm_ioctl_map
     uint64_t*   ioaddrs;
 };
 
-#if defined(UGDS_HAVE_DMABUF)
+/* Always define the dmabuf struct so the ioctl enum can reference it
+ * unconditionally. The handler body is only compiled when
+ * UGDS_HAVE_DMABUF is set, but the type must exist for the enum. */
 struct nvm_ioctl_dmabuf
 {
     uint64_t  gpu_ptr;           /* Original GPU VA -- unmap identity */
@@ -28,7 +30,6 @@ struct nvm_ioctl_dmabuf
     uint64_t  ioaddrs_capacity;  /* Max entries in ioaddrs buffer */
     uint64_t  ioaddrs;           /* Output: DMA bus addresses (pointer) */
 };
-#endif
 
 
 
@@ -38,9 +39,7 @@ enum nvm_ioctl_type
     NVM_MAP_HOST_MEMORY         = _IOW(NVM_IOCTL_TYPE, 1, struct nvm_ioctl_map),
     NVM_MAP_DEVICE_MEMORY       = _IOW(NVM_IOCTL_TYPE, 2, struct nvm_ioctl_map),
     NVM_UNMAP_MEMORY            = _IOW(NVM_IOCTL_TYPE, 3, uint64_t),
-#if defined(UGDS_HAVE_DMABUF)
     NVM_MAP_DMABUF_MEMORY       = _IOWR(NVM_IOCTL_TYPE, 4, struct nvm_ioctl_dmabuf),
-#endif
 };
 
 

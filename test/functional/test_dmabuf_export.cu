@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
 #else
         UGDS_BACKEND_CUDA;
 #endif
+    cfg.enable_export = true;  /* request dma-buf fd for export test */
 
     st = uGDSBufRegisterEx(d_buf, buf_size, &cfg);
     if (st.err != UGDS_SUCCESS) {
