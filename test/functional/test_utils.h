@@ -16,6 +16,14 @@
   #define cudaError_t           hipError_t
   #define cudaGetErrorString    hipGetErrorString
   #define cudaStreamSynchronize hipStreamSynchronize
+  #define cudaStreamCreate      hipStreamCreate
+  #define cudaStreamDestroy     hipStreamDestroy
+  #define cudaMemsetAsync       hipMemsetAsync
+  #define cudaHostAlloc         hipHostMalloc
+  #define cudaHostAllocDefault  hipHostMallocDefault
+  #define cudaFreeHost          hipHostFree
+  #define cudaLaunchHostFunc    hipLaunchHostFunc
+  #define cudaStream_t          hipStream_t
   /* HIP builds must use dmabuf path */
   #define TEST_BUF_FLAGS  UGDS_REGISTER_DMABUF
 #else

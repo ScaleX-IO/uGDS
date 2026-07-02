@@ -5,7 +5,12 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <time.h>
+#if defined(__HIP_PLATFORM_AMD__) && !defined(__NVCC__)
+#include <hip/hip_runtime.h>
+typedef hipStream_t cudaStream_t;
+#else
 #include <cuda_runtime.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
