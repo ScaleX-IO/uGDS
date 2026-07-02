@@ -74,6 +74,7 @@ struct HandleState {
     std::unique_ptr<IOQueuePairHuge> batch_qp;
     uint16_t                    batch_queue_depth;
     std::atomic<bool>           batch_active{false};
+    std::atomic<uint32_t>       handle_in_flight{0};  /* async refcount for safe deregister */
 };
 
 struct DriverState {
@@ -81,33 +82,15 @@ struct DriverState {
     std::mutex                                    lock;
     nvm_ctrl_t*                                   default_ctrl = nullptr;
 
-    /* Buffer registry with backend tracking for dual-backend dispatch */
+    /* Buffer registry with backend tracking for dual-backend dispatch.
+     * in_flight counts active IO references to prevent use-after-free
+     * during concurrent Deregister. */
     struct BufEntry {
-        nvm_dma_t*       dma;
-        uGDSBackend_t    backend;
+        nvm_dma_t*           dma;
+        uGDSBackend_t        backend;
+        std::atomic<uint32_t> in_flight{0};
     };
     std::unordered_map<const void*, BufEntry>     buf_registry;
-
-    /* RDMA MR tracking */
-    typedef enum {
-        RDMA_REC_PENDING       = 0,   /* in-flight registration */
-        RDMA_REC_ACTIVE        = 1,   /* MR registered, in use */
-        RDMA_REC_DEREGISTERING = 2,   /* dereg in progress */
-    } RDMARecordState;
-
-    struct RDMARecord {
-        const void*         bufPtr;
-        void*               mr;         /* ibv_mr*, NULL while pending */
-        int                 dup_fd;     /* -1 while pending */
-        uint64_t            iova;
-        uint64_t            offset;
-        size_t              length;
-        RDMARecordState     state;
-        uint64_t            token;      /* unique per registration */
-    };
-
-    std::unordered_map<const void*, std::vector<RDMARecord>>  rdma_records;
-    std::atomic<uint64_t>                                      rdma_token_counter{0};
 };
 
 extern DriverState g_driver;
@@ -181,5 +164,8 @@ struct AsyncRequest {
 
 /* Internal stream type — void* for backend neutrality */
 typedef void* ugsd_stream_t;
+
+void* hugepage_alloc(size_t size, size_t* alloc_size_out);
+void  hugepage_free(void* ptr, size_t alloc_size);
 
 #endif /* __UGDS_INTERNAL_H__ */

@@ -39,6 +39,11 @@ struct map
     int                 dmabuf_fd;       /* -1 if not dmabuf */
     uint64_t            dmabuf_offset;   /* 0 if not dmabuf */
     size_t              dmabuf_length;   /* 0 if not dmabuf */
+
+    /* Backend origin tag: true if mapping went through the HIP/dmabuf
+     * path (regardless of whether fd was retained). Used by dual-backend
+     * dispatch to select the correct async launch function. */
+    bool                hip_origin;
 };
 
 
@@ -109,6 +114,7 @@ static int create_map(struct map** md, const nvm_ctrl_t* ctrl, struct va_range* 
     m->dmabuf_fd = -1;
     m->dmabuf_offset = 0;
     m->dmabuf_length = 0;
+    m->hip_origin = false;
 
     *md = m;
     return 0;
@@ -513,5 +519,19 @@ int nvm_dma_get_dmabuf_info(const nvm_dma_t* handle,
     if (out_offset) *out_offset = c->map->dmabuf_offset;
     if (out_length) *out_length = c->map->dmabuf_length;
     return 0;
+}
+
+bool nvm_dma_is_hip_origin(const nvm_dma_t* handle)
+{
+    if (handle == NULL) return false;
+    const struct container* c = _nvm_container_of(handle, struct container, handle);
+    return c->map->hip_origin;
+}
+
+void _nvm_dma_set_hip_origin(nvm_dma_t* handle)
+{
+    if (handle == NULL) return;
+    struct container* c = _nvm_container_of(handle, struct container, handle);
+    c->map->hip_origin = true;
 }
 

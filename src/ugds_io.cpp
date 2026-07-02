@@ -38,16 +38,25 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         auto it = g_driver.buf_registry.find(bufPtr_base);
         if (it != g_driver.buf_registry.end()) {
             buf_dma = it->second.dma;
+            it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
         }
     }
 
     if (buf_dma != nullptr) {
         if ((static_cast<size_t>(bufPtr_offset) % page_size) != 0) {
+            std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+            auto it = g_driver.buf_registry.find(bufPtr_base);
+            if (it != g_driver.buf_registry.end())
+                it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
             return -EINVAL;
         }
         buf_page_start = static_cast<size_t>(bufPtr_offset) / page_size;
         size_t total_pages_needed = buf_page_start + (size + page_size - 1) / page_size;
         if (total_pages_needed > buf_dma->n_ioaddrs) {
+            std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+            auto it = g_driver.buf_registry.find(bufPtr_base);
+            if (it != g_driver.buf_registry.end())
+                it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
             return -EINVAL;
         }
     } else {
@@ -198,6 +207,12 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 
     if (on_the_fly && buf_dma != nullptr) {
         nvm_dma_unmap(buf_dma);
+    } else if (buf_dma != nullptr) {
+        /* Registered buffer: release in-flight reference */
+        std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+        auto it = g_driver.buf_registry.find(bufPtr_base);
+        if (it != g_driver.buf_registry.end())
+            it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
     }
 
     return result;
@@ -206,12 +221,22 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 extern "C" ssize_t uGDSRead(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                               off_t file_offset, off_t bufPtr_offset)
 {
-    return do_io_internal(fh, bufPtr_base, size, file_offset, bufPtr_offset, NVM_IO_READ);
+    if (fh == nullptr) return -EINVAL;
+    HandleState* hs = static_cast<HandleState*>(fh);
+    hs->handle_in_flight.fetch_add(1, std::memory_order_acq_rel);
+    ssize_t ret = do_io_internal(fh, bufPtr_base, size, file_offset, bufPtr_offset, NVM_IO_READ);
+    hs->handle_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    return ret;
 }
 
 extern "C" ssize_t uGDSWrite(uGDSHandle_t fh, const void* bufPtr_base, size_t size,
                                off_t file_offset, off_t bufPtr_offset)
 {
-    return do_io_internal(fh, const_cast<void*>(bufPtr_base), size, file_offset, bufPtr_offset,
+    if (fh == nullptr) return -EINVAL;
+    HandleState* hs = static_cast<HandleState*>(fh);
+    hs->handle_in_flight.fetch_add(1, std::memory_order_acq_rel);
+    ssize_t ret = do_io_internal(fh, const_cast<void*>(bufPtr_base), size, file_offset, bufPtr_offset,
                  NVM_IO_WRITE);
+    hs->handle_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    return ret;
 }

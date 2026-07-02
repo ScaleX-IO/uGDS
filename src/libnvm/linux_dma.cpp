@@ -25,9 +25,7 @@
 #include "internal/dprintf.h"
 
 #ifdef _CUDA
-#ifdef HAVE_CUDA_DMABUF
 #include <cuda.h>
-#endif
 #endif
 
 
@@ -226,7 +224,30 @@ int nvm_dma_map_device_ex(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devp
     int use_hip = 0;
 #ifdef _HIP
   #ifdef _CUDA
-    use_hip = (flags & NVM_MAP_DMABUF) ? 1 : 0;
+    /* Dual-backend: explicit flag wins, otherwise probe pointer origin.
+     * cuPointerGetAttribute succeeds for CUDA pointers; HIP pointers
+     * fail it, so we fall back to HIP path. This handles on-the-fly
+     * (unregistered) mappings where the caller doesn't know the backend.
+     * Uses driver API to avoid CUDA/HIP runtime header conflicts. */
+    if (flags & NVM_MAP_DMABUF)
+    {
+        use_hip = 1;
+    }
+    else if (!(flags & NVM_MAP_RDMA))
+    {
+        unsigned int mem_type = 0;
+        CUresult cu_err = cuPointerGetAttribute(&mem_type,
+            CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)devptr);
+        if (cu_err != CUDA_SUCCESS)
+        {
+            /* Not a CUDA pointer — assume HIP */
+            use_hip = 1;
+        }
+        else
+        {
+            use_hip = 0;
+        }
+    }
   #else
     use_hip = 1;  /* HIP-only build */
   #endif
@@ -523,6 +544,10 @@ int nvm_dma_map_device_ex(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devp
 #ifdef _HIP
     if (md->type == MAP_TYPE_DMABUF)
     {
+        /* Tag as HIP-origin for dual-backend async dispatch,
+         * regardless of fd retention. */
+        _nvm_dma_set_hip_origin(*handle);
+
         if (!md->retain_fd)
         {
             /* Non-RDMA: kernel holds refcount, close userspace fd */

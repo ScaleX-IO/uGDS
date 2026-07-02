@@ -4,8 +4,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <sys/types.h>
-#include <libnvm/nvm_dma.h>  /* NVM_MAP_DMABUF */
 #include <time.h>
+
+/* Buffer registration flags (defined locally to avoid pulling in
+ * libnvm/nvm_dma.h, which transitively includes C++ <atomic>) */
+#define NVM_MAP_DMABUF  0x1
 
 /* GPU runtime headers are NOT included in the public header.
  * cuda_runtime.h and hip_runtime_api.h define conflicting types
@@ -59,7 +62,6 @@ typedef enum uGDSOpError {
     UGDS_GPU_MEMORY_PINNING_FAILED   = UGDS_BASE_ERR + 36,
 
     UGDS_BATCH_CAPACITY_EXCEEDED     = UGDS_BASE_ERR + 40,
-    UGDS_RDMA_MR_STILL_ACTIVE        = UGDS_BASE_ERR + 41,
     UGDS_BUSY                        = UGDS_BASE_ERR + 42,
 } uGDSOpError;
 
@@ -79,7 +81,7 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
     case UGDS_INTERNAL_ERROR:              return "internal error";
     case UGDS_GPU_MEMORY_PINNING_FAILED:   return "GPU memory pinning failed";
     case UGDS_BATCH_CAPACITY_EXCEEDED:     return "batch capacity exceeded";
-    case UGDS_RDMA_MR_STILL_ACTIVE:       return "RDMA MR still active";
+
     case UGDS_BUSY:                        return "resource busy, retry";
     default:                                  return "unknown uGDS error";
     }
@@ -124,12 +126,9 @@ uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int flags);
 
 uGDSError_t uGDSBufDeregister(const void* bufPtr_base);
 
-/* ── RDMA / dma-buf export support ── */
+/* ── dma-buf export support ── */
 
-/* Flag for uGDSBufRegister: retain dmabuf fd for RDMA use */
-#define UGDS_REGISTER_RDMA  NVM_MAP_RDMA
-
-/* Extended buffer registration with explicit backend + RDMA flag */
+/* Extended buffer registration with explicit backend */
 typedef enum uGDSBackend {
     UGDS_BACKEND_DEFAULT = 0,
     UGDS_BACKEND_CUDA    = 1,
@@ -138,7 +137,6 @@ typedef enum uGDSBackend {
 
 typedef struct uGDSBufConfig {
     uGDSBackend_t   backend;
-    int             enable_rdma;
 } uGDSBufConfig_t;
 
 uGDSError_t uGDSBufRegisterEx(const void* bufPtr_base, size_t length,
@@ -152,53 +150,11 @@ typedef struct uGDSDmabufExport {
     size_t    length;
 } uGDSDmabufExport_t;
 
-/* Export a dma-buf handle for RDMA registration.
+/* Export a dma-buf handle for external use (e.g., RDMA registration).
  * Returns UGDS_SUCCESS with 'out' filled.
- * Caller owns out->fd and MUST close it after ibv_reg_dmabuf_mr().
- * WARNING: This is a low-level non-tracked export. For tracked lifecycle,
- * use uGDSRDMARegister() instead. */
+ * Caller owns out->fd and MUST close it after use. */
 uGDSError_t uGDSExportDmabuf(const void* bufPtr_base,
                               uGDSDmabufExport_t* out);
-
-/* Tracked RDMA MR API — uGDS manages ibv_dereg_mr internally.
- *
- * When UGDS_ENABLE_RDMA=ON at build time, these call ibv_reg_dmabuf_mr /
- * ibv_dereg_mr. When RDMA is not enabled, they return UGDS_IO_NOT_SUPPORTED.
- *
- * PRECONDITION for uGDSRDMAUnregister: all Work Requests referencing
- * this MR must have completed (QP drained). uGDS cannot verify this. */
-
-/* Forward declaration — ibv_pd is opaque */
-struct ibv_pd;
-
-typedef struct uGDSRDMARegion {
-    void*           mr;          /* ibv_mr* (opaque) */
-    uint32_t        lkey;
-    uint32_t        rkey;
-    uint64_t        iova;        /* IOVA/base address for SGE posting */
-} uGDSRDMARegion_t;
-
-/* Register a buffer for RDMA. Internally calls uGDSExportDmabuf + ibv_reg_dmabuf_mr.
- * Increments rdma_mr_refcount for the buffer.
- *
- * NOTE: The MR covers the page-aligned export length, which may be
- * slightly larger than the requested buffer size for non-page-aligned
- * allocations. Use page-aligned buffer sizes to avoid exposing extra
- * VRAM through the MR/rkey.
- *
- * Parameters:
- *   bufPtr_base  - previously registered with uGDSBufRegisterEx(enable_rdma=true)
- *   pd           - ibv protection domain
- *   access_flags - IBV access flags
- *   region       - output: MR handle + keys + IOVA */
-uGDSError_t uGDSRDMARegister(const void* bufPtr_base,
-                              struct ibv_pd* pd,
-                              int access_flags,
-                              uGDSRDMARegion_t* region);
-
-/* Calls ibv_dereg_mr exactly once. Caller must NOT call ibv_dereg_mr. */
-uGDSError_t uGDSRDMAUnregister(const void* bufPtr_base,
-                                uGDSRDMARegion_t* region);
 
 ssize_t uGDSRead(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                    off_t file_offset, off_t bufPtr_offset);

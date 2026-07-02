@@ -27,15 +27,27 @@ extern "C" uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, i
                                        const_cast<void*>(bufPtr_base), length,
                                        flags);
     if (status != 0 || dma == nullptr) {
-        if (status == ENOTSUP)
+        /* ENOTSUP or EINVAL when dmabuf flags are set indicates the
+         * kernel module was not built with HAVE_CUDA_DMABUF and the
+         * ioctl fell into its default case returning EINVAL. */
+        if (status == ENOTSUP ||
+            (status == EINVAL && (flags & NVM_MAP_DMABUF)))
             return make_error(UGDS_IO_NOT_SUPPORTED);
         return make_error(UGDS_GPU_MEMORY_PINNING_FAILED);
     }
 
-    g_driver.buf_registry[bufPtr_base] = {
-        dma,
-        (flags & NVM_MAP_DMABUF) ? UGDS_BACKEND_HIP : UGDS_BACKEND_DEFAULT
-    };
+    g_driver.buf_registry[bufPtr_base].dma = dma;
+#if defined(_HIP) && defined(_CUDA)
+    /* Dual-backend: detect actual backend from mapping origin.
+     * nvm_dma_map_device_ex may route to HIP even with flags=0
+     * (runtime pointer probing). Check hip_origin tag which persists
+     * even after the dmabuf fd is closed post-kernel-import. */
+    g_driver.buf_registry[bufPtr_base].backend =
+        nvm_dma_is_hip_origin(dma) ? UGDS_BACKEND_HIP : UGDS_BACKEND_CUDA;
+#else
+    g_driver.buf_registry[bufPtr_base].backend =
+        (flags & NVM_MAP_DMABUF) ? UGDS_BACKEND_HIP : UGDS_BACKEND_DEFAULT;
+#endif
     return UGDS_OK;
 }
 
@@ -58,26 +70,28 @@ extern "C" uGDSError_t uGDSBufRegisterEx(const void* bufPtr_base, size_t length,
         return make_error(UGDS_PLATFORM_NOT_SUPPORTED);
 #else
         flags |= NVM_MAP_DMABUF;
+        flags |= NVM_MAP_RDMA;  /* retain dmabuf fd for export */
 #endif
         break;
     case UGDS_BACKEND_CUDA:
 #ifndef _CUDA
         return make_error(UGDS_PLATFORM_NOT_SUPPORTED);
+#else
+        flags |= NVM_MAP_RDMA;  /* enable dmabuf export path */
 #endif
         break;
     default:
         return make_error(UGDS_INVALID_VALUE);
     }
 
-    if (config->enable_rdma) {
-        flags |= NVM_MAP_RDMA;
-    }
-
     uGDSError_t st = uGDSBufRegister(bufPtr_base, length, flags);
     if (st.err != UGDS_SUCCESS) return st;
 
-    /* Store backend for runtime dispatch */
-    {
+    /* Store backend for runtime dispatch.
+     * Skip overwrite when config->backend is DEFAULT — uGDSBufRegister
+     * already detected the correct backend from the mapping origin.
+     * Overwriting with DEFAULT would confuse dual-backend async dispatch. */
+    if (config->backend != UGDS_BACKEND_DEFAULT) {
         std::lock_guard<std::mutex> guard(g_driver.lock);
         auto it = g_driver.buf_registry.find(bufPtr_base);
         if (it != g_driver.buf_registry.end()) {
@@ -99,15 +113,14 @@ extern "C" uGDSError_t uGDSBufDeregister(const void* bufPtr_base) {
         return make_error(UGDS_MEMORY_NOT_REGISTERED);
     }
 
-    /* Check outstanding RDMA MRs before unmapping */
-    auto mr_it = g_driver.rdma_records.find(bufPtr_base);
-    if (mr_it != g_driver.rdma_records.end() && !mr_it->second.empty()) {
-        return make_error(UGDS_RDMA_MR_STILL_ACTIVE);
+    /* Reject deregister if IO is in-flight on this buffer.
+     * Caller must wait for outstanding operations to complete. */
+    if (it->second.in_flight.load(std::memory_order_acquire) > 0) {
+        return make_error(UGDS_BUSY);
     }
 
     nvm_dma_unmap(it->second.dma);
     g_driver.buf_registry.erase(it);
-    g_driver.rdma_records.erase(bufPtr_base);
 
     return UGDS_OK;
 }

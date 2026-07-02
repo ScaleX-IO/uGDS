@@ -297,6 +297,28 @@ extern "C" void uGDSHandleDeregister(uGDSHandle_t fh)
 
     HandleState* hs = reinterpret_cast<HandleState*>(fh);
 
+    /* Wait for ALL outstanding operations to complete before tearing
+     * down QPs and controller. This is an unbounded wait — callers MUST
+     * ensure streams are synchronized and batches are destroyed before
+     * deregistering a handle. A timeout here would convert a stuck
+     * operation into use-after-free, which is strictly worse.
+     *
+     * Covered refs:
+     *   - async callbacks (handle_in_flight incremented in async_validate)
+     *   - batch lifetime (handle_in_flight incremented in BatchIOSetUp) */
+    {
+        uint64_t warn_counter = 0;
+        while (hs->handle_in_flight.load(std::memory_order_acquire) > 0) {
+            if ((++warn_counter % 100000000ULL) == 0) {
+                fprintf(stderr, "uGDS: HandleDeregister waiting for %u "
+                        "in-flight operations — ensure streams are "
+                        "synchronized and batches are destroyed\n",
+                        hs->handle_in_flight.load());
+            }
+            __builtin_ia32_pause();
+        }
+    }
+
     if (hs->batch_qp)
         cleanup_batch_qp(hs->aq_ref, hs->batch_qp.get());
     hs->batch_qp.reset();

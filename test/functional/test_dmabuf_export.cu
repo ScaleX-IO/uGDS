@@ -3,15 +3,15 @@
 #include <errno.h>
 #include <dirent.h>
 
-/* Test: RDMA dmabuf export lifecycle
+/* Test: dmabuf export lifecycle
  *
  * Verifies:
- * - uGDSBufRegisterEx with enable_rdma produces a valid dmabuf export
+ * - uGDSBufRegisterEx produces a valid dmabuf export
  * - uGDSExportDmabuf returns a dup'd fd (different from internal)
  * - Export fd is valid (can be used for ioctl)
  * - NVMe I/O still works after export
  * - Deregister after export close succeeds
- * - Export on non-RDMA buffer returns UGDS_IO_NOT_SUPPORTED
+ * - Export on non-dmabuf buffer returns UGDS_IO_NOT_SUPPORTED
  * - Export on unregistered buffer returns UGDS_MEMORY_NOT_REGISTERED
  */
 int main(int argc, char** argv) {
@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_buf, buf_size);
     if (!d_buf) TEST_FAIL("cudaMalloc failed");
 
-    /* ── 1. Register with RDMA enabled ── */
+    /* ── 1. Register with dmabuf backend ── */
     uGDSBufConfig_t cfg = {};
     cfg.backend =
 #ifdef __HIP_PLATFORM_AMD__
@@ -37,7 +37,6 @@ int main(int argc, char** argv) {
 #else
         UGDS_BACKEND_CUDA;
 #endif
-    cfg.enable_rdma = 1;
 
     st = uGDSBufRegisterEx(d_buf, buf_size, &cfg);
     if (st.err != UGDS_SUCCESS) {
@@ -49,7 +48,7 @@ int main(int argc, char** argv) {
             uGDSDriverClose();
             return 77;  /* skip exit code (automake convention) */
         }
-        TEST_FAIL("BufRegisterEx (RDMA): %s", UGDS_ERRSTR(st.err));
+        TEST_FAIL("BufRegisterEx: %s", UGDS_ERRSTR(st.err));
     }
 
     /* ── 2. Export dmabuf handle ── */
@@ -99,20 +98,24 @@ int main(int argc, char** argv) {
     st = uGDSBufDeregister(d_buf);
     ASSERT_OK(st, "BufDeregister after export close");
 
-    /* ── 6. Export on non-RDMA buffer → IO_NOT_SUPPORTED ── */
+    /* ── 6. Export on non-dmabuf buffer → IO_NOT_SUPPORTED ──
+     * On CUDA builds, TEST_BUF_FLAGS=0 so the buffer is mapped via
+     * the standard CUDA P2P path (no dmabuf fd retained).
+     * On HIP builds, TEST_BUF_FLAGS=UGDS_REGISTER_DMABUF but the fd
+     * is not retained (no NVM_MAP_RDMA), so export still fails. */
     void* d_buf2 = nullptr;
     cudaMalloc(&d_buf2, buf_size);
     if (!d_buf2) TEST_FAIL("cudaMalloc(2) failed");
 
     st = uGDSBufRegister(d_buf2, buf_size, TEST_BUF_FLAGS);
-    ASSERT_OK(st, "BufRegister (non-RDMA)");
+    ASSERT_OK(st, "BufRegister (non-dmabuf)");
 
     uGDSDmabufExport_t exp2 = {};
     st = uGDSExportDmabuf(d_buf2, &exp2);
-    ASSERT_ERR(st, UGDS_IO_NOT_SUPPORTED, "export on non-RDMA buffer");
+    ASSERT_ERR(st, UGDS_IO_NOT_SUPPORTED, "export on non-dmabuf buffer");
 
     st = uGDSBufDeregister(d_buf2);
-    ASSERT_OK(st, "BufDeregister (non-RDMA)");
+    ASSERT_OK(st, "BufDeregister (non-dmabuf)");
 
     /* ── 7. Export on unregistered buffer ── */
     uGDSDmabufExport_t exp3 = {};

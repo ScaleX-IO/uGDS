@@ -31,8 +31,12 @@
 
 MODULE_DESCRIPTION("UserSpace-GDS NVMe DMA helper");
 MODULE_LICENSE("Dual BSD/GPL");
-#if defined(UGDS_HAVE_DMABUF)
+#if defined(UGDS_HAVE_DMABUF) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("DMA_BUF");
+#else
+MODULE_IMPORT_NS(DMA_BUF);
+#endif
 #endif
 MODULE_VERSION("1.0");
 
@@ -125,11 +129,12 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             {
                 if (copy_to_user((void __user*) request.ioaddrs, map->addrs, map->n_addrs * sizeof(uint64_t)))
                 {
+                    unmap_and_release(map);
                     return -EFAULT;
                 }
                 retval = 0;
             }
-            else 
+            else
             {
                 retval = PTR_ERR(map);
             }
@@ -148,6 +153,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             {
                 if (copy_to_user((void __user*) request.ioaddrs, map->addrs, map->n_addrs * sizeof(uint64_t)))
                 {
+                    unmap_and_release(map);
                     return -EFAULT;
                 }
                 retval = 0;
@@ -377,6 +383,21 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
         pci_release_region(dev, 0);
         ctrl_put(ctrl);
         return -EIO;
+    }
+#else
+    /* Default CUDA (non-dmabuf): try 64-bit, fall back to 32-bit. */
+    if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64)))
+    {
+        if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(32)))
+        {
+            printk(KERN_ERR DRIVER_NAME " failed to set DMA mask\n");
+            pci_clear_master(dev);
+            pci_disable_device(dev);
+            pci_release_region(dev, 0);
+            ctrl_put(ctrl);
+            return -EIO;
+        }
+        printk(KERN_WARNING DRIVER_NAME " using 32-bit DMA mask\n");
     }
 #endif
 

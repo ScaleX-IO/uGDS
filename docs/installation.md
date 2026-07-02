@@ -61,22 +61,18 @@ All GPU memory accessors are classified as **producers** (write to GPU VRAM) or 
 5. A running GPU kernel must NOT overlap any third-party producer (NVMe/RDMA) on the same region.
 6. `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` is set automatically for RDMA-enabled CUDA buffers to ensure BAR consistency, but it does NOT replace explicit stream/CQ barriers.
 
-For **RDMA** buffers (registered with `enable_rdma=1`), additional lifetime rules apply:
-- All RDMA completions (`ibv_poll_cq`) and `ibv_dereg_mr()` MUST complete before `uGDSBufDeregister()`.
-- If using the tracked API (`uGDSRDMARegister()`), `uGDSBufDeregister()` will fail with `UGDS_RDMA_MR_STILL_ACTIVE` if MRs are still registered.
-- If using the raw export API (`uGDSExportDmabuf()`), uGDS does not track MRs — the caller is responsible for ensuring all MRs are deregistered before calling `uGDSBufDeregister()`.
-- `uGDSDriverClose()` fails with `UGDS_RDMA_MR_STILL_ACTIVE` if any tracked MRs are outstanding.
+For **dmabuf-export** buffers (registered with `uGDSBufRegisterEx()` using `UGDS_BACKEND_CUDA` or `UGDS_BACKEND_HIP`), the dma-buf file descriptor is retained internally and can be exported via `uGDSExportDmabuf()`. The caller is responsible for closing the exported fd and ensuring all external users (e.g., RDMA MR registrations) are cleaned up before calling `uGDSBufDeregister()`.
 
 **Important:** Each backend used at runtime must be enabled in both the kernel module and the userspace library. For example, a CUDA-only kernel module will reject HIP `uGDSBufRegister()` calls. In dual-backend builds, use `uGDSBufRegisterEx()` with explicit `uGDSBackend_t`.
 
-**CUDA dma-buf / RDMA:** The userspace CMake auto-detects CUDA dma-buf support (`HAVE_CUDA_DMABUF`). When enabled, the kernel module must also be built with the same flag:
+**CUDA dma-buf:** The userspace CMake auto-detects CUDA dma-buf support (`HAVE_CUDA_DMABUF`). When enabled, the kernel module must also be built with the same flag:
 
 ```bash
 cd drv
 make BUILD_CUDA=1 HAVE_CUDA_DMABUF=1
 ```
 
-Without this flag, the kernel module will not include the `NVM_MAP_DMABUF_MEMORY` ioctl handler, and `uGDSBufRegisterEx()` with `enable_rdma=1` will fail at runtime.
+Without this flag, the kernel module will not include the `NVM_MAP_DMABUF_MEMORY` ioctl handler, and `uGDSBufRegisterEx()` with `UGDS_BACKEND_CUDA` for fd export will fail with `UGDS_IO_NOT_SUPPORTED`. Standard CUDA NVMe I/O (`uGDSRead`/`uGDSWrite`) does not require this flag.
 
 ## Step 1: Build the Kernel Module
 

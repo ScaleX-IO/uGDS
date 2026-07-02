@@ -50,7 +50,7 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
 
     list_node_init(&map->list);
 
-    map->owner = current;
+    map->owner_pid = get_task_pid(current, PIDTYPE_TGID);
     map->vaddr = vaddr;
     map->pdev = ctrl->pdev;
     map->page_size = 0;
@@ -79,6 +79,9 @@ void unmap_and_release(struct map* map)
         map->release(map);
     }
 
+    if (map->owner_pid != NULL)
+        put_pid(map->owner_pid);
+
     kvfree(map);
 }
 
@@ -88,12 +91,21 @@ struct map* map_find(const struct list* list, u64 vaddr)
 {
     const struct list_node* element = list_next(&list->head);
     struct map* map = NULL;
+    struct map* result = NULL;
+
+    /* Acquire refcounted pid once. get_task_pid returns a referenced
+     * pointer (via get_pid), so we must put_pid before returning. */
+    struct pid* current_pid = get_task_pid(current, PIDTYPE_TGID);
 
     while (element != NULL)
     {
         map = container_of(element, struct map, list);
 
-        if (map->owner == current)
+        /* Compare refcounted pid pointers, not numeric PID values,
+         * to prevent collisions after PID/TGID reuse on long-running
+         * systems. Pointer comparison is safe because the struct pid
+         * is only freed after all refs are dropped (RCU + refcount). */
+        if (map->owner_pid == current_pid)
         {
             /* Match address using the mapping's own page size.
              * Previously the unconditional GPU_PAGE_MASK (64 KiB)
@@ -103,14 +115,18 @@ struct map* map_find(const struct list* list, u64 vaddr)
             if (map->page_size > 0 &&
                 map->vaddr == (vaddr & ~((u64)map->page_size - 1)))
             {
-                return map;
+                result = map;
+                break;
             }
         }
 
         element = list_next(element);
     }
 
-    return NULL;
+    if (current_pid != NULL)
+        put_pid(current_pid);
+
+    return result;
 }
 
 
