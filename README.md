@@ -19,6 +19,7 @@
 - **Multi-vendor GPU support** — NVIDIA CUDA and AMD Infinity Storage (HIP/ROCm) backends; both can be enabled simultaneously for mixed-GPU systems
 - **Fully open-source** — BSD 3-Clause licensed; no proprietary runtime dependencies beyond the GPU driver (NVIDIA driver or AMD ROCm runtime)
 - **High performance** — busy-poll CQ completion with `_mm_pause()`, multi-queue round-robin IO, achieving up to 2.7x read and 28x write bandwidth over NVIDIA GDS
+- **DMA-buf export** — export registered GPU buffers as Linux dma-buf file descriptors for zero-copy sharing with external consumers (RDMA via `ibv_reg_dmabuf_mr`, peer drivers, inter-process `SCM_RIGHTS`)
 
 ## Architecture
 
@@ -129,6 +130,10 @@ scripts/run_tests.sh all
 | `uGDSBatchIOSetUp / Submit / GetStatus / Destroy` | ✅ | Submit/poll separation, up to 128 IOs per batch |
 | `uGDSReadAsync / WriteAsync` | ✅ | CUDA stream integration, late-binding pointers |
 | `uGDSStreamRegister / Deregister` | ✅ | Optional (no-op, uGDS has no bounce buffer) |
+| `uGDSStreamRegisterEx` | ✅ | Stream registration with explicit backend (CUDA/HIP) for dual-backend validation |
+| `uGDSBufRegisterEx` | ✅ | Extended buffer registration with backend selection and dma-buf export |
+| `uGDSExportDmabuf` | ✅ | Export registered buffer as dma-buf fd (`O_CLOEXEC`) |
+| `uGDSHandleDeregisterEx` | ✅ | Handle deregistration with drain timeout |
 
 ## Roadmap
 

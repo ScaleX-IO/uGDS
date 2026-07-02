@@ -74,16 +74,72 @@ struct HandleState {
     std::unique_ptr<IOQueuePairHuge> batch_qp;
     uint16_t                    batch_queue_depth;
     std::atomic<bool>           batch_active{false};
+    std::atomic<uint32_t>       handle_in_flight{0};  /* IO refcount for safe deregister */
+    std::atomic<bool>           closing{false};        /* set by Deregister to block new ops */
 };
 
 struct DriverState {
     bool                                          initialized = false;
     std::mutex                                    lock;
     nvm_ctrl_t*                                   default_ctrl = nullptr;
-    std::unordered_map<const void*, nvm_dma_t*>   buf_registry;
+
+    /* Handle registry: maps raw pointer → shared_ptr to keep handles alive.
+     * handle_lookup acquires under g_driver.lock so Deregister cannot
+     * destroy the HandleState while an IO entrypoint is dereferencing it. */
+    std::unordered_map<HandleState*,
+                       std::shared_ptr<HandleState>>  handle_registry;
+
+    /* Buffer registry with backend tracking for dual-backend dispatch.
+     * in_flight counts active IO references to prevent use-after-free
+     * during concurrent Deregister. */
+    struct BufEntry {
+        nvm_dma_t*           dma;
+        uGDSBackend_t        backend;
+        std::atomic<uint32_t> in_flight{0};
+    };
+    std::unordered_map<const void*, BufEntry>     buf_registry;
 };
 
 extern DriverState g_driver;
+
+/* Look up a handle in the global registry and acquire a reference.
+ * Returns the raw HandleState* on success (and stores a shared_ptr copy
+ * in *out_sp to keep the handle alive). Returns nullptr if the handle
+ * is invalid or being deregistered.
+ *
+ * The caller MUST keep *out_sp alive for the duration of the operation
+ * and call handle_release() when done. */
+static inline HandleState* handle_lookup(uGDSHandle_t fh,
+                                          std::shared_ptr<HandleState>* out_sp) {
+    std::lock_guard<std::mutex> g(g_driver.lock);
+    auto it = g_driver.handle_registry.find(static_cast<HandleState*>(fh));
+    if (it == g_driver.handle_registry.end())
+        return nullptr;
+    if (it->second->closing.load(std::memory_order_acquire))
+        return nullptr;
+    *out_sp = it->second;
+    it->second->handle_in_flight.fetch_add(1, std::memory_order_acq_rel);
+    return it->second.get();
+}
+
+/* Same as handle_lookup but assumes the caller already holds g_driver.lock.
+ * Use to avoid deadlock when called from a context that already holds
+ * the driver mutex (e.g. async_validate). */
+static inline HandleState* handle_lookup_locked(uGDSHandle_t fh,
+                                                  std::shared_ptr<HandleState>* out_sp) {
+    auto it = g_driver.handle_registry.find(static_cast<HandleState*>(fh));
+    if (it == g_driver.handle_registry.end())
+        return nullptr;
+    if (it->second->closing.load(std::memory_order_acquire))
+        return nullptr;
+    *out_sp = it->second;
+    it->second->handle_in_flight.fetch_add(1, std::memory_order_acq_rel);
+    return it->second.get();
+}
+
+static inline void handle_release(HandleState* hs) {
+    hs->handle_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+}
 
 struct PRPPool {
     nvm_dma_t*  dma       = nullptr;
@@ -127,6 +183,7 @@ struct BatchState {
     PRPPool                   prp_pool;
 
     HandleState* hs = nullptr;
+    std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive for batch lifetime */
     std::mutex   lock;
 };
 
@@ -150,7 +207,11 @@ struct AsyncRequest {
     off_t*          bufPtr_offset_p;
     ssize_t*        bytes_done_p;
     uint8_t         opcode;
+    std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive until callback */
 };
+
+/* Internal stream type — void* for backend neutrality */
+typedef void* ugsd_stream_t;
 
 void* hugepage_alloc(size_t size, size_t* alloc_size_out);
 void  hugepage_free(void* ptr, size_t alloc_size);

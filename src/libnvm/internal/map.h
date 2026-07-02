@@ -11,11 +11,16 @@
  */
 enum mapping_type
 {
-    MAP_TYPE_CUDA   =   0x1,   // CUDA device memory (NVIDIA)
-    MAP_TYPE_HOST   =   0x2,   // Host memory (RAM)
-    MAP_TYPE_API    =   0x4,   // Allocated by the API (RAM)
-    MAP_TYPE_DMABUF =   0x8    // DMA-buf (AMD HIP / standard Linux)
+    MAP_TYPE_CUDA        =   0x1,   // CUDA device memory (NVIDIA)
+    MAP_TYPE_HOST        =   0x2,   // Host memory (RAM)
+    MAP_TYPE_API         =   0x4,   // Allocated by the API (RAM)
+    MAP_TYPE_DMABUF      =   0x8,   // DMA-buf (AMD HIP / standard Linux)
+    MAP_TYPE_DMABUF_CUDA =   0x10   // CUDA dma-buf export (NVIDIA via cuMemGetHandleForAddressRange)
 };
+
+/* Typed fd close callback for backend-specific dma-buf fd release.
+ * Each backend registers its own adapter. Returns 0 on success. */
+typedef int (*dmabuf_close_fn)(int fd);
 
 
 
@@ -29,8 +34,12 @@ struct ioctl_mapping
     struct va_range     range;  // Memory range descriptor
 
     /* DMABUF-specific fields */
-    int       dmabuf_fd;        // HSA-exported dma-buf file descriptor
+    int       dmabuf_fd;        // HSA/CUDA-exported dma-buf file descriptor
     uint64_t  dmabuf_offset;    // Offset within dmabuf allocation
+
+    /* fd ownership + release (RDMA support) */
+    bool                retain_fd;   // true: fd retained for RDMA export
+    dmabuf_close_fn     close_fn;    // backend-specific close (NULL if N/A)
 };
 
 

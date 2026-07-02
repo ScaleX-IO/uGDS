@@ -31,8 +31,12 @@
 
 MODULE_DESCRIPTION("UserSpace-GDS NVMe DMA helper");
 MODULE_LICENSE("Dual BSD/GPL");
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("DMA_BUF");
+#else
+MODULE_IMPORT_NS(DMA_BUF);
+#endif
 #endif
 MODULE_VERSION("1.0");
 
@@ -125,11 +129,12 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             {
                 if (copy_to_user((void __user*) request.ioaddrs, map->addrs, map->n_addrs * sizeof(uint64_t)))
                 {
+                    unmap_and_release(map);
                     return -EFAULT;
                 }
                 retval = 0;
             }
-            else 
+            else
             {
                 retval = PTR_ERR(map);
             }
@@ -148,6 +153,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             {
                 if (copy_to_user((void __user*) request.ioaddrs, map->addrs, map->n_addrs * sizeof(uint64_t)))
                 {
+                    unmap_and_release(map);
                     return -EFAULT;
                 }
                 retval = 0;
@@ -159,7 +165,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             break;
 #endif
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
         case NVM_MAP_DMABUF_MEMORY:
         {
             struct nvm_ioctl_dmabuf dreq;
@@ -246,6 +252,13 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             }
             break;
         }
+#else
+        case NVM_MAP_DMABUF_MEMORY:
+            /* Kernel module built without dmabuf support — return
+             * EOPNOTSUPP so userspace can distinguish "not compiled in"
+             * from a real EINVAL on a bad request. */
+            retval = -EOPNOTSUPP;
+            break;
 #endif
 
         case NVM_UNMAP_MEMORY:
@@ -254,7 +267,12 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             }
 
-            map = map_find(&host_list, addr);
+            /* Use map_find_and_remove to atomically find and detach
+             * the mapping under the list spinlock, preventing
+             * concurrent find/remove races. unmap_and_release
+             * performs sleeping cleanup (dma_buf_put etc.)
+             * after the lock is released. */
+            map = map_find_and_remove(&host_list, addr);
             if (map != NULL)
             {
                 unmap_and_release(map);
@@ -262,7 +280,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             }
 
 #ifdef _CUDA
-            map = map_find(&device_list, addr);
+            map = map_find_and_remove(&device_list, addr);
             if (map != NULL)
             {
                 unmap_and_release(map);
@@ -270,8 +288,8 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             }
 #endif
 
-#ifdef _HIP
-            map = map_find(&device_list, addr);
+#if defined(UGDS_HAVE_DMABUF)
+            map = map_find_and_remove(&device_list, addr);
             if (map != NULL)
             {
                 unmap_and_release(map);
@@ -356,10 +374,8 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
     // Enable DMA
     pci_set_master(dev);
 
-#ifdef _HIP
-    /* HIP backend requires 64-bit DMA for P2P VRAM addresses (large BAR).
-     * 32-bit fallback is intentionally a hard failure -- AMD GPU P2P
-     * DMA requires 64-bit addressing. */
+#if defined(_HIP)
+    /* HIP/dmabuf-only operation: 64-bit DMA is required, no fallback. */
     if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64)))
     {
         printk(KERN_ERR DRIVER_NAME " HIP backend requires 64-bit DMA mask\n");
@@ -368,6 +384,32 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
         pci_release_region(dev, 0);
         ctrl_put(ctrl);
         return -EIO;
+    }
+#elif defined(UGDS_HAVE_DMABUF)
+    /* CUDA dmabuf: 64-bit DMA is required for P2P VRAM addresses. */
+    if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64)))
+    {
+        printk(KERN_ERR DRIVER_NAME " dmabuf backend requires 64-bit DMA mask\n");
+        pci_clear_master(dev);
+        pci_disable_device(dev);
+        pci_release_region(dev, 0);
+        ctrl_put(ctrl);
+        return -EIO;
+    }
+#else
+    /* Default CUDA (non-dmabuf): try 64-bit, fall back to 32-bit. */
+    if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64)))
+    {
+        if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(32)))
+        {
+            printk(KERN_ERR DRIVER_NAME " failed to set DMA mask\n");
+            pci_clear_master(dev);
+            pci_disable_device(dev);
+            pci_release_region(dev, 0);
+            ctrl_put(ctrl);
+            return -EIO;
+        }
+        printk(KERN_WARNING DRIVER_NAME " using 32-bit DMA mask\n");
     }
 #endif
 

@@ -12,6 +12,7 @@
 #include <linux/types.h>
 #include <linux/mm_types.h>
 #include <linux/atomic.h>
+#include <linux/pid.h>
 
 
 /* Forward declaration */
@@ -28,7 +29,7 @@ typedef void (*release)(struct map*);
 struct map
 {
     struct list_node    list;           /* Linked list header */
-    struct task_struct* owner;          /* Owner of mapping */
+    struct pid*         owner_pid;      /* Refcounted owner process (prevents PID reuse collision) */
     u64                 vaddr;          /* Starting virtual address */
     struct list*        ctrl_list;
     struct pci_dev*     pdev;           /* Reference to physical PCI device */
@@ -65,10 +66,10 @@ struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 va
 
 
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
 /*
  * Map GPU memory via standard Linux DMA-buf framework.
- * Used by AMD HIP/ROCm backend.
+ * Used by AMD HIP/ROCm backend and CUDA dma-buf export.
  */
 struct map* map_dmabuf(struct list* list, const struct ctrl* ctrl,
                         u64 gpu_ptr, int dmabuf_fd,
@@ -83,8 +84,16 @@ struct map* map_dmabuf(struct list* list, const struct ctrl* ctrl,
  */
 struct map* map_find(const struct list* list, u64 vaddr);
 
+/*
+ * Atomically find and remove a mapping from the list.
+ * Returns the removed map (caller must unmap_and_release it),
+ * or NULL if not found. The list spinlock is held during
+ * traversal and removal to prevent concurrent races.
+ */
+struct map* map_find_and_remove(struct list* list, u64 vaddr);
 
-#ifdef _HIP
+
+#if defined(UGDS_HAVE_DMABUF)
 /* Forward declaration -- avoids pulling <linux/scatterlist.h> into map.h */
 struct sg_table;
 

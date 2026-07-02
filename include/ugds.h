@@ -3,9 +3,23 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <time.h>
-#include <cuda_runtime.h>
+
+/* Buffer registration flags (defined locally to avoid pulling in
+ * libnvm/nvm_dma.h, which transitively includes C++ <atomic>) */
+#define NVM_MAP_DMABUF      0x1
+#define NVM_MAP_RDMA        0x2    /* Retain dmabuf fd for RDMA use */
+#define NVM_MAP_FORCE_CUDA  0x4    /* Force CUDA path (skip auto-probe) */
+/* GPU runtime headers are NOT included in the public header.
+ * cuda_runtime.h and hip_runtime_api.h define conflicting types
+ * (vector types, stream types) that cannot coexist in a single TU.
+ *
+ * The async API uses void* for streams. Callers pass cudaStream_t
+ * (CUDA) or hipStream_t (HIP), which implicitly convert to void*.
+ * Backend-specific runtime headers are included only in internal
+ * source files that need them. */
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +64,7 @@ typedef enum uGDSOpError {
     UGDS_GPU_MEMORY_PINNING_FAILED   = UGDS_BASE_ERR + 36,
 
     UGDS_BATCH_CAPACITY_EXCEEDED     = UGDS_BASE_ERR + 40,
+    UGDS_BUSY                        = UGDS_BASE_ERR + 42,
 } uGDSOpError;
 
 static inline const char* uGDS_status_error(uGDSOpError status) {
@@ -68,6 +83,8 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
     case UGDS_INTERNAL_ERROR:              return "internal error";
     case UGDS_GPU_MEMORY_PINNING_FAILED:   return "GPU memory pinning failed";
     case UGDS_BATCH_CAPACITY_EXCEEDED:     return "batch capacity exceeded";
+
+    case UGDS_BUSY:                        return "resource busy, retry";
     default:                                  return "unknown uGDS error";
     }
 }
@@ -104,12 +121,50 @@ uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr);
 
 void uGDSHandleDeregister(uGDSHandle_t fh);
 
+/* Deregister a handle with a drain timeout.
+ * Returns UGDS_OK on success, or UGDS_BUSY if the timeout expires
+ * before all in-flight operations (including batch handles) complete.
+ * timeout_sec == 0 means non-blocking check only.
+ * timeout_sec < 0 means infinite wait (equivalent to uGDSHandleDeregister). */
+uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec);
+
 uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int flags);
 
 /* Flag for uGDSBufRegister: use AMD HIP/dma-buf path */
-#define UGDS_REGISTER_DMABUF  0x1   /* Use AMD HIP/dma-buf path */
+#define UGDS_REGISTER_DMABUF  NVM_MAP_DMABUF
 
 uGDSError_t uGDSBufDeregister(const void* bufPtr_base);
+
+/* ── dma-buf export support ── */
+
+/* Extended buffer registration with explicit backend */
+typedef enum uGDSBackend {
+    UGDS_BACKEND_DEFAULT = 0,
+    UGDS_BACKEND_CUDA    = 1,
+    UGDS_BACKEND_HIP     = 2,
+} uGDSBackend_t;
+
+typedef struct uGDSBufConfig {
+    uGDSBackend_t   backend;
+    bool            enable_export;  /* request dma-buf fd for RDMA/peer export */
+} uGDSBufConfig_t;
+
+uGDSError_t uGDSBufRegisterEx(const void* bufPtr_base, size_t length,
+                               const uGDSBufConfig_t* config);
+
+/* dma-buf export handle for RDMA registration.
+ * fd is dup()'d — caller owns it and MUST close after use. */
+typedef struct uGDSDmabufExport {
+    int       fd;
+    uint64_t  offset;
+    size_t    length;
+} uGDSDmabufExport_t;
+
+/* Export a dma-buf handle for external use (e.g., RDMA registration).
+ * Returns UGDS_SUCCESS with 'out' filled.
+ * Caller owns out->fd and MUST close it after use. */
+uGDSError_t uGDSExportDmabuf(const void* bufPtr_base,
+                              uGDSDmabufExport_t* out);
 
 ssize_t uGDSRead(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                    off_t file_offset, off_t bufPtr_offset);
@@ -164,22 +219,46 @@ void uGDSBatchIODestroy(uGDSBatchHandle_t batch);
 
 /* ── Async Stream IO ──
  * Pointer params (size_p, file_offset_p, etc.) must be host-accessible.
- * Use cudaHostAlloc for GPU-writable pinned memory (late binding).
- */
+ * Use cudaHostAlloc/hipHostMalloc for GPU-writable pinned memory (late binding).
+ *
+ * Stream parameter is void* to support both CUDA and HIP backends.
+ * Pass cudaStream_t (CUDA) or hipStream_t (HIP) — both implicitly
+ * convert to void*.
+ *
+ * Backend dispatch:
+ *   - CUDA-only build: uses cudaLaunchHostFunc
+ *   - HIP-only build: uses hipLaunchHostFunc
+ *   - Dual-backend build: dispatches based on the buffer's registered
+ *     backend (UGDS_BACKEND_CUDA → cudaLaunchHostFunc,
+ *     UGDS_BACKEND_HIP → hipLaunchHostFunc). */
 
 uGDSError_t uGDSReadAsync(uGDSHandle_t fh, void *bufPtr_base,
                            size_t *size_p, off_t *file_offset_p,
                            off_t *bufPtr_offset_p, ssize_t *bytes_read_p,
-                           cudaStream_t stream);
+                           void* stream);
 
 uGDSError_t uGDSWriteAsync(uGDSHandle_t fh, void *bufPtr_base,
                             size_t *size_p, off_t *file_offset_p,
                             off_t *bufPtr_offset_p, ssize_t *bytes_written_p,
-                            cudaStream_t stream);
+                            void* stream);
 
-uGDSError_t uGDSStreamRegister(cudaStream_t stream);
+/* Register a stream without a backend hint (treated as default).
+ * In dual-backend builds, streams registered via this function are
+ * not validated against the buffer's backend. Use uGDSStreamRegisterEx
+ * to enable cross-backend mismatch detection. */
+uGDSError_t uGDSStreamRegister(void* stream);
 
-uGDSError_t uGDSStreamDeregister(cudaStream_t stream);
+/* Register a stream with an explicit backend for dual-backend validation.
+ * In dual-backend builds, uGDSReadAsync/uGDSWriteAsync will reject
+ * stream/buffer backend mismatches when the stream has been registered
+ * with an explicit backend. Streams registered via uGDSStreamRegister
+ * or not registered at all bypass the check.
+ *
+ * In single-backend builds, this validates that the requested backend
+ * matches the compiled-in backend (e.g. CUDA-only rejects HIP). */
+uGDSError_t uGDSStreamRegisterEx(void* stream, uGDSBackend_t backend);
+
+uGDSError_t uGDSStreamDeregister(void* stream);
 
 #ifdef __cplusplus
 }
