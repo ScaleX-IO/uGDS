@@ -131,6 +131,52 @@ struct map* map_find(const struct list* list, u64 vaddr)
 
 
 
+/* Atomically find and remove a mapping from the list under the
+ * list spinlock. The caller is responsible for calling
+ * unmap_and_release() on the returned map. */
+struct map* map_find_and_remove(struct list* list, u64 vaddr)
+{
+    struct map* result = NULL;
+    struct pid* current_pid;
+
+    current_pid = get_task_pid(current, PIDTYPE_TGID);
+
+    spin_lock(&list->lock);
+    {
+        struct list_node* element = list_next(&list->head);
+        while (element != NULL)
+        {
+            struct map* map = container_of(element, struct map, list);
+
+            if (map->owner_pid == current_pid)
+            {
+                if (map->page_size > 0 &&
+                    map->vaddr == (vaddr & ~((u64)map->page_size - 1)))
+                {
+                    /* Detach from list inline (already holding lock).
+                     * list_remove would try to re-lock and deadlock. */
+                    element->prev->next = element->next;
+                    element->next->prev = element->prev;
+                    element->list = NULL;
+                    element->next = NULL;
+                    element->prev = NULL;
+                    result = map;
+                    break;
+                }
+            }
+            element = list_next(element);
+        }
+    }
+    spin_unlock(&list->lock);
+
+    if (current_pid != NULL)
+        put_pid(current_pid);
+
+    return result;
+}
+
+
+
 static void release_user_pages(struct map* map)
 {
     unsigned long i;

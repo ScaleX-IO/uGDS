@@ -267,7 +267,12 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             }
 
-            map = map_find(&host_list, addr);
+            /* Use map_find_and_remove to atomically find and detach
+             * the mapping under the list spinlock, preventing
+             * concurrent find/remove races. unmap_and_release
+             * performs sleeping cleanup (dma_buf_put etc.)
+             * after the lock is released. */
+            map = map_find_and_remove(&host_list, addr);
             if (map != NULL)
             {
                 unmap_and_release(map);
@@ -275,7 +280,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             }
 
 #ifdef _CUDA
-            map = map_find(&device_list, addr);
+            map = map_find_and_remove(&device_list, addr);
             if (map != NULL)
             {
                 unmap_and_release(map);
@@ -284,7 +289,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
 #endif
 
 #if defined(UGDS_HAVE_DMABUF)
-            map = map_find(&device_list, addr);
+            map = map_find_and_remove(&device_list, addr);
             if (map != NULL)
             {
                 unmap_and_release(map);

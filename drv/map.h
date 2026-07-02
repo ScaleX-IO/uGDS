@@ -84,6 +84,14 @@ struct map* map_dmabuf(struct list* list, const struct ctrl* ctrl,
  */
 struct map* map_find(const struct list* list, u64 vaddr);
 
+/*
+ * Atomically find and remove a mapping from the list.
+ * Returns the removed map (caller must unmap_and_release it),
+ * or NULL if not found. The list spinlock is held during
+ * traversal and removal to prevent concurrent races.
+ */
+struct map* map_find_and_remove(struct list* list, u64 vaddr);
+
 
 #if defined(UGDS_HAVE_DMABUF)
 /* Forward declaration -- avoids pulling <linux/scatterlist.h> into map.h */

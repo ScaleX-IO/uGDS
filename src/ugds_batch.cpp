@@ -105,23 +105,34 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
     if (nr == 0 || nr > UGDS_MAX_BATCH_IO_SIZE)
         return make_error(UGDS_INVALID_VALUE);
 
-    HandleState* hs = static_cast<HandleState*>(fh);
+    /* Look up handle via global registry to safely acquire a shared_ptr.
+     * This prevents UAF if HandleDeregister races with us. */
+    std::shared_ptr<HandleState> hs_sp;
+    HandleState* hs = handle_lookup(fh, &hs_sp);
+    if (!hs)
+        return make_error(UGDS_INVALID_VALUE);
 
-    if (!hs->batch_qp)
+    if (!hs->batch_qp) {
+        handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
+    }
 
     bool expected = false;
-    if (!hs->batch_active.compare_exchange_strong(expected, true))
+    if (!hs->batch_active.compare_exchange_strong(expected, true)) {
+        handle_release(hs);
         return make_error(UGDS_INVALID_VALUE);
+    }
 
     auto bs = new (std::nothrow) BatchState();
     if (!bs) {
         hs->batch_active.store(false);
+        handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
     }
 
     bs->capacity = nr;
     bs->hs = hs;
+    bs->hs_sp = std::move(hs_sp);  /* keep handle alive for batch lifetime */
     bs->entries.resize(nr);
     bs->cmd_map.resize(hs->batch_queue_depth);
 
@@ -132,6 +143,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
     if (posix_memalign(&pool.buf, 4096, pool_bytes) != 0) {
         delete bs;
         hs->batch_active.store(false);
+        handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
     }
     std::memset(pool.buf, 0, pool_bytes);
@@ -142,6 +154,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         pool.buf = nullptr;
         delete bs;
         hs->batch_active.store(false);
+        handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
     }
     pool.n_pages = UGDS_PRP_POOL_PAGES;
@@ -149,10 +162,6 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         ? ~0ULL : (1ULL << UGDS_PRP_POOL_PAGES) - 1;
 
     *batch = static_cast<uGDSBatchHandle_t>(bs);
-
-    /* Hold handle reference for batch lifetime. Prevents HandleDeregister
-     * from freeing QPs/controller while batch state is active. */
-    hs->handle_in_flight.fetch_add(1, std::memory_order_acq_rel);
 
     return UGDS_OK;
 }
@@ -544,11 +553,11 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
 
     /* Mark batch inactive before releasing handle ref.
      * HandleDeregister waits on handle_in_flight==0, so we must not
-     * touch hs after fetch_sub. */
+     * touch hs after release. */
     hs->batch_active.store(false);
 
     /* Release handle reference acquired in BatchIOSetUp */
-    hs->handle_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    handle_release(hs);
 
     delete bs;
 }

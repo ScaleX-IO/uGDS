@@ -41,8 +41,19 @@ int main(int argc, char** argv) {
 
     st = uGDSBufRegisterEx(d_buf, buf_size, &cfg);
     if (st.err != UGDS_SUCCESS) {
-        /* If dma-buf export is not supported on this GPU, skip gracefully */
-        if (st.err == UGDS_IO_NOT_SUPPORTED || st.err == UGDS_PLATFORM_NOT_SUPPORTED) {
+        /* Skip only when the build does not expect dmabuf support.
+         * When the build expects dmabuf (HIP or HAVE_CUDA_DMABUF),
+         * a failure here indicates a real regression and should
+         * NOT be silently skipped. */
+        bool should_skip;
+#if defined(UGDS_HAVE_DMABUF)
+        should_skip = false;  /* build expects dmabuf — hard fail */
+#else
+        should_skip = true;   /* dmabuf not compiled in — skip ok */
+#endif
+        if (should_skip &&
+            (st.err == UGDS_IO_NOT_SUPPORTED ||
+             st.err == UGDS_PLATFORM_NOT_SUPPORTED)) {
             printf("SKIP: dma-buf export not supported on this device\n");
             cudaFree(d_buf);
             close_handle(fh);

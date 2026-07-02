@@ -121,6 +121,13 @@ uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr);
 
 void uGDSHandleDeregister(uGDSHandle_t fh);
 
+/* Deregister a handle with a drain timeout.
+ * Returns UGDS_OK on success, or UGDS_BUSY if the timeout expires
+ * before all in-flight operations (including batch handles) complete.
+ * timeout_sec == 0 means non-blocking check only.
+ * timeout_sec < 0 means infinite wait (equivalent to uGDSHandleDeregister). */
+uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec);
+
 uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int flags);
 
 /* Flag for uGDSBufRegister: use AMD HIP/dma-buf path */
@@ -235,7 +242,21 @@ uGDSError_t uGDSWriteAsync(uGDSHandle_t fh, void *bufPtr_base,
                             off_t *bufPtr_offset_p, ssize_t *bytes_written_p,
                             void* stream);
 
+/* Register a stream without a backend hint (treated as default).
+ * In dual-backend builds, streams registered via this function are
+ * not validated against the buffer's backend. Use uGDSStreamRegisterEx
+ * to enable cross-backend mismatch detection. */
 uGDSError_t uGDSStreamRegister(void* stream);
+
+/* Register a stream with an explicit backend for dual-backend validation.
+ * In dual-backend builds, uGDSReadAsync/uGDSWriteAsync will reject
+ * stream/buffer backend mismatches when the stream has been registered
+ * with an explicit backend. Streams registered via uGDSStreamRegister
+ * or not registered at all bypass the check.
+ *
+ * In single-backend builds, this validates that the requested backend
+ * matches the compiled-in backend (e.g. CUDA-only rejects HIP). */
+uGDSError_t uGDSStreamRegisterEx(void* stream, uGDSBackend_t backend);
 
 uGDSError_t uGDSStreamDeregister(void* stream);
 

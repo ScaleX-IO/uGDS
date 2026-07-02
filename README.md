@@ -16,9 +16,10 @@
 
 - **User-space IO stack** — bypasses the kernel NVMe driver and filesystem entirely; CPU builds NVMe commands and polls completions in user space
 - **cuFile API compatible** — existing GDS applications work with minimal changes (relink to `libugds.so`, change `cuFile` prefix to `uGDS`)
-- **Multi-vendor GPU support** -- NVIDIA CUDA and AMD Infinity Storage (HIP/ROCm) backends, individually or together for systems with both vendor GPUs
+- **Multi-vendor GPU support** — NVIDIA CUDA and AMD Infinity Storage (HIP/ROCm) backends; both can be enabled simultaneously for mixed-GPU systems
 - **Fully open-source** — BSD 3-Clause licensed; no proprietary runtime dependencies beyond the GPU driver (NVIDIA driver or AMD ROCm runtime)
 - **High performance** — busy-poll CQ completion with `_mm_pause()`, multi-queue round-robin IO, achieving up to 2.7x read and 28x write bandwidth over NVIDIA GDS
+- **DMA-buf export** — export registered GPU buffers as Linux dma-buf file descriptors for zero-copy sharing with external consumers (RDMA via `ibv_reg_dmabuf_mr`, peer drivers, inter-process `SCM_RIGHTS`)
 
 ## Architecture
 
@@ -126,23 +127,42 @@ scripts/run_tests.sh all
 | `uGDSHandleRegister / Deregister` | ✅ | Block device fd (no filesystem) |
 | `uGDSBufRegister / Deregister` | ✅ | GPU memory only |
 | `uGDSRead / Write` | ✅ | Synchronous, block-aligned |
-| `uGDSBatchIOSetUp / Submit / GetStatus` | ✅ | Batch doorbell optimization |
-| `uGDSReadAsync / WriteAsync` | ✅ | CUDA/HIP stream integration |
-| `uGDSBufRegisterEx` | ✅ | Dual-backend with explicit backend selection |
-| `uGDSExportDmabuf` | ✅ | DMA-buf fd export for RDMA |
+| `uGDSBatchIOSetUp / Submit / GetStatus / Destroy` | ✅ | Submit/poll separation, up to 128 IOs per batch |
+| `uGDSReadAsync / WriteAsync` | ✅ | CUDA stream integration, late-binding pointers |
+| `uGDSStreamRegister / Deregister` | ✅ | Optional (no-op, uGDS has no bounce buffer) |
+| `uGDSStreamRegisterEx` | ✅ | Stream registration with explicit backend (CUDA/HIP) for dual-backend validation |
+| `uGDSBufRegisterEx` | ✅ | Extended buffer registration with backend selection and dma-buf export |
+| `uGDSExportDmabuf` | ✅ | Export registered buffer as dma-buf fd (`O_CLOEXEC`) |
+| `uGDSHandleDeregisterEx` | ✅ | Handle deregistration with drain timeout |
 
 ## Roadmap
 
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Core synchronous API + test suite | ✅ |
+| 1.5 | Unified multi-backend (NVIDIA CUDA + AMD HIP/ROCm) | 🔧 |
 | 2 | Batch IO API (multi-command doorbell) | ✅ |
-| 3 | Async Stream API (CUDA/HIP stream integration) | ✅ |
+| 3 | Async Stream API (CUDA stream integration) | ✅ |
 | 4 | Hugepage support (larger QP depth) | ✅ |
-| 5 | Dual CUDA/HIP backend + DMA-buf export | ✅ |
-| 6 | SGL support (scatter-gather lists) | 🔜 |
-| 7 | Interrupt mode (MSI-X + eventfd) | 🔜 |
-| 8 | Filesystem compatibility (POSIX file path support) | 🔜 |
+| 5 | SGL support (scatter-gather lists) | 🔜 |
+| 6 | Interrupt mode (MSI-X + eventfd) | 🔜 |
+| 7 | Multi-SSD support (multi-handle aggregation) | 🔜 |
+| 8 | Striping (automatic IO distribution across SSDs) | 🔜 |
+| 9 | Filesystem compatibility (POSIX file path support) | 🔜 |
+| 10 | LMCache integration (KV cache storage backend) | 🔧 |
+
+## Citation
+
+uGDS originated from the motivation experiments in CoPilotIO. If you find uGDS useful in your research, please cite:
+
+```bibtex
+@inproceedings{chen2026copilotio,
+  title     = {CoPilotIO: CPU as a Co-pilot for GPU I/O to Free GPU Compute},
+  author    = {Guanyi Chen and Qi Chen and Shu Yin and Jian Zhang},
+  booktitle = {Proceedings of the 20th USENIX Symposium on Operating Systems Design and Implementation (OSDI '26)},
+  year      = {2026}
+}
+```
 
 ## References
 

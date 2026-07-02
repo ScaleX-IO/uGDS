@@ -161,8 +161,9 @@ if(UGDS_BACKEND_HIP)
 endif()
 
 # UGDS_HAVE_DMABUF: unified dmabuf guard (HIP or CUDA-dmabuf)
+# Use PUBLIC so test targets linking against ugds also see the definition.
 if(UGDS_BACKEND_HIP OR (UGDS_BACKEND_CUDA AND HAVE_CUDA_DMABUF))
-    target_compile_definitions(ugds PRIVATE UGDS_HAVE_DMABUF)
+    target_compile_definitions(ugds PUBLIC UGDS_HAVE_DMABUF)
 endif()
 
 target_link_libraries(ugds PRIVATE Threads::Threads)
