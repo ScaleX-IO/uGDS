@@ -100,7 +100,7 @@ cmake .. -DUGDS_BACKEND_HIP=ON -DUGDS_BACKEND_CUDA=OFF
 make -j$(nproc)
 ```
 
-Requires ROCm 5.6+, `CONFIG_HSA_AMD_P2P=y`, and Large BAR enabled. See the [Installation Guide](docs/installation.md) for details.
+Requires ROCm 7.0+, `CONFIG_HSA_AMD_P2P=y`, and Large BAR enabled. See the [Installation Guide](docs/installation.md) for details.
 
 ## Testing
 

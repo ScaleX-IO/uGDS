@@ -19,10 +19,11 @@ The HIP backend implements AMD Infinity Storage (AIS) using the standard Linux D
 | Dependency | Version | Notes |
 |-----------|---------|-------|
 | Linux kernel headers | >= 5.12 (6.4+ recommended) | `CONFIG_PCI_P2PDMA=y`, `CONFIG_DMABUF_MOVE_NOTIFY=y`. `MODULE_IMPORT_NS("DMA_BUF")` requires >= 6.4; on older kernels, remove or guard the import. |
-| ROCm | >= 5.6 (7.0+ recommended) | `hsa_amd_portable_export_dmabuf_v2()` with `HSA_AMD_DMABUF_MAPPING_TYPE_PCIE` |
-| HIP runtime | >= 5.6 | `hipMalloc`, `hipMemcpy` |
-| HSA runtime | >= 5.6 | `libhsa-runtime64.so` |
-| GPU | Large BAR | MI300X, MI250 (Full BAR exposes VRAM via PCIe) |
+| ROCm | >= 7.0 | `hsa_amd_portable_export_dmabuf_v2()` with `HSA_AMD_DMABUF_MAPPING_TYPE_PCIE` |
+| HIP runtime | >= 7.0 | `hipMalloc`, `hipMemcpy` |
+| HSA runtime | >= 7.0 | `libhsa-runtime64.so` |
+| amdgpu-dkms | >= 6.14.14 | VRAM P2P DMA pinning requires upstream fix in this version |
+| GPU | Large BAR | MI300X, MI250, MI210 (Full BAR exposes VRAM via PCIe) |
 | CMake | >= 3.18 (CUDA), >= 3.21 (HIP) | |
 | GCC | C++17 support | |
 
