@@ -44,6 +44,7 @@ int main(int argc, char** argv) {
 
     // Clear GPU buffer
     cudaMemset(d_buf, 0, total);
+    cudaDeviceSynchronize();
 
     // Step 2: batch-read all 4 regions
     uGDSBatchHandle_t batch = nullptr;

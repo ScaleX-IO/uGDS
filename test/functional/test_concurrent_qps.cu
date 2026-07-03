@@ -40,6 +40,7 @@ static void worker(int id, uGDSHandle_t fh) {
     }
 
     cudaMemset(d_buf, 0, alloc_size);
+    cudaDeviceSynchronize();
     ret = uGDSRead(fh, d_buf, io_size, file_off, 0);
     if (ret < 0 || (size_t)ret != io_size) {
         fprintf(stderr, "worker %d: uGDSRead failed: %zd\n", id, ret);

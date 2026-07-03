@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
 
     // Clear GPU buffer before read-back
     cudaMemset(d_buf, 0, alloc_size);
+    cudaDeviceSynchronize();
 
     // Round 2: batch-read both back
     uGDSIOParams_t rp[2];

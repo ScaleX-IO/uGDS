@@ -39,6 +39,7 @@ int main(int argc, char** argv) {
     uint32_t* h_buf = (uint32_t*)malloc(chunk);
     for (int i = 0; i < n_chunks; i++) {
         cudaMemset(d_buf, 0, alloc_size);
+        cudaDeviceSynchronize();
 
         off_t file_off = (off_t)(i * chunk);
         ssize_t ret = uGDSRead(fh, d_buf, chunk, file_off, 0);

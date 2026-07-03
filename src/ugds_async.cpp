@@ -1,5 +1,14 @@
 #include "ugds_internal.h"
+#if defined(__HIP_PLATFORM_AMD__) && !defined(__NVCC__)
+#include <hip/hip_runtime.h>
+#define CUDART_CB
+#define cudaLaunchHostFunc hipLaunchHostFunc
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+typedef hipStream_t cudaStream_t;
+#else
 #include <cuda_runtime.h>
+#endif
 #include <mutex>
 
 static void CUDART_CB async_io_callback(void* userData)

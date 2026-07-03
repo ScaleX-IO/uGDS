@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
 
     // Clear GPU buffer
     cudaMemset(d_buf, 0, io_size);
+    cudaDeviceSynchronize();
 
     // Read back
     ret = uGDSRead(fh, d_buf, io_size, 0, 0);

@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
 
     // Clear GPU buffer
     cudaMemset(d_buf, 0, alloc_size);
+    cudaDeviceSynchronize();
 
     // Step 2: batch-read it back
     uGDSBatchHandle_t batch = nullptr;

@@ -55,6 +55,7 @@ int main(int argc, char** argv) {
 
     // Round 2: reuse batch — read back 3 of the 4 regions
     cudaMemset(d_buf, 0, alloc_size);
+    cudaDeviceSynchronize();
 
     for (int i = 0; i < 3; i++) {
         memset(&params[i], 0, sizeof(params[i]));
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
 
     // Round 3: reuse again — read the 4th region
     cudaMemset(d_buf, 0, alloc_size);
+    cudaDeviceSynchronize();
     memset(&params[0], 0, sizeof(params[0]));
     params[0].devPtr_base = d_buf;
     params[0].file_offset = 3 * io_size;

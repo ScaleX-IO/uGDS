@@ -57,6 +57,7 @@ int main(int argc, char** argv)
 
     // Phase 2: clear buffer, read back on each stream
     cudaMemset(d_buf, 0, alloc_size);
+    cudaDeviceSynchronize();
 
     for (int i = 0; i < N_STREAMS; i++) {
         read_results[i] = 0;
