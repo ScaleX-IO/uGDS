@@ -36,6 +36,7 @@ struct ctrl
  * Acquire a controller reference.
  */
 struct ctrl* ctrl_get(struct list* list, struct class* cls, struct pci_dev* pdev, int number);
+void ctrl_publish(struct list* list, struct ctrl* ctrl);
 
 
 

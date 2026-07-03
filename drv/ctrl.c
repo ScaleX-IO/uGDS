@@ -38,9 +38,14 @@ struct ctrl* ctrl_get(struct list* list, struct class* cls, struct pci_dev* pdev
     snprintf(ctrl->name, sizeof(ctrl->name), "%s%d", KBUILD_MODNAME, ctrl->number);
     ctrl->name[sizeof(ctrl->name) - 1] = '\0';
 
-    list_insert(list, &ctrl->list);
-
+    /* NOTE: caller must call ctrl_publish() after probe completes
+     * (DMA mask, chrdev, etc.) to make the controller visible. */
     return ctrl;
+}
+
+void ctrl_publish(struct list* list, struct ctrl* ctrl)
+{
+    list_insert(list, &ctrl->list);
 }
 
 
@@ -59,20 +64,24 @@ void ctrl_put(struct ctrl* ctrl)
 
 struct ctrl* ctrl_find_by_pci_dev(const struct list* list, const struct pci_dev* pdev)
 {
-    const struct list_node* element = list_next(&list->head);
+    const struct list_node* element;
     struct ctrl* ctrl;
 
+    spin_lock(&((struct list*)list)->lock);
+    element = list_next(&list->head);
     while (element != NULL)
     {
         ctrl = container_of(element, struct ctrl, list);
 
         if (ctrl->pdev == pdev)
         {
+            spin_unlock(&((struct list*)list)->lock);
             return ctrl;
         }
 
         element = list_next(element);
     }
+    spin_unlock(&((struct list*)list)->lock);
 
     return NULL;
 }
@@ -81,20 +90,24 @@ struct ctrl* ctrl_find_by_pci_dev(const struct list* list, const struct pci_dev*
 
 struct ctrl* ctrl_find_by_inode(const struct list* list, const struct inode* inode)
 {
-    const struct list_node* element = list_next(&list->head);
+    const struct list_node* element;
     struct ctrl* ctrl;
 
+    spin_lock(&((struct list*)list)->lock);
+    element = list_next(&list->head);
     while (element != NULL)
     {
         ctrl = container_of(element, struct ctrl, list);
 
         if (&ctrl->cdev == inode->i_cdev)
         {
+            spin_unlock(&((struct list*)list)->lock);
             return ctrl;
         }
 
         element = list_next(element);
     }
+    spin_unlock(&((struct list*)list)->lock);
 
     return NULL;
 }
