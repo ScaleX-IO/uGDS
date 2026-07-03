@@ -11,7 +11,8 @@ find_package(Threads REQUIRED)
 option(UGDS_BACKEND_CUDA "Use NVIDIA CUDA backend" ON)
 option(UGDS_BACKEND_HIP  "Use AMD HIP backend"     OFF)
 
-# Both backends can be enabled simultaneously for dual-GPU systems.
+# Both backends can be enabled simultaneously. The async API uses void*
+# for stream parameters to avoid cudaStream_t/hipStream_t type conflicts.
 
 # HIP language support requires CMake >= 3.21
 if(UGDS_BACKEND_HIP AND CMAKE_VERSION VERSION_LESS "3.21")
@@ -26,6 +27,7 @@ set(UGDS_CUDA_ARCHITECTURES "80;90")
 if(UGDS_BACKEND_CUDA)
     find_package(CUDAToolkit REQUIRED)
     set(UGDS_CUDA_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+    list(APPEND UGDS_CUDA_LIBS CUDA::cudart)
 endif()
 
 # - HIP backend setup (independent) ------------
@@ -85,6 +87,7 @@ if(NOT UGDS_BACKEND_CUDA AND NOT UGDS_BACKEND_HIP)
     message(WARNING "No GPU backend selected, building library only")
 endif()
 
+
 # Library sources
 set(UGDS_SOURCES
     src/libnvm/admin.cpp
@@ -114,23 +117,22 @@ target_include_directories(ugds
 )
 
 # Backend includes and compile definitions (independent)
-target_link_libraries(ugds PRIVATE Threads::Threads)
-
 if(UGDS_BACKEND_CUDA)
     target_include_directories(ugds PRIVATE ${UGDS_CUDA_INCLUDES})
     target_compile_definitions(ugds PRIVATE _CUDA)
-    target_link_libraries(ugds PRIVATE CUDA::cudart)
+    target_link_libraries(ugds PRIVATE ${UGDS_CUDA_LIBS})
 endif()
 
 if(UGDS_BACKEND_HIP)
     target_include_directories(ugds PRIVATE ${UGDS_HIP_INCLUDES})
     target_link_libraries(ugds PRIVATE ${UGDS_HIP_LIBS})
-    target_compile_definitions(ugds PRIVATE _HIP)
+    target_compile_definitions(ugds PRIVATE _HIP __HIP_PLATFORM_AMD__)
     if(HAVE_HSA_DMABUF_V2)
         target_compile_definitions(ugds PRIVATE HAVE_HSA_DMABUF_V2)
     endif()
 endif()
 
+target_link_libraries(ugds PRIVATE Threads::Threads)
 target_compile_options(ugds PRIVATE -Wall -O2)
 
 # - Tests and benchmarks -----------------------

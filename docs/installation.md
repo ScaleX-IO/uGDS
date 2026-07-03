@@ -41,6 +41,8 @@ Buffers registered with `uGDSBufRegister()` must not be modified by the GPU (HIP
 
 **Important:** Each backend used at runtime must be enabled in both the kernel module and the userspace library. For example, a CUDA-only kernel module will reject HIP `uGDSBufRegister()` calls. In dual-backend builds, use `uGDSBufRegister(ptr, size, UGDS_REGISTER_DMABUF)` for AMD buffers and `uGDSBufRegister(ptr, size, 0)` for NVIDIA buffers (default).
 
+**Note:** In dual-backend builds, unregistered AMD buffers (on-the-fly I/O without prior `uGDSBufRegister`) are not supported. AMD buffers must be explicitly registered before I/O. NVIDIA buffers support both registered and unregistered paths.
+
 ## Step 1: Build the Kernel Module
 
 The kernel module (`ugds_drv.ko`) provides PCI BAR mapping and GPU page pinning for user-space NVMe access.
