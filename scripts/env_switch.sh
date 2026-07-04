@@ -7,6 +7,12 @@
 #   ./scripts/env_switch.sh ugds  <pci_slot>          Switch device to UGDS mode
 #   ./scripts/env_switch.sh gds   <pci_slot> [mount]  Switch device to GDS mode
 #
+# Environment:
+#   CUFILE_LIB         Optional explicit path to libcufile.so for status checks
+#   CUDA_HOME          Optional CUDA toolkit root used to find libcufile.so
+#   CUDA_PATH          Optional CUDA toolkit root used to find libcufile.so
+#   CUDAToolkit_ROOT   Optional CUDA toolkit root used to find libcufile.so
+#
 # Examples:
 #   ./scripts/env_switch.sh status
 #   ./scripts/env_switch.sh ugds 0000:b8:00.0
@@ -117,6 +123,44 @@ list_nvme_devices() {
     done
 }
 
+find_libcufile() {
+    local path
+
+    if [ -n "${CUFILE_LIB:-}" ] && [ -f "$CUFILE_LIB" ]; then
+        echo "$CUFILE_LIB"
+        return 0
+    fi
+
+    local cuda_roots=()
+    [ -n "${CUDA_HOME:-}" ] && cuda_roots+=("$CUDA_HOME")
+    [ -n "${CUDA_PATH:-}" ] && cuda_roots+=("$CUDA_PATH")
+    [ -n "${CUDAToolkit_ROOT:-}" ] && cuda_roots+=("$CUDAToolkit_ROOT")
+
+    local root
+    for root in "${cuda_roots[@]}" /usr/local/cuda /usr/local/cuda-*; do
+        [ -d "$root" ] || continue
+        for path in \
+            "$root"/targets/*-linux/lib/libcufile.so \
+            "$root"/lib64/libcufile.so; do
+            [ -f "$path" ] || continue
+            echo "$path"
+            return 0
+        done
+    done
+
+    local ldconfig_bin
+    for ldconfig_bin in ldconfig /sbin/ldconfig; do
+        command -v "$ldconfig_bin" > /dev/null 2>&1 || continue
+        path=$("$ldconfig_bin" -p 2>/dev/null | awk '/libcufile\.so/{print $NF; exit}')
+        if [ -n "$path" ] && [ -e "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # ── Commands ─────────────────────────────────────────────────────────
 
 cmd_status() {
@@ -132,8 +176,9 @@ cmd_status() {
     ls /dev/ugds_drv* 2>/dev/null | while read -r d; do echo "  $d"; done || echo "  (no devices)"
     echo ""
     echo "=== GDS ==="
-    if [ -f /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcufile.so ]; then
-        echo "  libcufile: available"
+    local cufile_lib
+    if cufile_lib=$(find_libcufile); then
+        echo "  libcufile: available ($cufile_lib)"
     else
         echo "  libcufile: NOT FOUND"
     fi
