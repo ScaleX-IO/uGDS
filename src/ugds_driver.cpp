@@ -33,11 +33,19 @@ extern "C" uGDSError_t uGDSDriverClose(void) {
         return make_error(UGDS_BUSY);
     }
 
+    /* Check ALL outstanding RDMA MRs before cleanup */
+    for (const auto& pair : g_driver.rdma_records) {
+        if (!pair.second.empty()) {
+            return make_error(UGDS_RDMA_MR_STILL_ACTIVE);
+        }
+    }
+
     for (auto& entry : g_driver.buf_registry) {
         nvm_dma_unmap(entry.second.dma);
     }
     g_driver.buf_registry.clear();
     g_driver.handle_registry.clear();
+    g_driver.rdma_records.clear();
     g_driver.default_ctrl = nullptr;
     g_driver.initialized = false;
     return UGDS_OK;

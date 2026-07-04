@@ -36,10 +36,44 @@ The HIP backend implements AMD Infinity Storage (AIS) using the standard Linux D
 **Driver notes:**
 The kernel-side code uses standard upstream DMA-buf APIs (`dma_buf_dynamic_attach`, `dma_buf_pin`, `dma_buf_map_attachment`). The userspace side uses `hsa_amd_portable_export_dmabuf_v2()` from the ROCm runtime. No vendor-specific amdgpu extensions are required beyond upstream `CONFIG_HSA_AMD_P2P` support.
 
-**Synchronization contract:**
-Buffers registered with `uGDSBufRegister()` must not be modified by the GPU (HIP kernel writes) while NVMe I/O is in flight on the same buffer. Concurrent GPU access during DMA can cause data corruption. This mirrors the NVIDIA GDS requirement.
+**Synchronization contract (producer/consumer model):**
 
-**Important:** Each backend used at runtime must be enabled in both the kernel module and the userspace library. For example, a CUDA-only kernel module will reject HIP `uGDSBufRegister()` calls. In dual-backend builds, use `uGDSBufRegister(ptr, size, UGDS_REGISTER_DMABUF)` for AMD buffers and `uGDSBufRegister(ptr, size, 0)` for NVIDIA buffers (default).
+All GPU memory accessors are classified as **producers** (write to GPU VRAM) or **consumers** (read from GPU VRAM):
+
+| Accessor | Direction | Role |
+|----------|-----------|------|
+| NVMe **Read** | SSD -> GPU VRAM | **Producer** (writes VRAM) |
+| NVMe **Write** | GPU VRAM -> SSD | **Consumer** (reads VRAM) |
+| RDMA **Send/Write** | GPU VRAM -> Network | **Consumer** (reads VRAM) |
+| RDMA **Recv/Read** | Network -> GPU VRAM | **Producer** (writes VRAM) |
+| GPU **Kernel Write** | GPU ALU -> VRAM | **Producer** |
+| GPU **Kernel Read** | VRAM -> GPU ALU | **Consumer** |
+
+**Rules:**
+1. Any producer requires exclusive ownership of the region. Two producers must NOT overlap (e.g., NVMe Read + RDMA Recv on the same VRAM is a data race).
+2. Two consumers may safely overlap (e.g., NVMe Write + RDMA Send both reading GPU VRAM).
+3. Any transition involving a producer requires the previous operation's completion barrier:
+   - Consumer -> Producer: drain all consumer completions before starting the producer.
+   - Producer -> Consumer: wait for producer completion before starting the consumer.
+4. After a producer completes, an explicit barrier is required before any dependent operation:
+   - NVMe I/O: `uGDSRead()`/`uGDSWrite()` return value (synchronous) or batch completion poll
+   - RDMA: `ibv_poll_cq` for Work Completion
+   - GPU: `cudaStreamSynchronize()` / `hipStreamSynchronize()`
+5. A running GPU kernel must NOT overlap any third-party producer (NVMe/RDMA) on the same region.
+6. `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` is set automatically for RDMA-enabled CUDA buffers to ensure BAR consistency, but it does NOT replace explicit stream/CQ barriers.
+
+For **dmabuf-export** buffers (registered with `uGDSBufRegisterEx()` using `UGDS_BACKEND_CUDA` or `UGDS_BACKEND_HIP`), the dma-buf file descriptor is retained internally and can be exported via `uGDSExportDmabuf()`. The caller is responsible for closing the exported fd and ensuring all external users (e.g., RDMA MR registrations) are cleaned up before calling `uGDSBufDeregister()`.
+
+**Important:** Each backend used at runtime must be enabled in both the kernel module and the userspace library. For example, a CUDA-only kernel module will reject HIP `uGDSBufRegister()` calls. In dual-backend builds, use `uGDSBufRegisterEx()` with explicit `uGDSBackend_t`.
+
+**CUDA dma-buf:** The userspace CMake auto-detects CUDA dma-buf support (`HAVE_CUDA_DMABUF`). When enabled, the kernel module must also be built with the same flag:
+
+```bash
+cd drv
+make BUILD_CUDA=1 HAVE_CUDA_DMABUF=1
+```
+
+Without this flag, the kernel module will not include the `NVM_MAP_DMABUF_MEMORY` ioctl handler, and `uGDSBufRegisterEx()` with `UGDS_BACKEND_CUDA` for fd export will fail with `UGDS_IO_NOT_SUPPORTED`. Standard CUDA NVMe I/O (`uGDSRead`/`uGDSWrite`) does not require this flag.
 
 **Note:** In dual-backend builds, unregistered AMD buffers (on-the-fly I/O without prior `uGDSBufRegister`) are not supported. AMD buffers must be explicitly registered before I/O. NVIDIA buffers support both registered and unregistered paths.
 

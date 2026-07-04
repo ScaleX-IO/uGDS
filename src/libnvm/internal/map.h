@@ -15,7 +15,10 @@ enum mapping_type
     MAP_TYPE_HOST        =   0x2,
     MAP_TYPE_API         =   0x4,
     MAP_TYPE_DMABUF      =   0x8,
+    MAP_TYPE_DMABUF_CUDA =   0x10
 };
+
+typedef int (*dmabuf_close_fn)(int fd);
 
 
 
@@ -30,6 +33,9 @@ struct ioctl_mapping
 
     int       dmabuf_fd;
     uint64_t  dmabuf_offset;
+
+    bool                retain_fd;
+    dmabuf_close_fn     close_fn;
 };
 
 

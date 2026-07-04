@@ -69,7 +69,7 @@ struct map* map_device_memory(const struct ctrl* ctrl, u64 vaddr, unsigned long 
 
 
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
 /*
  * Map GPU memory via standard Linux DMA-buf framework.
  * Used by AMD HIP/ROCm backend.
@@ -82,7 +82,7 @@ struct map* map_dmabuf(const struct ctrl* ctrl,
 
 
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
 /* Forward declaration -- avoids pulling <linux/scatterlist.h> into map.h */
 struct sg_table;
 

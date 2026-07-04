@@ -23,6 +23,7 @@
 - **User-space IO stack** — bypasses the kernel NVMe driver and filesystem entirely; CPU builds NVMe commands and polls completions in user space
 - **cuFile API compatible** — existing GDS applications work with minimal changes (relink to `libugds.so`, change `cuFile` prefix to `uGDS`)
 - **Multi-vendor GPU support** — NVIDIA CUDA and AMD Infinity Storage (HIP/ROCm) backends; both can be enabled simultaneously for mixed-GPU systems
+- **DMA-buf export** -- export GPU memory as a Linux dma-buf file descriptor for RDMA, DPDK, and other dmabuf-aware subsystems
 - **Fully open-source** — BSD 3-Clause licensed; no proprietary runtime dependencies beyond the GPU driver (NVIDIA driver or AMD ROCm runtime)
 - **High performance** — busy-poll CQ completion with `_mm_pause()`, multi-queue round-robin IO, achieving up to 2.7x read and 28x write bandwidth over NVIDIA GDS
 - **Interrupt mode (opt-in)** — MSI-X + eventfd completion for near-zero CPU utilization at large IO sizes; disabled by default (`UGDS_INTERRUPT_MODE=1` to enable)
@@ -136,6 +137,8 @@ scripts/run_tests.sh all
 | `uGDSBatchIOSetUp / Submit / GetStatus / Destroy` | ✅ | Submit/poll separation, up to 128 IOs per batch |
 | `uGDSReadAsync / WriteAsync` | ✅ | CUDA stream integration, late-binding pointers |
 | `uGDSStreamRegister / Deregister` | ✅ | Optional (no-op, uGDS has no bounce buffer) |
+| `uGDSBufRegisterEx` | ✅ | Extended registration with backend selection and export flag |
+| `uGDSExportDmabuf` | ✅ | DMA-buf fd export for RDMA and dmabuf-aware consumers |
 
 ## Roadmap
 
@@ -146,6 +149,7 @@ scripts/run_tests.sh all
 | 2 | Batch IO API (multi-command doorbell) | ✅ |
 | 3 | Async Stream API (CUDA stream integration) | ✅ |
 | 4 | Hugepage support (larger QP depth) | ✅ |
+| 4.5 | Dual CUDA/HIP backend + DMA-buf export | ✅ |
 | 5 | SGL support (scatter-gather lists) | 🔜 |
 | 6 | Interrupt mode (MSI-X + eventfd) | ✅ |
 | 7 | Multi-SSD support (multi-handle aggregation) | 🔜 |

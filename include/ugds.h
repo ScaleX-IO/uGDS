@@ -65,6 +65,7 @@ typedef enum uGDSOpError {
     UGDS_GPU_MEMORY_PINNING_FAILED   = UGDS_BASE_ERR + 36,
 
     UGDS_BATCH_CAPACITY_EXCEEDED     = UGDS_BASE_ERR + 40,
+    UGDS_RDMA_MR_STILL_ACTIVE        = UGDS_BASE_ERR + 41,
     UGDS_BUSY                        = UGDS_BASE_ERR + 42,
     UGDS_OUT_OF_MEMORY               = UGDS_BASE_ERR + 43,
 } uGDSOpError;
@@ -89,6 +90,7 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
     case UGDS_BATCH_CAPACITY_EXCEEDED:     return "batch capacity exceeded";
 
     case UGDS_BUSY:                        return "resource busy, retry";
+    case UGDS_RDMA_MR_STILL_ACTIVE:       return "RDMA MR still active";
     case UGDS_OUT_OF_MEMORY:               return "out of memory";
     default:                                  return "unknown uGDS error";
     }
@@ -141,6 +143,12 @@ uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int flags);
 /* Flag for uGDSBufRegister: use AMD HIP/dma-buf path */
 #define UGDS_REGISTER_DMABUF  NVM_MAP_DMABUF
 
+/* Buffer registration flags (defined locally to avoid pulling in
+ * libnvm/nvm_dma.h, which transitively includes C++ <atomic>) */
+#define NVM_MAP_DMABUF      0x1
+#define NVM_MAP_RDMA        0x2    /* Retain dmabuf fd for RDMA use */
+#define NVM_MAP_FORCE_CUDA  0x4    /* Force CUDA path (skip auto-probe) */
+
 uGDSError_t uGDSBufDeregister(const void* bufPtr_base);
 
 /* Backend identifier for dual-backend dispatch. */
@@ -149,6 +157,50 @@ typedef enum uGDSBackend {
     UGDS_BACKEND_CUDA    = 1,
     UGDS_BACKEND_HIP     = 2,
 } uGDSBackend_t;
+
+/* Extended buffer registration with backend selection and export flag */
+typedef struct uGDSBufConfig {
+    uGDSBackend_t   backend;
+    bool            enable_export;
+} uGDSBufConfig_t;
+
+uGDSError_t uGDSBufRegisterEx(const void* bufPtr_base, size_t length,
+                               const uGDSBufConfig_t* config);
+
+/* dma-buf export handle for RDMA registration.
+ * fd is dup()'d -- caller owns it and MUST close after use. */
+typedef struct uGDSDmabufExport {
+    int       fd;
+    uint64_t  offset;
+    size_t    length;
+} uGDSDmabufExport_t;
+
+uGDSError_t uGDSExportDmabuf(const void* bufPtr_base,
+                              uGDSDmabufExport_t* out);
+
+/* RDMA MR registration handle.
+ *
+ * Lifecycle: uGDSRDMARegister() creates an MR via ibv_reg_dmabuf_mr()
+ * and records it. uGDSRDMAUnregister() calls ibv_dereg_mr() and removes
+ * the record. The caller MUST ensure that:
+ *   1. No new work requests are posted to this MR before unregistering.
+ *   2. All outstanding completions for this MR have been reaped.
+ * Deregistering an MR that still has in-flight WRs is undefined
+ * behavior (NIC may still be accessing the memory). */
+typedef struct uGDSRDMARegion {
+    void*           mr;          /* ibv_mr* (opaque) */
+    uint64_t        iova;        /* IOVA / buffer VA for post-recv */
+    uint32_t        lkey;
+    uint32_t        rkey;
+    uint64_t        token;       /* internal generation token */
+} uGDSRDMARegion_t;
+
+uGDSError_t uGDSRDMARegister(const void* bufPtr_base,
+                              void* pd, int access_flags,
+                              uGDSRDMARegion_t* region);
+
+uGDSError_t uGDSRDMAUnregister(const void* bufPtr_base,
+                                uGDSRDMARegion_t* region);
 
 ssize_t uGDSRead(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                    off_t file_offset, off_t bufPtr_offset);

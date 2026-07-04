@@ -64,10 +64,13 @@ static int ioctl_map(const struct device* dev, const struct va_range* va, uint64
             type = NVM_MAP_DEVICE_MEMORY;
             break;
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
         case MAP_TYPE_DMABUF:
+        case MAP_TYPE_DMABUF_CUDA:
         {
-            /* DMA-buf path: pass fd + offset + gpu_ptr to kernel */
+            /* DMA-buf path: pass fd + offset + gpu_ptr to kernel.
+             * Both HIP (MAP_TYPE_DMABUF) and CUDA (MAP_TYPE_DMABUF_CUDA)
+             * go through the same NVM_MAP_DMABUF_MEMORY ioctl. */
             struct nvm_ioctl_dmabuf request = {
                 .gpu_ptr          = (uint64_t) m->buffer,
                 .dmabuf_fd        = m->dmabuf_fd,

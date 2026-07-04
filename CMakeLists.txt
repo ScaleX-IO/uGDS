@@ -27,7 +27,7 @@ set(UGDS_CUDA_ARCHITECTURES "80;90")
 if(UGDS_BACKEND_CUDA)
     find_package(CUDAToolkit REQUIRED)
     set(UGDS_CUDA_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
-    list(APPEND UGDS_CUDA_LIBS CUDA::cudart)
+    list(APPEND UGDS_CUDA_LIBS CUDA::cudart CUDA::cuda_driver)
 endif()
 
 # - HIP backend setup (independent) ------------
@@ -87,6 +87,53 @@ if(NOT UGDS_BACKEND_CUDA AND NOT UGDS_BACKEND_HIP)
     message(WARNING "No GPU backend selected, building library only")
 endif()
 
+# - RDMA support (optional) --------------------
+option(UGDS_ENABLE_RDMA "Enable tracked RDMA convenience API (libibverbs)" OFF)
+
+include(CheckCXXSourceCompiles)
+
+if(UGDS_ENABLE_RDMA)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(IBVERBS REQUIRED IMPORTED_TARGET libibverbs)
+    # Verify ibv_reg_dmabuf_mr is available (rdma-core >= v37)
+    set(CMAKE_REQUIRED_LIBRARIES "PkgConfig::IBVERBS")
+    check_cxx_source_compiles("
+        #include <infiniband/verbs.h>
+        int main() {
+            ibv_reg_dmabuf_mr(0, 0, 0, 0, 0, 0);
+            return 0;
+        }" HAVE_IBV_REG_DMABUF_MR)
+    set(CMAKE_REQUIRED_LIBRARIES)
+    if(NOT HAVE_IBV_REG_DMABUF_MR)
+        message(FATAL_ERROR "ibv_reg_dmabuf_mr not found. "
+                            "Install rdma-core >= v37 or disable RDMA (-DUGDS_ENABLE_RDMA=OFF).")
+    endif()
+endif()
+
+# - CUDA dma-buf detection ----------------------
+if(UGDS_BACKEND_CUDA)
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES "${UGDS_CUDA_INCLUDES}")
+    set(CMAKE_REQUIRED_LIBRARIES "${UGDS_CUDA_LIBS}")
+    check_cxx_source_compiles("
+        #include <cuda.h>
+        int main() {
+            int fd; void* h = &fd;
+            cuMemGetHandleForAddressRange(h, (CUdeviceptr)0, 0,
+                CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+                CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
+            return 0;
+        }" HAVE_CUDA_DMABUF)
+    set(CMAKE_REQUIRED_INCLUDES)
+    set(CMAKE_REQUIRED_LIBRARIES)
+    if(HAVE_CUDA_DMABUF)
+        message(STATUS "CUDA dma-buf export supported (HAVE_CUDA_DMABUF)")
+        message(STATUS "  When building the kernel module, pass:")
+        message(STATUS "    make BUILD_CUDA=1 HAVE_CUDA_DMABUF=1")
+    else()
+        message(STATUS "CUDA dma-buf export NOT supported (need CUDA 11.7+)")
+    endif()
+endif()
 
 # Library sources
 set(UGDS_SOURCES
@@ -105,6 +152,7 @@ set(UGDS_SOURCES
     src/ugds_io.cpp
     src/ugds_batch.cpp
     src/ugds_async.cpp
+    src/ugds_rdma.cpp
     src/ugds_hugepage.cpp
 )
 
@@ -121,6 +169,9 @@ if(UGDS_BACKEND_CUDA)
     target_include_directories(ugds PRIVATE ${UGDS_CUDA_INCLUDES})
     target_compile_definitions(ugds PRIVATE _CUDA)
     target_link_libraries(ugds PRIVATE ${UGDS_CUDA_LIBS})
+    if(HAVE_CUDA_DMABUF)
+        target_compile_definitions(ugds PRIVATE HAVE_CUDA_DMABUF)
+    endif()
 endif()
 
 if(UGDS_BACKEND_HIP)
@@ -130,6 +181,18 @@ if(UGDS_BACKEND_HIP)
     if(HAVE_HSA_DMABUF_V2)
         target_compile_definitions(ugds PRIVATE HAVE_HSA_DMABUF_V2)
     endif()
+endif()
+
+# UGDS_HAVE_DMABUF: unified dmabuf guard (HIP or CUDA-dmabuf)
+# Use PUBLIC so test targets linking against ugds also see the definition.
+if(UGDS_BACKEND_HIP OR (UGDS_BACKEND_CUDA AND HAVE_CUDA_DMABUF))
+    target_compile_definitions(ugds PUBLIC UGDS_HAVE_DMABUF)
+endif()
+
+# RDMA support
+if(UGDS_ENABLE_RDMA)
+    target_link_libraries(ugds PRIVATE PkgConfig::IBVERBS)
+    target_compile_definitions(ugds PRIVATE _RDMA)
 endif()
 
 target_link_libraries(ugds PRIVATE Threads::Threads)
@@ -160,6 +223,13 @@ set(FUNCTIONAL_TESTS
     test_interrupt_ioctls
     test_cq_dw11
     test_interrupt_mode
+    test_dmabuf_export
+)
+
+# RDMA/dmabuf tests -- only built/run when RDMA is enabled
+set(RDMA_TESTS
+    test_rdma_export
+    test_rdma_tracked
 )
 
 # CUDA tests (compiled with nvcc)
@@ -190,6 +260,26 @@ if(UGDS_BACKEND_CUDA)
                 BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
             )
         endforeach()
+
+        # RDMA tests (only when UGDS_ENABLE_RDMA is ON)
+        if(UGDS_ENABLE_RDMA)
+            foreach(test_name ${RDMA_TESTS})
+                set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/${test_name}.cu)
+                add_executable(${test_name}${CUDA_SUFFIX} ${test_src})
+                target_include_directories(${test_name}${CUDA_SUFFIX} PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/include
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/functional
+                )
+                target_link_libraries(${test_name}${CUDA_SUFFIX} ugds CUDA::cudart PkgConfig::IBVERBS)
+                set_target_properties(${test_name}${CUDA_SUFFIX} PROPERTIES
+                    CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+                    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+                )
+                if(${test_name} STREQUAL "test_rdma_tracked")
+                    target_compile_definitions(${test_name}${CUDA_SUFFIX} PRIVATE _RDMA)
+                endif()
+            endforeach()
+        endif()
 
         # bench_ugds (CUDA)
         set(bench_src ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cufile_bench.cu)
@@ -237,21 +327,22 @@ if(UGDS_BACKEND_CUDA)
                 CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
             )
 
-            # bench_overlap_gds: overlap benchmark linked against libcufile.so
-            add_executable(bench_overlap_gds test/perf/bench_overlap.cu)
-            target_include_directories(bench_overlap_gds PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
-            )
-            if(CUFILE_INCLUDE)
-                target_include_directories(bench_overlap_gds PRIVATE ${CUFILE_INCLUDE})
-            else()
-                target_include_directories(bench_overlap_gds PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+            if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_overlap.cu)
+                add_executable(bench_overlap_gds test/perf/bench_overlap.cu)
+                target_include_directories(bench_overlap_gds PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+                )
+                if(CUFILE_INCLUDE)
+                    target_include_directories(bench_overlap_gds PRIVATE ${CUFILE_INCLUDE})
+                else()
+                    target_include_directories(bench_overlap_gds PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+                endif()
+                target_link_libraries(bench_overlap_gds ${CUFILE_LIB} CUDA::cudart)
+                target_compile_definitions(bench_overlap_gds PRIVATE USE_O_DIRECT USE_NVIDIA_GDS)
+                set_target_properties(bench_overlap_gds PROPERTIES
+                    CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+                )
             endif()
-            target_link_libraries(bench_overlap_gds ${CUFILE_LIB} CUDA::cudart)
-            target_compile_definitions(bench_overlap_gds PRIVATE USE_O_DIRECT USE_NVIDIA_GDS)
-            set_target_properties(bench_overlap_gds PROPERTIES
-                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
-            )
         endif()
     else()
         message(WARNING "CUDA compiler not found, CUDA tests will not be built")
@@ -297,6 +388,35 @@ if(UGDS_BACKEND_HIP)
             )
         endforeach()
 
+        # RDMA tests (only when UGDS_ENABLE_RDMA is ON)
+        if(UGDS_ENABLE_RDMA)
+            foreach(test_name ${RDMA_TESTS})
+                set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/${test_name}.cu)
+                if(UGDS_BACKEND_CUDA)
+                    set(hip_src ${CMAKE_CURRENT_BINARY_DIR}/${test_name}.hip.cu)
+                    configure_file(${test_src} ${hip_src} COPYONLY)
+                    set_source_files_properties(${hip_src} PROPERTIES LANGUAGE HIP)
+                    add_executable(${test_name}${HIP_SUFFIX} ${hip_src})
+                else()
+                    set_source_files_properties(${test_src} PROPERTIES LANGUAGE HIP)
+                    add_executable(${test_name}${HIP_SUFFIX} ${test_src})
+                endif()
+                target_include_directories(${test_name}${HIP_SUFFIX} PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/include
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/functional
+                )
+                target_link_libraries(${test_name}${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS} PkgConfig::IBVERBS)
+                target_compile_definitions(${test_name}${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
+                set_target_properties(${test_name}${HIP_SUFFIX} PROPERTIES
+                    HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
+                    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+                )
+                if(${test_name} STREQUAL "test_rdma_tracked")
+                    target_compile_definitions(${test_name}${HIP_SUFFIX} PRIVATE _RDMA)
+                endif()
+            endforeach()
+        endif()
+
         # bench_ugds (HIP)
         set(bench_src_orig ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cufile_bench.cu)
         if(UGDS_BACKEND_CUDA)
@@ -325,4 +445,25 @@ endif()
 
 if(NOT UGDS_BACKEND_CUDA AND NOT UGDS_BACKEND_HIP)
     message(WARNING "No GPU backend enabled, tests will not be built")
+endif()
+
+# - RDMA Example --------------------------------
+# Build only when CUDA compiler is available and RDMA is enabled
+if(UGDS_ENABLE_RDMA AND UGDS_BACKEND_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        add_executable(rdma_example examples/rdma_example.cu)
+        target_include_directories(rdma_example PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(rdma_example ugds ${UGDS_CUDA_LIBS} PkgConfig::IBVERBS)
+        target_compile_definitions(rdma_example PRIVATE UGDS_ENABLE_RDMA)
+        set_target_properties(rdma_example PROPERTIES
+            CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+            BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        )
+    else()
+        message(WARNING "CUDA compiler not found, rdma_example will not be built")
+    endif()
 endif()
