@@ -18,6 +18,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/pci.h>
+#include <linux/jiffies.h>
 
 #ifdef _CUDA
 #include <nv-p2p.h>
@@ -516,8 +517,11 @@ int map_gpu_memory(struct map* map, struct list* list)
         }
     }
 
-    /* Publish gd AFTER all setup completes. */
-    map->data = gd;
+    /* Publish gd AFTER all setup completes. Release ordering pairs
+     * with the xchg (full barrier) in force_release_gpu_memory /
+     * release_gpu_memory, ensuring the callback never sees a
+     * partially initialized gpu_region. */
+    smp_store_release(&map->data, gd);
 
     /* If callback fired during setup, it took gd via xchg and freed
      * it via gpu_region_free_callback. The callback saves n_addrs
@@ -809,9 +813,17 @@ static int map_dmabuf_memory(struct map* map, int dmabuf_fd,
      * addresses, so that GPU writes preceding the import are visible
      * at the DMA-buf backing storage when NVMe accesses it. */
     dma_resv_lock(dr->dmabuf->resv, NULL);
+    /* Bounded, interruptible wait: an unbounded uninterruptible wait
+     * puts the caller in unkillable D state if a GPU fence never
+     * signals. 0 means timeout; negative (incl. -ERESTARTSYS) is
+     * returned as-is so the signal layer can restart the syscall. */
     fence_ret = dma_resv_wait_timeout(dr->dmabuf->resv, DMA_RESV_USAGE_WRITE,
-                                 false, MAX_SCHEDULE_TIMEOUT);
-    if (fence_ret < 0 && fence_ret != -ERESTARTSYS)
+                                 true, msecs_to_jiffies(10000));
+    if (fence_ret == 0)
+    {
+        fence_ret = -ETIMEDOUT;
+    }
+    if (fence_ret < 0)
     {
         dma_resv_unlock(dr->dmabuf->resv);
         printk(KERN_ERR "uGDS: dma_resv_wait_timeout failed: %ld\n", fence_ret);
