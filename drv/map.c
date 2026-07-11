@@ -123,9 +123,6 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
         return ERR_PTR(-ENOMEM);
     }
 
-    list_node_init(&map->list);
-
-    map->owner_pid = get_task_pid(current, PIDTYPE_TGID);
     map->vaddr = vaddr;
     map->pdev = ctrl->pdev;
     map->page_size = 0;
@@ -134,7 +131,6 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
     map->n_addrs = n_pages;
     map->n_dma_mapped = 0;
     atomic_set(&map->invalid, 0);
-    atomic_set(&map->refcount, 1);
 
 
     for (i = 0; i < map->n_addrs; ++i)
@@ -149,319 +145,14 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
 
 void unmap_and_release(struct map* map)
 {
-    list_remove(&map->list);
-
     if (map->release != NULL && map->data != NULL)
     {
         map->release(map);
     }
 
-    if (map->owner_pid != NULL)
-        put_pid(map->owner_pid);
-
     kvfree(map);
 }
 
-
-
-struct map* map_find(const struct list* list, u64 vaddr)
-{
-    const struct list_node* element = list_next(&list->head);
-    struct map* map = NULL;
-    struct map* exact = NULL;
-    struct map* masked = NULL;
-
-    /* Acquire refcounted pid once. get_task_pid returns a referenced
-     * pointer (via get_pid), so we must put_pid before returning. */
-    struct pid* current_pid = get_task_pid(current, PIDTYPE_TGID);
-
-    /* Two-pass lookup: prefer exact vaddr match, fall back to
-     * page-mask match. This prevents a 64 KiB CUDA mapping from
-     * shadowing a 4 KiB dma-buf mapping in the same region. */
-    while (element != NULL)
-    {
-        map = container_of(element, struct map, list);
-
-        if (map->owner_pid == current_pid)
-        {
-            if (map->vaddr == vaddr)
-            {
-                exact = map;
-                break;
-            }
-            if (masked == NULL &&
-                map->page_size > 0 &&
-                map->vaddr == (vaddr & ~((u64)map->page_size - 1)))
-            {
-                masked = map;
-            }
-        }
-
-        element = list_next(element);
-    }
-
-    if (current_pid != NULL)
-        put_pid(current_pid);
-
-    return exact ? exact : masked;
-}
-
-
-
-/*
- * Helper: unlink a list_node from the doubly-linked list.
- * Must be called with the list spinlock held.
- */
-static void list_unlink(struct list_node* element)
-{
-    element->prev->next = element->next;
-    element->next->prev = element->prev;
-    element->list = NULL;
-    element->next = NULL;
-    element->prev = NULL;
-}
-
-/*
- * Helper: find a mapping by exact vaddr or page-masked vaddr
- * for the current task and matching PCI device. Returns the map or NULL.
- * Must be called with the list spinlock held.
- *
- * The pdev match prevents cross-device reuse: two NVMe controllers
- * in the same process must not share DMA addresses.
- */
-static struct map* map_lookup_locked(const struct list* list,
-                                      u64 vaddr,
-                                      const struct pci_dev* pdev,
-                                      unsigned long n_pages,
-                                      unsigned long page_size,
-                                      struct list_node** out_element)
-{
-    struct list_node* element = list_next(&list->head);
-    struct map* exact = NULL;
-    struct map* masked = NULL;
-    struct list_node* masked_element = NULL;
-    struct pid* current_pid = get_task_pid(current, PIDTYPE_TGID);
-
-    while (element != NULL)
-    {
-        struct map* map = container_of(element, struct map, list);
-
-        if (map->owner_pid == current_pid &&
-            (pdev == NULL || map->pdev == pdev) &&
-            (n_pages == 0 || map->n_addrs == n_pages) &&
-            (page_size == 0 || map->page_size == page_size))
-        {
-            if (map->vaddr == vaddr)
-            {
-                exact = map;
-                if (out_element)
-                    *out_element = element;
-                break;
-            }
-            if (masked == NULL &&
-                map->page_size > 0 &&
-                map->vaddr == (vaddr & ~((u64)map->page_size - 1)))
-            {
-                masked = map;
-                masked_element = element;
-            }
-        }
-        element = list_next(element);
-    }
-
-    if (current_pid != NULL)
-        put_pid(current_pid);
-
-    if (exact)
-        return exact;
-
-    if (masked)
-    {
-        if (out_element)
-            *out_element = masked_element;
-        return masked;
-    }
-
-    if (out_element)
-        *out_element = NULL;
-    return NULL;
-}
-
-/*
- * Atomically find an existing mapping and increment its refcount.
- * Matches by (owner_pid, vaddr, pdev). Returns the existing map,
- * or NULL if not found.
- */
-struct map* map_find_and_ref(struct list* list, u64 vaddr,
-                             const struct pci_dev* pdev,
-                             unsigned long n_pages,
-                             unsigned long page_size)
-{
-    struct map* result = NULL;
-
-    spin_lock(&list->lock);
-    {
-        result = map_lookup_locked(list, vaddr, pdev, n_pages, page_size, NULL);
-        if (result != NULL)
-        {
-            int old = atomic_read(&result->refcount);
-            if (old >= 0x7FFFFFFF)
-            {
-                spin_unlock(&list->lock);
-                return ERR_PTR(-EMFILE);
-            }
-            atomic_inc(&result->refcount);
-        }
-    }
-    spin_unlock(&list->lock);
-
-    return result;
-}
-
-/*
- * Decrement a mapping's refcount. If it reaches 0 the mapping is
- * removed from the list and freed.
- *
- * The caller must hold map_create_mutex (or otherwise guarantee no
- * concurrent force_release) to prevent a race with the NVIDIA P2P
- * callback path.
- */
-void map_put_ref(struct map* map)
-{
-    struct list* lst;
-
-    if (map == NULL)
-        return;
-
-    lst = map->list.list;
-    spin_lock(&lst->lock);
-    {
-        if (atomic_dec_and_test(&map->refcount))
-        {
-            list_unlink(&map->list);
-        }
-        else
-        {
-            map = NULL; /* still referenced, don't free */
-        }
-    }
-    spin_unlock(&lst->lock);
-
-    if (map != NULL)
-        unmap_and_release(map);
-}
-
-/*
- * Atomically find and remove (or decrement) a mapping from the list.
- *
- * n_pages=0 and page_size=0 act as wildcards. This is correct for
- * UNMAP because userspace should never create two maps with the same
- * VA on the same controller with different backends; if it does, the
- * exact-match path returns the first matching map deterministically.
- *
- * Returns:
- *   - pointer to the removed map if refcount drops to 0 (caller must
- *     unmap_and_release)
- *   - ERR_PTR(-EAGAIN) if the mapping was found but still referenced
- *     (refcount decremented, not removed)
- *   - NULL if not found
- */
-struct map* map_find_and_remove(struct list* list, u64 vaddr,
-                                const struct pci_dev* pdev)
-{
-    struct map* result = NULL;
-    struct list_node* target_element = NULL;
-
-    spin_lock(&list->lock);
-    {
-        result = map_lookup_locked(list, vaddr, pdev, 0, 0, &target_element);
-        if (result != NULL && target_element != NULL)
-        {
-            if (atomic_dec_and_test(&result->refcount))
-            {
-                /* refcount reached 0: safe to remove */
-                list_unlink(target_element);
-            }
-            else
-            {
-                /* Still in use by another on-the-fly user */
-                result = ERR_PTR(-EAGAIN);
-            }
-        }
-        else
-        {
-            result = NULL;
-        }
-    }
-    spin_unlock(&list->lock);
-
-    return result;
-}
-
-
-
-/*
- * Check if any mapping owned by the current task overlaps the
- * byte range [vaddr, vaddr + n_bytes) on the given list and pdev.
- * Uses proper range-overlap detection so mappings at different
- * page granularities (e.g. 4 KiB dmabuf vs 64 KiB CUDA) are
- * correctly detected even when their base addresses differ.
- *
- * Must be called with map_create_mutex held (serializes against
- * concurrent MAP/UNMAP that could add/remove entries).
- */
-bool map_range_exists(struct list* list, u64 vaddr, u64 n_bytes,
-                      const struct pci_dev* pdev)
-{
-    struct list_node* element;
-    struct pid* current_pid;
-    bool found = false;
-    u64 new_end;
-
-    /* Reject wrapping ranges from user-controlled addresses.
-     * Return true so the caller rejects with -EEXIST rather than
-     * allowing a nonsensical wrapped range to be created. */
-    if (vaddr > U64_MAX - n_bytes)
-        return true;
-
-    new_end = vaddr + n_bytes;
-
-    current_pid = get_task_pid(current, PIDTYPE_TGID);
-
-    spin_lock(&list->lock);
-    {
-        element = list_next(&list->head);
-        while (element != NULL)
-        {
-            struct map* map = container_of(element, struct map, list);
-            u64 existing_end;
-
-            if (map->owner_pid != current_pid ||
-                map->pdev != pdev)
-            {
-                element = list_next(element);
-                continue;
-            }
-
-            existing_end = map->vaddr + (u64)map->n_addrs * (u64)map->page_size;
-
-            /* Standard interval overlap: [a, b) vs [c, d) */
-            if (vaddr < existing_end && new_end > map->vaddr)
-            {
-                found = true;
-                break;
-            }
-
-            element = list_next(element);
-        }
-    }
-    spin_unlock(&list->lock);
-
-    if (current_pid != NULL)
-        put_pid(current_pid);
-
-    return found;
-}
 
 
 static void release_user_pages(struct map* map)
@@ -572,7 +263,7 @@ static long map_user_pages(struct map* map)
 
 
 
-struct map* map_userspace(struct list* list, const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages)
+struct map* map_userspace(const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages)
 {
     long err;
     struct map* md;
@@ -597,9 +288,7 @@ struct map* map_userspace(struct list* list, const struct ctrl* ctrl, u64 vaddr,
         return ERR_PTR(err);
     }
 
-    list_insert(list, &md->list);
-
-    //printk(KERN_DEBUG "Mapped %lu host pages starting at address %llx\n", 
+    //printk(KERN_DEBUG "Mapped %lu host pages starting at address %llx\n",
     //        md->n_addrs, md->vaddr);
     return md;
 }
@@ -845,7 +534,7 @@ int map_gpu_memory(struct map* map, struct list* list)
 
 
 #ifdef _CUDA
-struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages, struct list* ctrl_list)
+struct map* map_device_memory(const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages, struct list* ctrl_list)
 {
     int err;
     struct map* md = NULL;
@@ -870,9 +559,7 @@ struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 va
         return ERR_PTR(err);
     }
 
-    list_insert(list, &md->list);
-
-    //printk(KERN_DEBUG "Mapped %lu GPU pages starting at address %llx\n", 
+    //printk(KERN_DEBUG "Mapped %lu GPU pages starting at address %llx\n",
     //        md->n_addrs, md->vaddr);
     return md;
 }
@@ -1175,7 +862,7 @@ fail:
 }
 
 
-struct map* map_dmabuf(struct list* list, const struct ctrl* ctrl,
+struct map* map_dmabuf(const struct ctrl* ctrl,
                         u64 gpu_ptr, int dmabuf_fd,
                         u64 dmabuf_offset, unsigned long n_pages,
                         size_t ioaddrs_capacity)
@@ -1188,7 +875,7 @@ struct map* map_dmabuf(struct list* list, const struct ctrl* ctrl,
         return ERR_PTR(-EINVAL);
     }
 
-    /* Use GPU pointer as vaddr for map_find() lookup on unmap */
+    /* Use GPU pointer as the map's vaddr */
     md = create_descriptor(ctrl, gpu_ptr, n_pages);
     if (IS_ERR(md))
     {
@@ -1203,8 +890,6 @@ struct map* map_dmabuf(struct list* list, const struct ctrl* ctrl,
         unmap_and_release(md);
         return ERR_PTR(err);
     }
-
-    list_insert(list, &md->list);
 
     printk(KERN_DEBUG "uGDS: mapped %lu dmabuf pages starting at gpu_ptr %llx\n",
            md->n_addrs, md->vaddr);
