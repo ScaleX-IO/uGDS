@@ -17,6 +17,7 @@
 /* Forward declaration */
 struct ctrl;
 struct map;
+struct pci_dev;
 
 
 typedef void (*release)(struct map*);
@@ -24,19 +25,22 @@ typedef void (*release)(struct map*);
 
 /*
  * Describes a range of mapped memory.
+ *
+ * Ownership: a map is owned by exactly one map_handle in one file's
+ * ledger (see pci.c). There is no global map list; all lookup and
+ * refcounting happens in the per-file ledger under the file ctx lock.
  */
 struct map
 {
-    struct list_node    list;           /* Linked list header */
-    struct task_struct* owner;          /* Owner of mapping */
-    u64                 vaddr;          /* Starting virtual address */
+    u64                 vaddr;          /* Starting virtual address (aligned) */
     struct list*        ctrl_list;
     struct pci_dev*     pdev;           /* Reference to physical PCI device */
     unsigned long       page_size;      /* Logical page size */
-    void*               data;           /* Custom data */
-    release             release;        /* Custom callback for unmapping and releasing memory */
+    void*               data;           /* Backend data, handed off via xchg */
+    release             release;        /* Backend release callback */
     unsigned long       n_addrs;        /* Number of mapped pages */
-    atomic_t            invalid;        /* Set by dmabuf move_notify */
+    unsigned long       n_dma_mapped;   /* Successfully DMA-mapped pages (host backend) */
+    atomic_t            invalid;        /* Set by dmabuf move_notify or NVIDIA force_release */
     uint64_t            addrs[1];       /* Bus addresses */
 };
 
@@ -45,7 +49,7 @@ struct map
 /*
  * Lock and map userspace pages for DMA.
  */
-struct map* map_userspace(struct list* list, const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages);
+struct map* map_userspace(const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages);
 
 
 
@@ -60,7 +64,7 @@ void unmap_and_release(struct map* map);
 /*
  * Lock and map GPU device memory.
  */
-struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages, struct list* ctrl_list);
+struct map* map_device_memory(const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages, struct list* ctrl_list);
 #endif
 
 
@@ -70,18 +74,12 @@ struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 va
  * Map GPU memory via standard Linux DMA-buf framework.
  * Used by AMD HIP/ROCm backend.
  */
-struct map* map_dmabuf(struct list* list, const struct ctrl* ctrl,
+struct map* map_dmabuf(const struct ctrl* ctrl,
                         u64 gpu_ptr, int dmabuf_fd,
                         u64 dmabuf_offset, unsigned long n_pages,
                         size_t ioaddrs_capacity);
 #endif
 
-
-
-/*
- * Find memory mapping from vaddr and current task
- */
-struct map* map_find(const struct list* list, u64 vaddr);
 
 
 #ifdef _HIP
