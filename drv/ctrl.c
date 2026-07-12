@@ -42,6 +42,7 @@ struct ctrl* ctrl_get(struct class* cls, struct pci_dev* pdev, int number)
 
     list_node_init(&ctrl->list);
     kref_init(&ctrl->ref);
+    ctrl->dying = 0;
 
     ctrl->pdev = pci_dev_get(pdev);
     ctrl->number = number;
@@ -116,6 +117,13 @@ struct ctrl* ctrl_find_and_get_by_inode(struct list* list, const struct inode* i
 
         if (ctrl->cdev == inode->i_cdev)
         {
+            /* Refuse opens on controllers being removed. The dying
+             * flag is set under the list spinlock in remove_pci_dev,
+             * so this check is atomic with respect to list removal. */
+            if (ctrl->dying)
+            {
+                break;
+            }
             /* Same lock domain as list removal in remove_pci_dev,
              * so a controller found here cannot have dropped its
              * final reference yet. */
