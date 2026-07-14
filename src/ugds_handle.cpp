@@ -1,12 +1,19 @@
 #include "ugds_internal.h"
+#include "libnvm/internal/ioctl.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
-static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp) {
+static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp, int dev_fd) {
+    // Teardown order: delete SQ -> delete CQ (controller stops posting
+    // completions and raising IRQs) -> unregister interrupt (free_irq
+    // drains any in-flight handler) -> close eventfd.
     if (qp->sq_dma) {
         nvm_admin_sq_delete(aq_ref, &qp->sq, &qp->cq);
         nvm_dma_unmap(qp->sq_dma);
@@ -15,17 +22,26 @@ static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp) {
         nvm_admin_cq_delete(aq_ref, &qp->cq);
         nvm_dma_unmap(qp->cq_dma);
     }
+    if (qp->irq_efd >= 0) {
+        struct nvm_ioctl_irq req = {};
+        req.vector = qp->irq_vec;
+        req.eventfd = qp->irq_efd;
+        if (dev_fd >= 0)
+            ioctl(dev_fd, NVM_UNREGISTER_INTERRUPT, &req);
+        close(qp->irq_efd);
+        qp->irq_efd = -1;
+    }
     if (qp->prp_dma) nvm_dma_unmap(qp->prp_dma);
     free(qp->sq_buf);
     free(qp->cq_buf);
     free(qp->prp_buf);
 }
 
-static void cleanup_batch_qp(nvm_aq_ref aq_ref, IOQueuePairHuge* bqp) {
+static void cleanup_batch_qp(nvm_aq_ref aq_ref, IOQueuePairHuge* bqp, int dev_fd) {
     // Null out hugepage-backed bufs so cleanup_qp calls free(nullptr) for those
     if (bqp->sq_huge) bqp->qp.sq_buf = nullptr;
     if (bqp->cq_huge) bqp->qp.cq_buf = nullptr;
-    cleanup_qp(aq_ref, &bqp->qp);
+    cleanup_qp(aq_ref, &bqp->qp, dev_fd);
 
     if (bqp->sq_huge)
         hugepage_free(bqp->sq_huge, bqp->sq_huge_size);
@@ -127,6 +143,28 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     uint16_t sync_qps = total_qps - 1;
     hs->num_qps = sync_qps;
 
+    // Interrupt mode (opt-in via UGDS_INTERRUPT_MODE). Query how many MSI-X
+    // vectors the driver allocated; if none (or query fails), fall back to
+    // poll mode. Only sync QPs use interrupts; the batch QP stays polling.
+    uint16_t irq_vectors = 0;
+    {
+        const char* env = getenv("UGDS_INTERRUPT_MODE");
+        bool want = env != nullptr &&
+            (strcmp(env, "1") == 0 || strcmp(env, "on") == 0 ||
+             strcmp(env, "true") == 0 || strcmp(env, "yes") == 0);
+        if (want) {
+            uint32_t nv = 0;
+            if (ioctl(hs->fd, NVM_GET_NUM_VECTORS, &nv) == 0 && nv > 0) {
+                hs->interrupt_mode = true;
+                irq_vectors = std::min<uint16_t>(sync_qps,
+                                                 static_cast<uint16_t>(nv));
+            } else {
+                fprintf(stderr, "uGDS: interrupt mode requested but no MSI-X "
+                                "vectors available; using poll mode\n");
+            }
+        }
+    }
+
     // Create sync IO QPs (shallow depth, 4KB pages)
     for (uint16_t i = 0; i < sync_qps; ++i) {
         auto qp = std::make_unique<IOQueuePair>();
@@ -137,8 +175,29 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         std::memset(qp->cq_buf, 0, page_size);
         status = nvm_dma_map_host(&qp->cq_dma, hs->ctrl, qp->cq_buf, page_size);
         if (!nvm_ok(status)) goto fail;
+
+        // Interrupt mode: arm the MSI-X vector (eventfd + kernel registration)
+        // BEFORE Create-CQ so the vector exists when the controller uses IV.
+        // Vectors beyond irq_vectors (or on failure) fall back to poll.
+        // Result is stored on qp (irq_efd/irq_vec) so no goto-crossing locals.
+        if (hs->interrupt_mode && i < irq_vectors) {
+            int efd = eventfd(0, EFD_CLOEXEC);
+            if (efd >= 0) {
+                struct nvm_ioctl_irq req = {};
+                req.vector = i;
+                req.eventfd = efd;
+                if (ioctl(hs->fd, NVM_REGISTER_INTERRUPT, &req) == 0) {
+                    qp->irq_efd = efd;
+                    qp->irq_vec = i;
+                } else {
+                    close(efd);
+                }
+            }
+        }
+
         status = nvm_admin_cq_create(hs->aq_ref, &qp->cq, i + 1,
-                                     qp->cq_dma, 0, UGDS_DEFAULT_QUEUE_DEPTH);
+                                     qp->cq_dma, 0, UGDS_DEFAULT_QUEUE_DEPTH,
+                                     false, qp->irq_vec, qp->irq_efd >= 0);
         if (!nvm_ok(status)) {
             nvm_dma_unmap(qp->cq_dma);
             qp->cq_dma = nullptr;
@@ -168,9 +227,9 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         continue;
 
     fail:
-        cleanup_qp(hs->aq_ref, qp.get());
+        cleanup_qp(hs->aq_ref, qp.get(), hs->fd);
         for (auto& done : hs->qps)
-            cleanup_qp(hs->aq_ref, done.get());
+            cleanup_qp(hs->aq_ref, done.get(), hs->fd);
         hs->qps.clear();
         nvm_aq_destroy(hs->aq_ref);
         nvm_dma_unmap(hs->aq_dma);
@@ -269,9 +328,9 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         goto batch_done;
 
     batch_fail:
-        cleanup_batch_qp(hs->aq_ref, bqp.get());
+        cleanup_batch_qp(hs->aq_ref, bqp.get(), hs->fd);
         for (auto& done : hs->qps)
-            cleanup_qp(hs->aq_ref, done.get());
+            cleanup_qp(hs->aq_ref, done.get(), hs->fd);
         hs->qps.clear();
         nvm_aq_destroy(hs->aq_ref);
         nvm_dma_unmap(hs->aq_dma);
@@ -298,11 +357,11 @@ extern "C" void uGDSHandleDeregister(uGDSHandle_t fh)
     HandleState* hs = reinterpret_cast<HandleState*>(fh);
 
     if (hs->batch_qp)
-        cleanup_batch_qp(hs->aq_ref, hs->batch_qp.get());
+        cleanup_batch_qp(hs->aq_ref, hs->batch_qp.get(), hs->fd);
     hs->batch_qp.reset();
 
     for (auto it = hs->qps.rbegin(); it != hs->qps.rend(); ++it)
-        cleanup_qp(hs->aq_ref, it->get());
+        cleanup_qp(hs->aq_ref, it->get(), hs->fd);
     hs->qps.clear();
 
     {

@@ -30,6 +30,14 @@ struct nvm_ioctl_dmabuf
 };
 #endif
 
+/* Bind/unbind an eventfd to an MSI-X interrupt vector (interrupt mode).
+ * Must match struct nvm_ioctl_irq in drv/ioctl.h. */
+struct nvm_ioctl_irq
+{
+    __u32  vector;            /* MSI-X vector index (0 .. num_vectors-1) */
+    __s32  eventfd;           /* eventfd to signal on IRQ (register only) */
+};
+
 
 
 /* Supported operations */
@@ -41,6 +49,9 @@ enum nvm_ioctl_type
 #ifdef _HIP
     NVM_MAP_DMABUF_MEMORY       = _IOWR(NVM_IOCTL_TYPE, 4, struct nvm_ioctl_dmabuf),
 #endif
+    NVM_REGISTER_INTERRUPT      = _IOW(NVM_IOCTL_TYPE, 5, struct nvm_ioctl_irq),
+    NVM_UNREGISTER_INTERRUPT    = _IOW(NVM_IOCTL_TYPE, 6, struct nvm_ioctl_irq),
+    NVM_GET_NUM_VECTORS         = _IOR(NVM_IOCTL_TYPE, 7, __u32),
 };
 
 

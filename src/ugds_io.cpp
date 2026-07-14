@@ -4,6 +4,9 @@
 #include <cerrno>
 #include <atomic>
 #include <algorithm>
+#include <poll.h>
+#include <unistd.h>
+#include <time.h>
 
 /*
  * Wait for one completion on qp's CQ. Returns a pointer to the completion
@@ -11,19 +14,60 @@
  *
  * Poll mode (qp.irq_efd < 0): busy-poll the CQ with _mm_pause, avoiding
  * the 1ms sleep of nvm_cq_dequeue_block. This is the default and the
- * source of uGDS's low latency. The interrupt-mode branch (blocking on
- * the eventfd) is added in a later stage.
+ * source of uGDS's low latency.
+ *
+ * Interrupt mode (qp.irq_efd >= 0): block on the eventfd that the kernel
+ * MSI-X handler signals, trading a few us of latency for near-zero CPU at
+ * low queue depth. Three correctness points:
+ *   - Lost wakeup: poll the CQ BEFORE every ppoll, so a completion that
+ *     landed (and its IRQ fired) between submit and here is never missed.
+ *   - Coalescing: N completions may raise only one eventfd signal; because
+ *     each call re-polls the CQ first, the extra completions are found
+ *     without blocking. A single read() drains the counter so a stale
+ *     count cannot wedge the next wait.
+ *   - Timeout: ppoll deadline = ctrl->timeout (ms); on expiry do one final
+ *     CQ poll to close the exactly-at-timeout race, then return its result.
  */
 static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
 {
-    nvm_cpl_t* cpl = nullptr;
-    uint64_t spins = 0;
-    const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
-    while ((cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
-        if (++spins > max_spins) break;
-        __builtin_ia32_pause();
+    if (qp.irq_efd < 0) {
+        nvm_cpl_t* cpl = nullptr;
+        uint64_t spins = 0;
+        const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
+        while ((cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
+            if (++spins > max_spins) break;
+            __builtin_ia32_pause();
+        }
+        return cpl;
     }
-    return cpl;
+
+    // Interrupt mode
+    const long timeout_ms = (long)hs->ctrl->timeout;
+    for (;;) {
+        nvm_cpl_t* cpl = nvm_cq_dequeue(&qp.cq);   // (A) poll before block
+        if (cpl != nullptr) return cpl;
+
+        struct pollfd pfd;
+        pfd.fd = qp.irq_efd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        struct timespec ts;
+        ts.tv_sec = timeout_ms / 1000;
+        ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
+
+        int pr = ppoll(&pfd, 1, &ts, nullptr);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return nullptr;
+        }
+        if (pr == 0) {
+            return nvm_cq_dequeue(&qp.cq);          // timeout: final poll
+        }
+        uint64_t cnt;
+        ssize_t r = read(qp.irq_efd, &cnt, sizeof(cnt));  // (C) drain counter
+        (void)r;
+        // loop: re-poll CQ (handles coalescing)
+    }
 }
 
 ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,

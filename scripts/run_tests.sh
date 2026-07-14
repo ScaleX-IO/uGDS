@@ -163,6 +163,7 @@ run_functional() {
         test_async_errors
         test_async_multi_stream
         test_interrupt_ioctls
+        test_interrupt_mode
     )
 
     for t in "${tests[@]}"; do
