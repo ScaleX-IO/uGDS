@@ -5,6 +5,27 @@
 #include <atomic>
 #include <algorithm>
 
+/*
+ * Wait for one completion on qp's CQ. Returns a pointer to the completion
+ * entry, or nullptr on timeout (budget = ctrl->timeout ms).
+ *
+ * Poll mode (qp.irq_efd < 0): busy-poll the CQ with _mm_pause, avoiding
+ * the 1ms sleep of nvm_cq_dequeue_block. This is the default and the
+ * source of uGDS's low latency. The interrupt-mode branch (blocking on
+ * the eventfd) is added in a later stage.
+ */
+static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
+{
+    nvm_cpl_t* cpl = nullptr;
+    uint64_t spins = 0;
+    const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
+    while ((cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
+        if (++spins > max_spins) break;
+        __builtin_ia32_pause();
+    }
+    return cpl;
+}
+
 ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                        off_t file_offset, off_t bufPtr_offset, uint8_t opcode)
 {
@@ -109,16 +130,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 
             nvm_cmd_t* cmd = nullptr;
             while ((cmd = nvm_sq_enqueue(&qp.sq)) == nullptr) {
-                nvm_cpl_t* drain = ({  /* busy-poll CQ instead of sleeping 1ms per attempt */
-                    nvm_cpl_t* _cpl = nullptr;
-                    uint64_t _spins = 0;
-                    const uint64_t _max = (uint64_t)hs->ctrl->timeout * 1000000ULL;
-                    while ((_cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
-                        if (++_spins > _max) break;
-                        __builtin_ia32_pause();
-                    }
-                    _cpl;
-                });
+                nvm_cpl_t* drain = wait_for_completion(hs, qp);
                 if (drain == nullptr) {
                     result = -EIO;
                     goto out;
@@ -161,16 +173,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             nvm_sq_submit(&qp.sq);
             std::atomic_thread_fence(std::memory_order_seq_cst);
 
-            nvm_cpl_t* cpl = ({  /* busy-poll CQ instead of sleeping 1ms per attempt */
-                    nvm_cpl_t* _cpl = nullptr;
-                    uint64_t _spins = 0;
-                    const uint64_t _max = (uint64_t)hs->ctrl->timeout * 1000000ULL;
-                    while ((_cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
-                        if (++_spins > _max) break;
-                        __builtin_ia32_pause();
-                    }
-                    _cpl;
-                });
+            nvm_cpl_t* cpl = wait_for_completion(hs, qp);
             if (cpl == nullptr) {
                 result = -EIO;
                 goto out;

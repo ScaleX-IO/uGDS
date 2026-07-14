@@ -45,6 +45,8 @@ struct IOQueuePair {
     void*          sq_buf  = nullptr;
     void*          cq_buf  = nullptr;
     void*          prp_buf = nullptr;
+    int            irq_efd = -1;   /* eventfd for interrupt mode; -1 = poll */
+    uint16_t       irq_vec = 0;    /* MSI-X vector bound to this CQ */
     std::mutex     lock;
 };
 
@@ -74,6 +76,7 @@ struct HandleState {
     std::unique_ptr<IOQueuePairHuge> batch_qp;
     uint16_t                    batch_queue_depth;
     std::atomic<bool>           batch_active{false};
+    bool                        interrupt_mode = false;  /* UGDS_INTERRUPT_MODE */
 };
 
 struct DriverState {
