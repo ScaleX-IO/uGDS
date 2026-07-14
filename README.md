@@ -160,15 +160,17 @@ interrupt mode drops to under 1% for large transfers:
 
 Measured as CPU consumed per I/O (log scale), busy-poll's cost grows with the
 transfer time because it spins the whole way, while interrupt mode stays flat —
-just submit plus one wakeup — yielding up to a **127× CPU reduction at 4 MB**:
+just submit plus one wakeup — yielding up to a **131× CPU reduction at 4 MB**:
 
 ![Interrupt vs busy-poll: CPU cost per I/O](assets/ugds_interrupt_cpu_per_io.png)
 
 For large I/O or low-queue-depth / idle workloads, interrupt mode frees almost
-the entire core at a negligible latency cost (p50 within 2% at ≥256 KB). For
-tiny, latency-critical I/O, keep the default busy-poll — a completion often
-arrives before the thread would even block, so interrupt mode only adds `ppoll`
-overhead there (4 KB p50 5.1 → 17.5 µs).
+the entire core at a negligible latency cost (p50 within 3% at ≥256 KB). For
+tiny, latency-critical I/O, keep the default busy-poll: at 4 KB/QD1 each I/O
+completes in ~5 µs, so blocking in `ppoll` and taking a wakeup adds two
+syscalls whose fixed cost dominates — interrupt mode's per-I/O CPU (6.9 µs) and
+latency (5.1 → 17.5 µs p50) both go *up*. The break-even is around 16–64 KB;
+below it, busy-poll wins.
 
 ## API Coverage
 
