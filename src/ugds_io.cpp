@@ -41,23 +41,45 @@ static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
         return cpl;
     }
 
-    // Interrupt mode
+    // Interrupt mode. Use an absolute deadline so that a burst of signal
+    // interruptions (EINTR restarts ppoll) can never stretch the total
+    // wait past ctrl->timeout.
     const long timeout_ms = (long)hs->ctrl->timeout;
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
     for (;;) {
         nvm_cpl_t* cpl = nvm_cq_dequeue(&qp.cq);   // (A) poll before block
         if (cpl != nullptr) return cpl;
+
+        // Remaining time until the absolute deadline.
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        struct timespec ts;
+        ts.tv_sec = deadline.tv_sec - now.tv_sec;
+        ts.tv_nsec = deadline.tv_nsec - now.tv_nsec;
+        if (ts.tv_nsec < 0) {
+            ts.tv_sec -= 1;
+            ts.tv_nsec += 1000000000L;
+        }
+        if (ts.tv_sec < 0) {
+            return nvm_cq_dequeue(&qp.cq);          // deadline passed: final poll
+        }
 
         struct pollfd pfd;
         pfd.fd = qp.irq_efd;
         pfd.events = POLLIN;
         pfd.revents = 0;
-        struct timespec ts;
-        ts.tv_sec = timeout_ms / 1000;
-        ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
 
         int pr = ppoll(&pfd, 1, &ts, nullptr);
         if (pr < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue;           // remaining time is recomputed
             return nullptr;
         }
         if (pr == 0) {
