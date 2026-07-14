@@ -48,6 +48,10 @@ struct ctrl* ctrl_get(struct class* cls, struct pci_dev* pdev, int number)
     ctrl->cdev = NULL;
     ctrl->chrdev = NULL;
 
+    ctrl->num_vectors = 0;
+    ctrl->irqs = NULL;
+    mutex_init(&ctrl->irq_lock);
+
     snprintf(ctrl->name, sizeof(ctrl->name), "%s%d", KBUILD_MODNAME, ctrl->number);
     ctrl->name[sizeof(ctrl->name) - 1] = '\0';
 
