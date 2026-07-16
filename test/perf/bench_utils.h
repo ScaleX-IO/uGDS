@@ -63,7 +63,8 @@ static inline void get_percentile(std::vector<uint64_t>& vec, double p,
 
 static inline void report_results(const char* label, std::vector<ThreadData>& threads,
                                   size_t io_size, size_t actual_bytes,
-                                  uint64_t prog_time_ns, bool json) {
+                                  uint64_t prog_time_ns, bool json,
+                                  bool show_cpu = true) {
     uint64_t total_ops = 0;
     long long total_io_time = 0;
     uint64_t total_cpu_ns = 0;
@@ -97,8 +98,10 @@ static inline void report_results(const char* label, std::vector<ThreadData>& th
         printf("  \"total_ops\": %llu,\n", (unsigned long long)total_ops);
         printf("  \"bandwidth_mbps\": %.2f,\n", bw_mbps);
         printf("  \"avg_latency_us\": %.2f,\n", avg_lat_us);
-        printf("  \"cpu_util\": %.4f,\n", cpu_util);
-        printf("  \"cpu_us_per_io\": %.3f,\n", cpu_us_per_io);
+        if (show_cpu) {
+            printf("  \"cpu_util\": %.4f,\n", cpu_util);
+            printf("  \"cpu_us_per_io\": %.3f,\n", cpu_us_per_io);
+        }
         if (!all_lat.empty()) {
             size_t n = all_lat.size();
             printf("  \"p50_us\": %.2f,\n", all_lat[(size_t)((n - 1) * 0.5)] / 1000.0);
@@ -111,8 +114,9 @@ static inline void report_results(const char* label, std::vector<ThreadData>& th
         printf("[%s]\n", label);
         printf("  Total IO operations: %llu\n", (unsigned long long)total_ops);
         printf("  Bandwidth: %.2f MB/s\n", bw_mbps);
-        printf("  CPU util: %.1f%%  CPU/IO: %.2f us\n",
-               cpu_util * 100.0, cpu_us_per_io);
+        if (show_cpu)
+            printf("  CPU util: %.1f%%  CPU/IO: %.2f us\n",
+                   cpu_util * 100.0, cpu_us_per_io);
         if (is_batched) {
             printf("  Avg latency: %.2f us (amortized per-IO)\n", avg_lat_us);
             size_t n_batches = all_lat.size();

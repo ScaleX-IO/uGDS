@@ -344,6 +344,12 @@ static void run_ugds_bench(BenchOpts& opts) {
     printf("  Mode:       %s%s\n",
            opts.is_async ? "async-" : (opts.is_batch ? "batch-" : ""),
            opts.is_write ? "write" : "read");
+    {
+        const char* env = getenv("UGDS_INTERRUPT_MODE");
+        bool irq = env && (strcmp(env, "1") == 0 || strcmp(env, "on") == 0 ||
+                           strcmp(env, "true") == 0 || strcmp(env, "yes") == 0);
+        printf("  Completion: %s\n", irq ? "interrupt (MSI-X)" : "busy-poll");
+    }
     printf("\n");
 
     CHECK_CUDA(cudaSetDevice(opts.gpu_id));
@@ -428,7 +434,8 @@ static void run_ugds_bench(BenchOpts& opts) {
     for (auto& t : threads)
         actual_bytes += t.total_bytes;
 
-    report_results(label, threads, opts.io_size, actual_bytes, prog_time_ns, opts.json);
+    bool show_cpu = !opts.is_batch && !opts.is_async;
+    report_results(label, threads, opts.io_size, actual_bytes, prog_time_ns, opts.json, show_cpu);
 
     for (int i = 0; i < num_threads; i++) {
         uGDSBufDeregister(threads[i].gpu_buffer);
