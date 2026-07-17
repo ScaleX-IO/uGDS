@@ -22,9 +22,7 @@
 #include <linux/device.h>
 #include <linux/version.h>
 #include <linux/uaccess.h>
-#include <linux/interrupt.h>
-#include <linux/eventfd.h>
-#include <linux/bitmap.h>
+#include "irq.h"
 #include <asm/io.h>
 #include <asm/errno.h>
 #include <asm/page.h>
@@ -97,8 +95,6 @@ enum handle_type
  * (dup()/fork/fd-passing share the struct file and thus the ledger;
  * .release fires exactly once when the last reference closes).
  */
-#define UGDS_MAX_IRQ_VECTORS 64
-
 struct ugds_file_ctx
 {
     struct list_head    global_node;    /* ctx_list membership */
@@ -106,7 +102,7 @@ struct ugds_file_ctx
     struct list_head    handles;        /* map_handle ledger */
     struct mutex        lock;           /* Protects handles and dead */
     bool                dead;           /* Controller removed */
-    DECLARE_BITMAP(irq_owned, UGDS_MAX_IRQ_VECTORS);  /* vectors armed by this file */
+    struct ugds_irq_owner irq_owner;
 };
 
 
@@ -127,9 +123,6 @@ struct map_handle
     u64                 dmabuf_offset;
     unsigned int        count;          /* Registrations from this file */
 };
-
-
-static long do_unregister_irq(struct ugds_file_ctx* ctx, u32 vector);
 
 
 static struct map_handle* handle_find(struct ugds_file_ctx* ctx, u64 vaddr)
@@ -188,7 +181,7 @@ static int dev_open(struct inode* inode, struct file* file)
     INIT_LIST_HEAD(&ctx->handles);
     mutex_init(&ctx->lock);
     ctx->dead = false;
-    bitmap_zero(ctx->irq_owned, UGDS_MAX_IRQ_VECTORS);
+    ugds_irq_owner_init(&ctx->irq_owner);
     file->private_data = ctx;
 
     mutex_lock(&ctx_list_mutex);
@@ -209,11 +202,7 @@ static int dev_release(struct inode* inode, struct file* file)
     list_del(&ctx->global_node);
     mutex_unlock(&ctx_list_mutex);
 
-    {
-        unsigned long vec;
-        for_each_set_bit(vec, ctx->irq_owned, UGDS_MAX_IRQ_VECTORS)
-            do_unregister_irq(ctx, (u32) vec);
-    }
+    ugds_irq_owner_cleanup(ctx->ctrl, &ctx->irq_owner);
 
     /* Each handle owns exactly one map regardless of count (count is
      * the number of registrations, not the number of maps). If the
@@ -463,138 +452,6 @@ out:
 }
 
 
-static irqreturn_t ugds_irq_handler(int irq, void* dev_id)
-{
-    struct ugds_irq* v = dev_id;
-    struct eventfd_ctx* efd = READ_ONCE(v->efd);
-
-    if (efd != NULL)
-    {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
-        eventfd_signal(efd);
-#else
-        eventfd_signal(efd, 1);
-#endif
-    }
-
-    return IRQ_HANDLED;
-}
-
-
-static long do_register_irq(struct ugds_file_ctx* ctx, u32 vector, int eventfd)
-{
-    struct ctrl* ctrl = ctx->ctrl;
-    struct eventfd_ctx* efd;
-    struct ugds_irq* v;
-    long retval = 0;
-
-    if (vector >= UGDS_MAX_IRQ_VECTORS)
-    {
-        return -EINVAL;
-    }
-
-    efd = eventfd_ctx_fdget(eventfd);
-    if (IS_ERR(efd))
-    {
-        return -EBADF;
-    }
-
-    mutex_lock(&ctrl->irq_lock);
-
-    if (ctrl->irqs == NULL || ctrl->num_vectors == 0)
-    {
-        retval = -ENODEV;
-        goto out;
-    }
-    if (vector >= (u32) ctrl->num_vectors)
-    {
-        retval = -EINVAL;
-        goto out;
-    }
-
-    v = &ctrl->irqs[vector];
-    if (v->efd != NULL)
-    {
-        retval = -EBUSY;
-        goto out;
-    }
-
-    if (!v->requested)
-    {
-        retval = request_irq(v->irq, ugds_irq_handler, 0,
-                             DRIVER_NAME, v);
-        if (retval != 0)
-        {
-            goto out;
-        }
-        v->requested = true;
-    }
-
-    WRITE_ONCE(v->efd, efd);
-    set_bit(vector, ctx->irq_owned);
-    mutex_unlock(&ctrl->irq_lock);
-    return 0;
-
-out:
-    mutex_unlock(&ctrl->irq_lock);
-    eventfd_ctx_put(efd);
-    return retval;
-}
-
-
-static long do_unregister_irq(struct ugds_file_ctx* ctx, u32 vector)
-{
-    struct ctrl* ctrl = ctx->ctrl;
-    struct ugds_irq* v;
-    struct eventfd_ctx* efd;
-
-    if (vector >= UGDS_MAX_IRQ_VECTORS)
-    {
-        return -EINVAL;
-    }
-
-    mutex_lock(&ctrl->irq_lock);
-
-    if (ctrl->irqs == NULL || ctrl->num_vectors == 0)
-    {
-        clear_bit(vector, ctx->irq_owned);
-        mutex_unlock(&ctrl->irq_lock);
-        return -ENODEV;
-    }
-    if (vector >= (u32) ctrl->num_vectors)
-    {
-        mutex_unlock(&ctrl->irq_lock);
-        return -EINVAL;
-    }
-
-    if (!test_bit(vector, ctx->irq_owned))
-    {
-        mutex_unlock(&ctrl->irq_lock);
-        return -EINVAL;
-    }
-
-    v = &ctrl->irqs[vector];
-    efd = v->efd;
-
-    WRITE_ONCE(v->efd, NULL);
-    if (v->requested)
-    {
-        free_irq(v->irq, v);
-        v->requested = false;
-    }
-    clear_bit(vector, ctx->irq_owned);
-
-    mutex_unlock(&ctrl->irq_lock);
-
-    if (efd != NULL)
-    {
-        eventfd_ctx_put(efd);
-    }
-
-    return 0;
-}
-
-
 static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
 {
     struct ugds_file_ctx* ctx = file->private_data;
@@ -693,7 +550,8 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             {
                 return -EFAULT;
             }
-            return do_register_irq(ctx, req.vector, req.eventfd);
+            return ugds_irq_register(ctx->ctrl, &ctx->irq_owner,
+                                     req.vector, req.eventfd);
         }
 
         case NVM_UNREGISTER_INTERRUPT:
@@ -703,12 +561,13 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             {
                 return -EFAULT;
             }
-            return do_unregister_irq(ctx, req.vector);
+            return ugds_irq_unregister(ctx->ctrl, &ctx->irq_owner,
+                                       req.vector);
         }
 
         case NVM_GET_NUM_VECTORS:
         {
-            u32 n = (u32) ctx->ctrl->num_vectors;
+            u32 n = ugds_irq_num_vectors(ctx->ctrl);
             if (put_user(n, (u32 __user*) arg))
             {
                 return -EFAULT;
@@ -733,90 +592,6 @@ static const struct file_operations dev_fops =
     .unlocked_ioctl = map_ioctl,
     .mmap = mmap_registers,
 };
-
-
-static void ctrl_alloc_irqs(struct ctrl* ctrl, struct pci_dev* dev)
-{
-    int want, nv, i;
-
-    want = pci_msix_vec_count(dev);
-    if (want <= 0)
-    {
-        printk(KERN_INFO DRIVER_NAME " no MSI-X support; poll mode only\n");
-        return;
-    }
-    if (want > UGDS_MAX_IRQ_VECTORS)
-    {
-        want = UGDS_MAX_IRQ_VECTORS;
-    }
-
-    ctrl->irqs = kcalloc(want, sizeof(struct ugds_irq), GFP_KERNEL);
-    if (ctrl->irqs == NULL)
-    {
-        return;
-    }
-
-    nv = pci_alloc_irq_vectors(dev, 1, want, PCI_IRQ_MSIX);
-    if (nv <= 0)
-    {
-        printk(KERN_WARNING DRIVER_NAME
-               " pci_alloc_irq_vectors failed (%d); poll mode only\n", nv);
-        kfree(ctrl->irqs);
-        ctrl->irqs = NULL;
-        return;
-    }
-
-    for (i = 0; i < nv; ++i)
-    {
-        ctrl->irqs[i].irq = pci_irq_vector(dev, i);
-        ctrl->irqs[i].efd = NULL;
-        ctrl->irqs[i].ctrl = ctrl;
-        ctrl->irqs[i].requested = false;
-    }
-    ctrl->num_vectors = nv;
-
-    printk(KERN_INFO DRIVER_NAME " allocated %d MSI-X vectors\n", nv);
-}
-
-
-static void ctrl_free_irqs(struct ctrl* ctrl, struct pci_dev* dev)
-{
-    struct eventfd_ctx* pending[UGDS_MAX_IRQ_VECTORS];
-    struct ugds_irq* irqs;
-    int i, n, pending_count = 0;
-
-    if (ctrl->irqs == NULL)
-    {
-        return;
-    }
-
-    mutex_lock(&ctrl->irq_lock);
-    n = ctrl->num_vectors;
-    irqs = ctrl->irqs;
-    for (i = 0; i < n; ++i)
-    {
-        struct ugds_irq* v = &irqs[i];
-        struct eventfd_ctx* efd = v->efd;
-
-        WRITE_ONCE(v->efd, NULL);
-        if (v->requested)
-        {
-            free_irq(v->irq, v);
-            v->requested = false;
-        }
-        if (efd != NULL)
-            pending[pending_count++] = efd;
-    }
-    ctrl->irqs = NULL;
-    ctrl->num_vectors = 0;
-    mutex_unlock(&ctrl->irq_lock);
-
-    for (i = 0; i < pending_count; ++i)
-        eventfd_ctx_put(pending[i]);
-
-    pci_free_irq_vectors(dev);
-    kfree(irqs);
-}
 
 
 static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
@@ -904,7 +679,7 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
     }
 #endif
 
-    ctrl_alloc_irqs(ctrl, dev);
+    ugds_irq_ctrl_init(ctrl, dev);
 
     /* Publish controller to the list only after probe is fully
      * complete. This prevents opens from seeing a partially
@@ -971,7 +746,7 @@ static void remove_pci_dev(struct pci_dev* dev)
     }
     mutex_unlock(&ctx_list_mutex);
 
-    ctrl_free_irqs(ctrl, dev);
+    ugds_irq_ctrl_cleanup(ctrl, dev);
 
     /* 5. All DMA on this controller is now unmapped, satisfying the
      *    DMA API contract before the device goes away. */

@@ -14,19 +14,8 @@
 #include <linux/fs.h>
 #include <linux/device.h>
 #include <linux/kref.h>
-#include <linux/mutex.h>
 
-struct eventfd_ctx;
-
-
-struct ugds_irq
-{
-    int                 irq;        /* Linux IRQ number (pci_irq_vector) */
-    struct eventfd_ctx* efd;        /* eventfd to signal; NULL if unarmed */
-    struct ctrl*        ctrl;
-    bool                requested;  /* request_irq installed */
-};
-
+struct ugds_irq_state;
 
 /*
  * Represents an NVM controller.
@@ -53,9 +42,7 @@ struct ctrl
     struct cdev*        cdev;       /* Character device (cdev_alloc'd) */
     struct device*      chrdev;     /* Character device handle */
 
-    int                 num_vectors;/* MSI-X vectors; 0 = poll-only */
-    struct ugds_irq*    irqs;       /* array[num_vectors] */
-    struct mutex        irq_lock;   /* Serialises arm/disarm vs teardown */
+    struct ugds_irq_state* irq;     /* Opaque; managed by irq.c */
 };
 
 

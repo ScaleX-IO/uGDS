@@ -14,7 +14,7 @@ endif
 
 ifneq ($(KERNELRELEASE),)
 	obj-m := ugds_drv.o
-	ugds_drv-objs := pci.o list.o ctrl.o map.o
+	ugds_drv-objs := pci.o list.o ctrl.o map.o irq.o
 
 	# KUnit self-test module (opt-in, HIP-only)
  ifeq ($(BUILD_KUNIT),1)
