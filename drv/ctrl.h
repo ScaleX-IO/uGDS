@@ -41,6 +41,7 @@ struct ctrl
     struct class*       cls;        /* Character device class */
     struct cdev*        cdev;       /* Character device (cdev_alloc'd) */
     struct device*      chrdev;     /* Character device handle */
+    bool                dying;      /* Set in remove_pci_dev, checked in dev_open */
 
     struct ugds_irq_state* irq;     /* Opaque; managed by irq.c */
 };
