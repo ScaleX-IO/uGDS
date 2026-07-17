@@ -82,6 +82,17 @@ void nvm_cmd_rw_blks(nvm_cmd_t* cmd, uint64_t start_lba, uint16_t n_blks)
 
 
 
+// Create CQ DWORD11: IV[31:16] | IEN[1] | PC[0]
+static inline
+uint32_t nvm_cq_dw11(uint16_t iv, bool ien, bool prp_contiguous)
+{
+    return (((uint32_t) iv) << 16)
+         | ((ien ? 1u : 0u) << 1)
+         | (prp_contiguous ? 1u : 0u);
+}
+
+
+
 /*
  * Set command's dataset management (DSM) field (DWORD13)
  */

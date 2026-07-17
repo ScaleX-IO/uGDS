@@ -25,6 +25,7 @@
 - **Multi-vendor GPU support** — NVIDIA CUDA and AMD Infinity Storage (HIP/ROCm) backends; both can be enabled simultaneously for mixed-GPU systems
 - **Fully open-source** — BSD 3-Clause licensed; no proprietary runtime dependencies beyond the GPU driver (NVIDIA driver or AMD ROCm runtime)
 - **High performance** — busy-poll CQ completion with `_mm_pause()`, multi-queue round-robin IO, achieving up to 2.7x read and 28x write bandwidth over NVIDIA GDS
+- **Interrupt mode (opt-in)** — MSI-X + eventfd completion for near-zero CPU utilization at large IO sizes; disabled by default (`UGDS_INTERRUPT_MODE=1` to enable)
 
 ## Architecture
 
@@ -146,7 +147,7 @@ scripts/run_tests.sh all
 | 3 | Async Stream API (CUDA stream integration) | ✅ |
 | 4 | Hugepage support (larger QP depth) | ✅ |
 | 5 | SGL support (scatter-gather lists) | 🔜 |
-| 6 | Interrupt mode (MSI-X + eventfd) | 🔜 |
+| 6 | Interrupt mode (MSI-X + eventfd) | ✅ |
 | 7 | Multi-SSD support (multi-handle aggregation) | 🔜 |
 | 8 | Striping (automatic IO distribution across SSDs) | 🔜 |
 | 9 | Filesystem compatibility (POSIX file path support) | 🔜 |

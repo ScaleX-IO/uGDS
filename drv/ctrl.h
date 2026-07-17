@@ -15,6 +15,7 @@
 #include <linux/device.h>
 #include <linux/kref.h>
 
+struct ugds_irq_state;
 
 /*
  * Represents an NVM controller.
@@ -40,6 +41,8 @@ struct ctrl
     struct class*       cls;        /* Character device class */
     struct cdev*        cdev;       /* Character device (cdev_alloc'd) */
     struct device*      chrdev;     /* Character device handle */
+
+    struct ugds_irq_state* irq;     /* Opaque; managed by irq.c */
 };
 
 

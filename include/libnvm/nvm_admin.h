@@ -61,7 +61,9 @@ int nvm_admin_cq_create(nvm_aq_ref ref,                 // AQ pair reference
                         const nvm_dma_t* dma,           // Queue memory handle
                         size_t page_offset,             // Number of pages to offset into the handle
                         size_t qs,                      // Queue size/depth
-                        bool need_prp = false);                 // non-contiguous queue
+                        bool need_prp = false,          // non-contiguous queue
+                        uint16_t iv = 0,                // MSI-X interrupt vector (if ien)
+                        bool ien = false);              // enable interrupts for this CQ
 
 /*
  * Delete IO completion queue (CQ)

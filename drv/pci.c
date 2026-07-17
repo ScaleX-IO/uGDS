@@ -22,6 +22,7 @@
 #include <linux/device.h>
 #include <linux/version.h>
 #include <linux/uaccess.h>
+#include "irq.h"
 #include <asm/io.h>
 #include <asm/errno.h>
 #include <asm/page.h>
@@ -101,6 +102,7 @@ struct ugds_file_ctx
     struct list_head    handles;        /* map_handle ledger */
     struct mutex        lock;           /* Protects handles and dead */
     bool                dead;           /* Controller removed */
+    struct ugds_irq_owner irq_owner;
 };
 
 
@@ -179,6 +181,7 @@ static int dev_open(struct inode* inode, struct file* file)
     INIT_LIST_HEAD(&ctx->handles);
     mutex_init(&ctx->lock);
     ctx->dead = false;
+    ugds_irq_owner_init(&ctx->irq_owner);
     file->private_data = ctx;
 
     mutex_lock(&ctx_list_mutex);
@@ -198,6 +201,8 @@ static int dev_release(struct inode* inode, struct file* file)
     mutex_lock(&ctx_list_mutex);
     list_del(&ctx->global_node);
     mutex_unlock(&ctx_list_mutex);
+
+    ugds_irq_owner_cleanup(ctx->ctrl, &ctx->irq_owner);
 
     /* Each handle owns exactly one map regardless of count (count is
      * the number of registrations, not the number of maps). If the
@@ -538,6 +543,38 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             }
             return do_unmap(ctx, addr);
 
+        case NVM_REGISTER_INTERRUPT:
+        {
+            struct nvm_ioctl_irq req;
+            if (copy_from_user(&req, (void __user*) arg, sizeof(req)))
+            {
+                return -EFAULT;
+            }
+            return ugds_irq_register(ctx->ctrl, &ctx->irq_owner,
+                                     req.vector, req.eventfd);
+        }
+
+        case NVM_UNREGISTER_INTERRUPT:
+        {
+            struct nvm_ioctl_irq req;
+            if (copy_from_user(&req, (void __user*) arg, sizeof(req)))
+            {
+                return -EFAULT;
+            }
+            return ugds_irq_unregister(ctx->ctrl, &ctx->irq_owner,
+                                       req.vector);
+        }
+
+        case NVM_GET_NUM_VECTORS:
+        {
+            u32 n = ugds_irq_num_vectors(ctx->ctrl);
+            if (put_user(n, (u32 __user*) arg))
+            {
+                return -EFAULT;
+            }
+            return 0;
+        }
+
         default:
             printk(KERN_NOTICE "Unknown ioctl command from process %d: %u\n",
                     current->pid, cmd);
@@ -642,6 +679,8 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
     }
 #endif
 
+    ugds_irq_ctrl_init(ctrl, dev);
+
     /* Publish controller to the list only after probe is fully
      * complete. This prevents opens from seeing a partially
      * initialized controller. */
@@ -707,7 +746,9 @@ static void remove_pci_dev(struct pci_dev* dev)
     }
     mutex_unlock(&ctx_list_mutex);
 
-    /* 4. All DMA on this controller is now unmapped, satisfying the
+    ugds_irq_ctrl_cleanup(ctrl, dev);
+
+    /* 5. All DMA on this controller is now unmapped, satisfying the
      *    DMA API contract before the device goes away. */
     --curr_ctrls;
     pci_release_region(dev, 0);

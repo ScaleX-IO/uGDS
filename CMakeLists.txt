@@ -155,6 +155,9 @@ set(FUNCTIONAL_TESTS
     test_async_late_binding
     test_async_errors
     test_async_multi_stream
+    test_interrupt_ioctls
+    test_cq_dw11
+    test_interrupt_mode
 )
 
 # CUDA tests (compiled with nvcc)

@@ -4,6 +4,81 @@
 #include <cerrno>
 #include <atomic>
 #include <algorithm>
+#include <poll.h>
+#include <unistd.h>
+#include <time.h>
+
+static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
+{
+    if (qp.irq_efd < 0) {
+        nvm_cpl_t* cpl = nullptr;
+        uint64_t spins = 0;
+        const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
+        while ((cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
+            if (++spins > max_spins) break;
+            __builtin_ia32_pause();
+        }
+        return cpl;
+    }
+
+    // Absolute deadline prevents EINTR restarts from stretching total wait.
+    const long timeout_ms = (long)hs->ctrl->timeout;
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    for (;;) {
+        // Poll CQ before blocking to prevent lost wakeups.
+        nvm_cpl_t* cpl = nvm_cq_dequeue(&qp.cq);
+        if (cpl != nullptr) return cpl;
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        struct timespec ts;
+        ts.tv_sec = deadline.tv_sec - now.tv_sec;
+        ts.tv_nsec = deadline.tv_nsec - now.tv_nsec;
+        if (ts.tv_nsec < 0) {
+            ts.tv_sec -= 1;
+            ts.tv_nsec += 1000000000L;
+        }
+        if (ts.tv_sec < 0)
+            return nvm_cq_dequeue(&qp.cq);
+
+        struct pollfd pfd = {qp.irq_efd, POLLIN, 0};
+        int pr = ppoll(&pfd, 1, &ts, nullptr);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "uGDS: ppoll(eventfd=%d) failed: %s\n",
+                    qp.irq_efd, strerror(errno));
+            return nullptr;
+        }
+        if (pr == 0)
+            return nvm_cq_dequeue(&qp.cq);
+
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "uGDS: eventfd=%d invalid, revents=0x%x\n",
+                    qp.irq_efd, pfd.revents);
+            return nullptr;
+        }
+        if (!(pfd.revents & POLLIN))
+            continue;
+
+        uint64_t cnt;
+        ssize_t r = read(qp.irq_efd, &cnt, sizeof(cnt));
+        if (r == (ssize_t)sizeof(cnt))
+            continue;
+        if (r < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        fprintf(stderr, "uGDS: read(eventfd=%d) failed: %s\n",
+                qp.irq_efd, r < 0 ? strerror(errno) : "short read");
+        return nullptr;
+    }
+}
 
 ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                        off_t file_offset, off_t bufPtr_offset, uint8_t opcode)
@@ -109,16 +184,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 
             nvm_cmd_t* cmd = nullptr;
             while ((cmd = nvm_sq_enqueue(&qp.sq)) == nullptr) {
-                nvm_cpl_t* drain = ({  /* busy-poll CQ instead of sleeping 1ms per attempt */
-                    nvm_cpl_t* _cpl = nullptr;
-                    uint64_t _spins = 0;
-                    const uint64_t _max = (uint64_t)hs->ctrl->timeout * 1000000ULL;
-                    while ((_cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
-                        if (++_spins > _max) break;
-                        __builtin_ia32_pause();
-                    }
-                    _cpl;
-                });
+                nvm_cpl_t* drain = wait_for_completion(hs, qp);
                 if (drain == nullptr) {
                     result = -EIO;
                     goto out;
@@ -161,16 +227,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             nvm_sq_submit(&qp.sq);
             std::atomic_thread_fence(std::memory_order_seq_cst);
 
-            nvm_cpl_t* cpl = ({  /* busy-poll CQ instead of sleeping 1ms per attempt */
-                    nvm_cpl_t* _cpl = nullptr;
-                    uint64_t _spins = 0;
-                    const uint64_t _max = (uint64_t)hs->ctrl->timeout * 1000000ULL;
-                    while ((_cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
-                        if (++_spins > _max) break;
-                        __builtin_ia32_pause();
-                    }
-                    _cpl;
-                });
+            nvm_cpl_t* cpl = wait_for_completion(hs, qp);
             if (cpl == nullptr) {
                 result = -EIO;
                 goto out;

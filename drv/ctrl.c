@@ -6,6 +6,7 @@
  * Originally derived from ssd-gpu-dma and BaM.
  */
 #include "ctrl.h"
+#include "irq.h"
 #include "list.h"
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -21,6 +22,7 @@ static void ctrl_release(struct kref* ref)
 {
     struct ctrl* ctrl = container_of(ref, struct ctrl, ref);
 
+    ugds_irq_ctrl_destroy(ctrl);
     pci_dev_put(ctrl->pdev);
     kfree(ctrl);
 }
@@ -47,6 +49,8 @@ struct ctrl* ctrl_get(struct class* cls, struct pci_dev* pdev, int number)
     ctrl->cls = cls;
     ctrl->cdev = NULL;
     ctrl->chrdev = NULL;
+
+    ctrl->irq = NULL;
 
     snprintf(ctrl->name, sizeof(ctrl->name), "%s%d", KBUILD_MODNAME, ctrl->number);
     ctrl->name[sizeof(ctrl->name) - 1] = '\0';

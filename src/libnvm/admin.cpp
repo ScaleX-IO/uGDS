@@ -17,13 +17,13 @@
 
 
 
-static void admin_cq_create(nvm_cmd_t* cmd, const nvm_queue_t* cq, uint64_t ioaddr, bool need_prp = false)
+static void admin_cq_create(nvm_cmd_t* cmd, const nvm_queue_t* cq, uint64_t ioaddr, bool need_prp = false, uint16_t iv = 0, bool ien = false)
 {
     nvm_cmd_header(cmd, 0, NVM_ADMIN_CREATE_CQ, 0);
     nvm_cmd_data_ptr(cmd, ioaddr, 0);
 
     cmd->dword[10] = (((uint32_t) cq->qs - 1) << 16) | cq->no;
-    cmd->dword[11] = (0x0000 << 16) | (0x00 << 1) | (!need_prp);
+    cmd->dword[11] = nvm_cq_dw11(iv, ien, /*prp_contiguous=*/!need_prp);
 }
 
 
@@ -228,7 +228,7 @@ int nvm_admin_get_log_page(nvm_aq_ref ref, uint32_t ns_id, void* ptr, uint64_t i
 
 
 
-int nvm_admin_cq_create(nvm_aq_ref ref, nvm_queue_t* cq, uint16_t id, const nvm_dma_t* dma, size_t offset, size_t qs, bool need_prp)
+int nvm_admin_cq_create(nvm_aq_ref ref, nvm_queue_t* cq, uint16_t id, const nvm_dma_t* dma, size_t offset, size_t qs, bool need_prp, uint16_t iv, bool ien)
 {
     int err;
     nvm_cmd_t command;
@@ -291,7 +291,7 @@ int nvm_admin_cq_create(nvm_aq_ref ref, nvm_queue_t* cq, uint16_t id, const nvm_
     memset(&command, 0, sizeof(command));
     memset(&completion, 0, sizeof(completion));
 
-    admin_cq_create(&command, &queue, dma->ioaddrs[offset], need_prp);
+    admin_cq_create(&command, &queue, dma->ioaddrs[offset], need_prp, iv, ien);
 
     err = nvm_raw_rpc(ref, &command, &completion);
     if (!nvm_ok(err))
