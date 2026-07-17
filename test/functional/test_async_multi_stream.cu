@@ -17,7 +17,7 @@ int main(int argc, char** argv)
     void* d_buf;
     cudaMalloc(&d_buf, alloc_size);
     if (!d_buf) TEST_FAIL("cudaMalloc failed");
-    ASSERT_OK(uGDSBufRegister(d_buf, alloc_size, 0), "BufRegister");
+    ASSERT_OK(uGDSBufRegister(d_buf, alloc_size, TEST_BUF_FLAGS), "BufRegister");
 
     cudaStream_t streams[N_STREAMS];
     for (int i = 0; i < N_STREAMS; i++)
