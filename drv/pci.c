@@ -106,10 +106,7 @@ struct ugds_file_ctx
     struct list_head    handles;        /* map_handle ledger */
     struct mutex        lock;           /* Protects handles and dead */
     bool                dead;           /* Controller removed */
-    /* MSI-X vectors this file armed; cleaned up in dev_release so a
-     * crashing process can't leak IRQ registrations. Guarded by
-     * ctrl->irq_lock (same lock that protects ctrl->irqs[].efd). */
-    DECLARE_BITMAP(irq_owned, UGDS_MAX_IRQ_VECTORS);
+    DECLARE_BITMAP(irq_owned, UGDS_MAX_IRQ_VECTORS);  /* vectors armed by this file */
 };
 
 
@@ -212,15 +209,10 @@ static int dev_release(struct inode* inode, struct file* file)
     list_del(&ctx->global_node);
     mutex_unlock(&ctx_list_mutex);
 
-    /* Unregister any MSI-X vectors this file still holds (crash-safe
-     * cleanup). If the controller was removed, ctrl_free_irqs already
-     * ran and num_vectors is 0, so do_unregister_irq is a no-op. */
     {
         unsigned long vec;
         for_each_set_bit(vec, ctx->irq_owned, UGDS_MAX_IRQ_VECTORS)
-        {
             do_unregister_irq(ctx, (u32) vec);
-        }
     }
 
     /* Each handle owns exactly one map regardless of count (count is
@@ -471,14 +463,6 @@ out:
 }
 
 
-/*
- * MSI-X interrupt handler. dev_id is &ctrl->irqs[vector]. Signals the
- * armed eventfd, if any. Reads efd with READ_ONCE so a concurrent
- * disarm (efd set to NULL under irq_lock, then free_irq) is safe: we
- * either see the old eventfd (still valid until free_irq returns) or
- * NULL (drop the signal). Each vector is dedicated (not IRQF_SHARED),
- * so a spurious call with efd == NULL is harmless.
- */
 static irqreturn_t ugds_irq_handler(int irq, void* dev_id)
 {
     struct ugds_irq* v = dev_id;
@@ -517,9 +501,6 @@ static long do_register_irq(struct ugds_file_ctx* ctx, u32 vector, int eventfd)
 
     mutex_lock(&ctrl->irq_lock);
 
-    /* Re-validate under irq_lock: ctrl_free_irqs() (hot-remove teardown)
-     * clears irqs/num_vectors while holding this lock, so checking here
-     * closes the TOCTOU window that a lock-free guard would leave open. */
     if (ctrl->irqs == NULL || ctrl->num_vectors == 0)
     {
         retval = -ENODEV;
@@ -534,7 +515,6 @@ static long do_register_irq(struct ugds_file_ctx* ctx, u32 vector, int eventfd)
     v = &ctrl->irqs[vector];
     if (v->efd != NULL)
     {
-        /* Already armed (by this or another file). */
         retval = -EBUSY;
         goto out;
     }
@@ -550,8 +530,6 @@ static long do_register_irq(struct ugds_file_ctx* ctx, u32 vector, int eventfd)
         v->requested = true;
     }
 
-    /* Publish efd before recording ownership so the handler sees a
-     * valid eventfd as soon as IRQs can fire. */
     WRITE_ONCE(v->efd, efd);
     set_bit(vector, ctx->irq_owned);
     mutex_unlock(&ctrl->irq_lock);
@@ -577,9 +555,6 @@ static long do_unregister_irq(struct ugds_file_ctx* ctx, u32 vector)
 
     mutex_lock(&ctrl->irq_lock);
 
-    /* Re-validate under irq_lock. If ctrl_free_irqs() already tore down
-     * (hot-remove), irqs is NULL; the vector is already freed, so this
-     * file's ownership bit is stale -- just clear it and return. */
     if (ctrl->irqs == NULL || ctrl->num_vectors == 0)
     {
         clear_bit(vector, ctx->irq_owned);
@@ -594,7 +569,6 @@ static long do_unregister_irq(struct ugds_file_ctx* ctx, u32 vector)
 
     if (!test_bit(vector, ctx->irq_owned))
     {
-        /* This file did not arm this vector. */
         mutex_unlock(&ctrl->irq_lock);
         return -EINVAL;
     }
@@ -602,9 +576,6 @@ static long do_unregister_irq(struct ugds_file_ctx* ctx, u32 vector)
     v = &ctrl->irqs[vector];
     efd = v->efd;
 
-    /* Stop the handler from seeing the eventfd, then free_irq (which
-     * synchronously drains any in-flight handler) before dropping the
-     * eventfd reference. */
     WRITE_ONCE(v->efd, NULL);
     if (v->requested)
     {
@@ -764,11 +735,6 @@ static const struct file_operations dev_fops =
 };
 
 
-/*
- * Allocate MSI-X vectors for interrupt mode. Best-effort: on any
- * failure, num_vectors stays 0 and the device operates in poll mode
- * (register ioctls then return -ENODEV). Must run after pci_set_master.
- */
 static void ctrl_alloc_irqs(struct ctrl* ctrl, struct pci_dev* dev)
 {
     int want, nv, i;
@@ -813,15 +779,11 @@ static void ctrl_alloc_irqs(struct ctrl* ctrl, struct pci_dev* dev)
 }
 
 
-/*
- * Free MSI-X vectors and any still-armed IRQ registrations. Must run
- * before pci_disable_device. Callers hold no locks; by this point the
- * controller is unpublished and all files are marked dead.
- */
 static void ctrl_free_irqs(struct ctrl* ctrl, struct pci_dev* dev)
 {
+    struct eventfd_ctx* pending[UGDS_MAX_IRQ_VECTORS];
     struct ugds_irq* irqs;
-    int i, n;
+    int i, n, pending_count = 0;
 
     if (ctrl->irqs == NULL)
     {
@@ -843,17 +805,14 @@ static void ctrl_free_irqs(struct ctrl* ctrl, struct pci_dev* dev)
             v->requested = false;
         }
         if (efd != NULL)
-        {
-            eventfd_ctx_put(efd);
-        }
+            pending[pending_count++] = efd;
     }
-    /* Clear the published state INSIDE the lock so a concurrent
-     * register/unregister ioctl (which re-checks irqs/num_vectors under
-     * the same lock) can never observe a vector that is about to be
-     * freed. The actual free happens after unlocking. */
     ctrl->irqs = NULL;
     ctrl->num_vectors = 0;
     mutex_unlock(&ctrl->irq_lock);
+
+    for (i = 0; i < pending_count; ++i)
+        eventfd_ctx_put(pending[i]);
 
     pci_free_irq_vectors(dev);
     kfree(irqs);
@@ -945,8 +904,6 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
     }
 #endif
 
-    /* Allocate MSI-X vectors for interrupt mode. Best-effort: failure
-     * leaves num_vectors == 0 and the device runs in poll mode. */
     ctrl_alloc_irqs(ctrl, dev);
 
     /* Publish controller to the list only after probe is fully
@@ -1014,9 +971,6 @@ static void remove_pci_dev(struct pci_dev* dev)
     }
     mutex_unlock(&ctx_list_mutex);
 
-    /* 4. Free MSI-X vectors and any armed IRQ registrations before the
-     *    device is disabled. Files are already marked dead (step 3), so
-     *    no register/unregister ioctl can race this. */
     ctrl_free_irqs(ctrl, dev);
 
     /* 5. All DMA on this controller is now unmapped, satisfying the

@@ -25,6 +25,7 @@
 - **Multi-vendor GPU support** — NVIDIA CUDA and AMD Infinity Storage (HIP/ROCm) backends; both can be enabled simultaneously for mixed-GPU systems
 - **Fully open-source** — BSD 3-Clause licensed; no proprietary runtime dependencies beyond the GPU driver (NVIDIA driver or AMD ROCm runtime)
 - **High performance** — busy-poll CQ completion with `_mm_pause()`, multi-queue round-robin IO, achieving up to 2.7x read and 28x write bandwidth over NVIDIA GDS
+- **Interrupt mode (opt-in)** — MSI-X + eventfd completion for near-zero CPU utilization at large IO sizes; disabled by default (`UGDS_INTERRUPT_MODE=1` to enable)
 
 ## Architecture
 
@@ -123,65 +124,6 @@ scripts/run_tests.sh compare
 # Run all (functional + comparison)
 scripts/run_tests.sh all
 ```
-
-The functional suite includes the interrupt-mode tests (`test_interrupt_ioctls`,
-`test_interrupt_mode`). To exercise the whole suite over the interrupt path as
-well, run it with the mode enabled:
-
-```bash
-UGDS_INTERRUPT_MODE=1 scripts/run_tests.sh functional
-```
-
-## Interrupt Mode (MSI-X + eventfd)
-
-By default uGDS busy-polls the completion queue (`_mm_pause`) to detect I/O
-completion — this is what delivers uGDS's low latency, but it keeps a CPU core
-spinning for the entire duration of each transfer. Interrupt mode is an opt-in
-alternative: the kernel module allocates MSI-X vectors and signals an eventfd
-from its IRQ handler, so the submitting thread blocks in `ppoll` instead of
-spinning.
-
-Enable it per process with an environment variable (default is busy-poll):
-
-```bash
-UGDS_INTERRUPT_MODE=1 ./your_app        # values: 1 / on / true / yes
-```
-
-It applies only to the synchronous I/O queue pairs; the batch queue always
-polls. If the controller exposes no MSI-X vectors, uGDS transparently falls
-back to busy-poll.
-
-**When to use it.** The CPU saved scales with device busy time. The following
-measurements are single-thread, QD=1, sequential read on an A100 + Samsung NVMe.
-Busy-poll keeps the I/O thread at 100% CPU regardless of I/O size, while
-interrupt mode drops to under 1% for large transfers:
-
-![Interrupt vs busy-poll: CPU utilization](assets/ugds_interrupt_cpu_util.png)
-
-Measured as CPU consumed per I/O (log scale), busy-poll's cost grows with the
-transfer time because it spins the whole way, while interrupt mode stays low —
-only the submit path plus one wakeup — yielding up to a **131× CPU reduction at
-4 MB**:
-
-![Interrupt vs busy-poll: CPU cost per I/O](assets/ugds_interrupt_cpu_per_io.png)
-
-Interrupt mode's per-I/O CPU is not perfectly flat but forms a shallow U
-(≈6.9 µs at 4 KB, dipping to ≈3.9 µs at 64 KB, rising to ≈19 µs at 4 MB), for
-two composing reasons. Going *up* in size from 4 KB, the fixed per-wakeup
-scheduling cost is amortized over a longer sleep, so per-I/O CPU falls. Past
-64 KB it rises again because a large request is split into `max_transfer_size`
-chunks and each chunk builds a PRP list — the `for (i=1..n_pages)` loop in
-`do_io_internal` grows linearly with I/O size (4 MB = 1024 pages). That part is
-real command-building work that interrupt mode cannot elide; it stays tiny next
-to busy-poll's pure spin-wait (19 µs vs 2493 µs at 4 MB).
-
-For large I/O or low-queue-depth / idle workloads, interrupt mode frees almost
-the entire core at a negligible latency cost (p50 within 3% at ≥256 KB). For
-tiny, latency-critical I/O, keep the default busy-poll: at 4 KB/QD1 each I/O
-completes in ~5 µs, so blocking in `ppoll` and taking a wakeup adds two
-syscalls whose fixed cost dominates — interrupt mode's per-I/O CPU (6.9 µs) and
-latency (5.1 → 17.5 µs p50) both go *up*. The break-even is around 16–64 KB;
-below it, busy-poll wins.
 
 ## API Coverage
 

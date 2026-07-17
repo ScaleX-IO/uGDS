@@ -344,12 +344,14 @@ static void run_ugds_bench(BenchOpts& opts) {
     printf("  Mode:       %s%s\n",
            opts.is_async ? "async-" : (opts.is_batch ? "batch-" : ""),
            opts.is_write ? "write" : "read");
+#ifndef USE_NVIDIA_GDS
     {
         const char* env = getenv("UGDS_INTERRUPT_MODE");
         bool irq = env && (strcmp(env, "1") == 0 || strcmp(env, "on") == 0 ||
                            strcmp(env, "true") == 0 || strcmp(env, "yes") == 0);
         printf("  Completion: %s\n", irq ? "interrupt (MSI-X)" : "busy-poll");
     }
+#endif
     printf("\n");
 
     CHECK_CUDA(cudaSetDevice(opts.gpu_id));

@@ -141,9 +141,10 @@ int main(int argc, char** argv) {
     cudaMemcpy(h_buf, d_buf, kIoSize, cudaMemcpyDeviceToHost);
     for (size_t i = 0; i < n_words; i++) {
         if (h_buf[i] != pattern) {
+            uint32_t got = h_buf[i];
             free(h_buf);
             TEST_FAIL("single-IO mismatch at word %zu: 0x%08X != 0x%08X",
-                      i, h_buf[i], pattern);
+                      i, got, pattern);
         }
     }
     free(h_buf);

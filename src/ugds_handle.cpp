@@ -11,9 +11,6 @@
 #include <unistd.h>
 
 static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp, int dev_fd) {
-    // Teardown order: delete SQ -> delete CQ (controller stops posting
-    // completions and raising IRQs) -> unregister interrupt (free_irq
-    // drains any in-flight handler) -> close eventfd.
     if (qp->sq_dma) {
         nvm_admin_sq_delete(aq_ref, &qp->sq, &qp->cq);
         nvm_dma_unmap(qp->sq_dma);
@@ -143,9 +140,6 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     uint16_t sync_qps = total_qps - 1;
     hs->num_qps = sync_qps;
 
-    // Interrupt mode (opt-in via UGDS_INTERRUPT_MODE). Query how many MSI-X
-    // vectors the driver allocated; if none (or query fails), fall back to
-    // poll mode. Only sync QPs use interrupts; the batch QP stays polling.
     uint16_t irq_vectors = 0;
     {
         const char* env = getenv("UGDS_INTERRUPT_MODE");
@@ -176,12 +170,8 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         status = nvm_dma_map_host(&qp->cq_dma, hs->ctrl, qp->cq_buf, page_size);
         if (!nvm_ok(status)) goto fail;
 
-        // Interrupt mode: arm the MSI-X vector (eventfd + kernel registration)
-        // BEFORE Create-CQ so the vector exists when the controller uses IV.
-        // Vectors beyond irq_vectors (or on failure) fall back to poll.
-        // Result is stored on qp (irq_efd/irq_vec) so no goto-crossing locals.
         if (hs->interrupt_mode && i < irq_vectors) {
-            int efd = eventfd(0, EFD_CLOEXEC);
+            int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
             if (efd >= 0) {
                 struct nvm_ioctl_irq req = {};
                 req.vector = i;

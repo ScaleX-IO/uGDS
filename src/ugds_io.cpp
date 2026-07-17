@@ -8,26 +8,6 @@
 #include <unistd.h>
 #include <time.h>
 
-/*
- * Wait for one completion on qp's CQ. Returns a pointer to the completion
- * entry, or nullptr on timeout (budget = ctrl->timeout ms).
- *
- * Poll mode (qp.irq_efd < 0): busy-poll the CQ with _mm_pause, avoiding
- * the 1ms sleep of nvm_cq_dequeue_block. This is the default and the
- * source of uGDS's low latency.
- *
- * Interrupt mode (qp.irq_efd >= 0): block on the eventfd that the kernel
- * MSI-X handler signals, trading a few us of latency for near-zero CPU at
- * low queue depth. Three correctness points:
- *   - Lost wakeup: poll the CQ BEFORE every ppoll, so a completion that
- *     landed (and its IRQ fired) between submit and here is never missed.
- *   - Coalescing: N completions may raise only one eventfd signal; because
- *     each call re-polls the CQ first, the extra completions are found
- *     without blocking. A single read() drains the counter so a stale
- *     count cannot wedge the next wait.
- *   - Timeout: ppoll deadline = ctrl->timeout (ms); on expiry do one final
- *     CQ poll to close the exactly-at-timeout race, then return its result.
- */
 static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
 {
     if (qp.irq_efd < 0) {
@@ -41,9 +21,7 @@ static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
         return cpl;
     }
 
-    // Interrupt mode. Use an absolute deadline so that a burst of signal
-    // interruptions (EINTR restarts ppoll) can never stretch the total
-    // wait past ctrl->timeout.
+    // Absolute deadline prevents EINTR restarts from stretching total wait.
     const long timeout_ms = (long)hs->ctrl->timeout;
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -55,10 +33,10 @@ static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
     }
 
     for (;;) {
-        nvm_cpl_t* cpl = nvm_cq_dequeue(&qp.cq);   // (A) poll before block
+        // Poll CQ before blocking to prevent lost wakeups.
+        nvm_cpl_t* cpl = nvm_cq_dequeue(&qp.cq);
         if (cpl != nullptr) return cpl;
 
-        // Remaining time until the absolute deadline.
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         struct timespec ts;
@@ -68,27 +46,37 @@ static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
             ts.tv_sec -= 1;
             ts.tv_nsec += 1000000000L;
         }
-        if (ts.tv_sec < 0) {
-            return nvm_cq_dequeue(&qp.cq);          // deadline passed: final poll
-        }
+        if (ts.tv_sec < 0)
+            return nvm_cq_dequeue(&qp.cq);
 
-        struct pollfd pfd;
-        pfd.fd = qp.irq_efd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-
+        struct pollfd pfd = {qp.irq_efd, POLLIN, 0};
         int pr = ppoll(&pfd, 1, &ts, nullptr);
         if (pr < 0) {
-            if (errno == EINTR) continue;           // remaining time is recomputed
+            if (errno == EINTR) continue;
+            fprintf(stderr, "uGDS: ppoll(eventfd=%d) failed: %s\n",
+                    qp.irq_efd, strerror(errno));
             return nullptr;
         }
-        if (pr == 0) {
-            return nvm_cq_dequeue(&qp.cq);          // timeout: final poll
+        if (pr == 0)
+            return nvm_cq_dequeue(&qp.cq);
+
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "uGDS: eventfd=%d invalid, revents=0x%x\n",
+                    qp.irq_efd, pfd.revents);
+            return nullptr;
         }
+        if (!(pfd.revents & POLLIN))
+            continue;
+
         uint64_t cnt;
-        ssize_t r = read(qp.irq_efd, &cnt, sizeof(cnt));  // (C) drain counter
-        (void)r;
-        // loop: re-poll CQ (handles coalescing)
+        ssize_t r = read(qp.irq_efd, &cnt, sizeof(cnt));
+        if (r == (ssize_t)sizeof(cnt))
+            continue;
+        if (r < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        fprintf(stderr, "uGDS: read(eventfd=%d) failed: %s\n",
+                qp.irq_efd, r < 0 ? strerror(errno) : "short read");
+        return nullptr;
     }
 }
 

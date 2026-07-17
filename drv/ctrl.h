@@ -19,19 +19,11 @@
 struct eventfd_ctx;
 
 
-/*
- * Per-MSI-X-vector interrupt state (interrupt mode).
- *
- * One entry per allocated MSI-X vector. efd is NULL when the vector is
- * unarmed; when a user file registers an eventfd, request_irq installs
- * ugds_irq_handler and efd is published (under ctrl->irq_lock). The IRQ
- * handler reads efd with READ_ONCE and signals it if non-NULL.
- */
 struct ugds_irq
 {
     int                 irq;        /* Linux IRQ number (pci_irq_vector) */
     struct eventfd_ctx* efd;        /* eventfd to signal; NULL if unarmed */
-    struct ctrl*        ctrl;       /* Back-pointer for the handler */
+    struct ctrl*        ctrl;
     bool                requested;  /* request_irq installed */
 };
 
@@ -61,10 +53,8 @@ struct ctrl
     struct cdev*        cdev;       /* Character device (cdev_alloc'd) */
     struct device*      chrdev;     /* Character device handle */
 
-    /* MSI-X interrupt state (interrupt mode). Allocated in add_pci_dev,
-     * freed in remove_pci_dev. num_vectors == 0 means poll-only. */
-    int                 num_vectors;/* pci_alloc_irq_vectors result */
-    struct ugds_irq*    irqs;       /* array[num_vectors], NULL if none */
+    int                 num_vectors;/* MSI-X vectors; 0 = poll-only */
+    struct ugds_irq*    irqs;       /* array[num_vectors] */
     struct mutex        irq_lock;   /* Serialises arm/disarm vs teardown */
 };
 

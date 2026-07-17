@@ -83,8 +83,6 @@ static inline void report_results(const char* label, std::vector<ThreadData>& th
 
     double bw_mbps = (actual_bytes * 1.0 / MB) / (prog_time_ns / 1e9);
     double avg_lat_us = total_ops > 0 ? (double)total_io_time / (total_ops * 1000.0) : 0;
-    // CPU utilization = summed thread CPU time / summed thread wall time.
-    // CPU cost per IO = CPU time per completed IO (absolute us, not a ratio).
     double cpu_util = total_wall_ns > 0 ? (double)total_cpu_ns / total_wall_ns : 0;
     double cpu_us_per_io = total_ops > 0 ? (double)total_cpu_ns / (total_ops * 1000.0) : 0;
 
