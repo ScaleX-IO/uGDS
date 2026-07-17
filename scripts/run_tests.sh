@@ -124,9 +124,16 @@ run_test() {
         printf "${G}PASS${N}\n"
         PASSED=$((PASSED + 1))
     else
-        printf "${R}FAIL${N}\n"
-        echo "$output" | tail -5 | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
+        local rc=$?
+        if [ $rc -eq 77 ]; then
+            printf "${Y}SKIP${N}\n"
+            echo "$output" | tail -3 | sed 's/^/    /'
+            SKIPPED=$((SKIPPED + 1))
+        else
+            printf "${R}FAIL${N}\n"
+            echo "$output" | tail -5 | sed 's/^/    /'
+            FAILED=$((FAILED + 1))
+        fi
     fi
 }
 
@@ -165,10 +172,53 @@ run_functional() {
         test_cq_dw11
         test_interrupt_ioctls
         test_interrupt_mode
+        test_dmabuf_export
+    )
+
+    # RDMA tests (only if built)
+    local rdma_tests=(
+        test_rdma_export
+        test_rdma_tracked
     )
 
     for t in "${tests[@]}"; do
-        run_test "$t" "$BUILD_DIR/$t" "$ugds_dev" "$GPU_ID"
+        # In dual-backend builds, targets may be suffixed (_cuda/_hip)
+        local found=0
+        for suffix in "" "_cuda" "_hip"; do
+            if [ -x "$BUILD_DIR/${t}${suffix}" ]; then
+                # Skip on-the-fly unregistered test for HIP in dual builds:
+                # nvm_dma_map_device() defaults to CUDA (flags=0), so HIP
+                # unregistered I/O would route to the wrong backend.
+                # AMD buffers must be explicitly registered via uGDSBufRegister.
+                if [ "$t" = "test_read_write_unregistered" ] && [ "$suffix" = "_hip" ]; then
+                    printf "  %-40s ${Y}SKIP${N} (unregistered HIP I/O unsupported in dual mode)\n" "${t}${suffix}"
+                    SKIPPED=$((SKIPPED + 1))
+                    found=1
+                    continue
+                fi
+                run_test "$t${suffix}" "$BUILD_DIR/${t}${suffix}" "$ugds_dev" "$GPU_ID"
+                found=1
+            fi
+        done
+        if [ $found -eq 0 ]; then
+            printf "  %-40s ${Y}SKIP${N} (not built)\n" "$t"
+            SKIPPED=$((SKIPPED + 1))
+        fi
+    done
+    for t in "${rdma_tests[@]}"; do
+        # RDMA tests may not be built in non-RDMA configs.
+        # In dual-backend builds, both _cuda and _hip variants may exist.
+        local found=0
+        for suffix in "" "_cuda" "_hip"; do
+            if [ -x "$BUILD_DIR/${t}${suffix}" ]; then
+                run_test "$t${suffix}" "$BUILD_DIR/${t}${suffix}" "$ugds_dev" "$GPU_ID"
+                found=1
+            fi
+        done
+        if [ $found -eq 0 ]; then
+            printf "  %-40s ${Y}SKIP${N} (not built)\n" "$t"
+            SKIPPED=$((SKIPPED + 1))
+        fi
     done
     echo ""
 }
@@ -182,7 +232,16 @@ run_perf_ugds() {
     local ugds_dev
     ugds_dev=$(ensure_ugds "$slot")
 
-    if [ ! -x "$BUILD_DIR/bench_ugds" ]; then
+    # Find bench_ugds (may be suffixed in dual-backend builds)
+    local bench_bin=""
+    for suffix in "" "_cuda" "_hip"; do
+        if [ -x "$BUILD_DIR/bench_ugds${suffix}" ]; then
+            bench_bin="$BUILD_DIR/bench_ugds${suffix}"
+            break
+        fi
+    done
+
+    if [ -z "$bench_bin" ]; then
         echo "  SKIP (bench_ugds not built)"
         echo ""
         return
@@ -193,7 +252,7 @@ run_perf_ugds() {
 
     for sz in 4K 128K 1M; do
         echo "[UGDS - ${sz} seq read]"
-        "$BUILD_DIR/bench_ugds" -f "$ugds_dev" -l 128M -s "$sz" -t 1 -d "$GPU_ID" -m read
+        "$bench_bin" -f "$ugds_dev" -l 128M -s "$sz" -t 1 -d "$GPU_ID" -m read
     done
     echo ""
 }

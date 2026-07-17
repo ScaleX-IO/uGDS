@@ -19,10 +19,10 @@
   #define cudaSuccess           hipSuccess
   #define cudaError_t           hipError_t
   #define cudaGetErrorString    hipGetErrorString
-  #define cudaStreamSynchronize hipStreamSynchronize
+  #define cudaStream_t          hipStream_t
   #define cudaStreamCreate      hipStreamCreate
   #define cudaStreamDestroy     hipStreamDestroy
-  #define cudaStream_t          hipStream_t
+  #define cudaStreamSynchronize hipStreamSynchronize
   /* HIP builds must use dmabuf path */
   #define TEST_BUF_FLAGS  UGDS_REGISTER_DMABUF
 #else

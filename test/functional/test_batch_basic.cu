@@ -18,7 +18,7 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_buf, alloc_size);
     if (!d_buf) TEST_FAIL("cudaMalloc failed");
 
-    st = uGDSBufRegister(d_buf, alloc_size, 0);
+    st = uGDSBufRegister(d_buf, alloc_size, TEST_BUF_FLAGS);
     ASSERT_OK(st, "BufRegister");
 
     // Step 1: sync-write a known pattern to offset 0

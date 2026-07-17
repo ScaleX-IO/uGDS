@@ -11,11 +11,14 @@
  */
 enum mapping_type
 {
-    MAP_TYPE_CUDA   =   0x1,   // CUDA device memory (NVIDIA)
-    MAP_TYPE_HOST   =   0x2,   // Host memory (RAM)
-    MAP_TYPE_API    =   0x4,   // Allocated by the API (RAM)
-    MAP_TYPE_DMABUF =   0x8    // DMA-buf (AMD HIP / standard Linux)
+    MAP_TYPE_CUDA        =   0x1,
+    MAP_TYPE_HOST        =   0x2,
+    MAP_TYPE_API         =   0x4,
+    MAP_TYPE_DMABUF      =   0x8,
+    MAP_TYPE_DMABUF_CUDA =   0x10
 };
+
+typedef int (*dmabuf_close_fn)(int fd);
 
 
 
@@ -24,13 +27,15 @@ enum mapping_type
  */
 struct ioctl_mapping
 {
-    enum mapping_type   type;   // What kind of memory
-    void*               buffer; // GPU pointer (unmap identity) or host buffer
-    struct va_range     range;  // Memory range descriptor
+    enum mapping_type   type;
+    void*               buffer;
+    struct va_range     range;
 
-    /* DMABUF-specific fields */
-    int       dmabuf_fd;        // HSA-exported dma-buf file descriptor
-    uint64_t  dmabuf_offset;    // Offset within dmabuf allocation
+    int       dmabuf_fd;
+    uint64_t  dmabuf_offset;
+
+    bool                retain_fd;
+    dmabuf_close_fn     close_fn;
 };
 
 

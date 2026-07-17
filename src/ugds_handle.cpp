@@ -9,6 +9,7 @@
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <time.h>
 
 static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp, int dev_fd) {
     if (qp->sq_dma) {
@@ -55,7 +56,7 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     if (descr->type != UGDS_HANDLE_TYPE_OPAQUE_FD)
         return make_error(UGDS_INVALID_FILE_TYPE);
 
-    auto hs = std::make_unique<HandleState>();
+    auto hs = std::make_shared<HandleState>();
     hs->fd = descr->handle.fd;
     hs->ns_id = 1;
     hs->ctrl = nullptr;
@@ -330,21 +331,159 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     batch_done:;
     }
 
+    /* Register in global handle registry so handle_lookup() can find
+     * the shared_ptr. The raw pointer serves as the key and the public
+     * opaque handle.
+     *
+     * Re-check g_driver.initialized under lock: DriverClose may have
+     * run between the initial check (line 41) and here, after a long
+     * NVMe admin/setup sequence. */
+    HandleState* raw = hs.get();
     {
         std::lock_guard<std::mutex> g(g_driver.lock);
+        if (!g_driver.initialized)
+        {
+            /* Driver was closed during setup. Roll back all resources
+             * that were allocated above, including sync QPs and batch QP
+             * (same sequence as batch_fail). */
+            cleanup_batch_qp(hs->aq_ref, hs->batch_qp.get(), hs->fd);
+            for (auto& done : hs->qps)
+                cleanup_qp(hs->aq_ref, done.get(), hs->fd);
+            hs->qps.clear();
+            nvm_aq_destroy(hs->aq_ref);
+            nvm_dma_unmap(hs->aq_dma);
+            free(hs->aq_buf);
+            nvm_ctrl_free(hs->ctrl);
+            return make_error(UGDS_DRIVER_NOT_INITIALIZED);
+        }
+        try {
+            g_driver.handle_registry[raw] = hs;
+        } catch (const std::bad_alloc&) {
+            /* Registry insertion failed (out of memory). Roll back
+             * all NVMe resources allocated above. */
+            cleanup_batch_qp(hs->aq_ref, hs->batch_qp.get(), hs->fd);
+            for (auto& done : hs->qps)
+                cleanup_qp(hs->aq_ref, done.get(), hs->fd);
+            hs->qps.clear();
+            nvm_aq_destroy(hs->aq_ref);
+            nvm_dma_unmap(hs->aq_dma);
+            free(hs->aq_buf);
+            nvm_ctrl_free(hs->ctrl);
+            return make_error(UGDS_OUT_OF_MEMORY);
+        }
         if (g_driver.default_ctrl == nullptr)
             g_driver.default_ctrl = hs->ctrl;
     }
 
-    *fh = reinterpret_cast<uGDSHandle_t>(hs.release());
+    *fh = reinterpret_cast<uGDSHandle_t>(raw);
     return UGDS_OK;
 }
 
 extern "C" void uGDSHandleDeregister(uGDSHandle_t fh)
 {
-    if (fh == nullptr) return;
+    /* Legacy API: infinite wait. This void API cannot return an error
+     * to the caller.  If the handle is wedged (I/O timeout with commands
+     * still in flight), the underlying NVMe resources (QPs, DMA mappings)
+     * remain live and the caller must NOT close the device fd or free GPU
+     * memory until a successful DeregisterEx.  Use uGDSHandleDeregisterEx
+     * for a status-returning variant. */
+    uGDSError_t err = uGDSHandleDeregisterEx(fh, -1);
+    if (err.err != UGDS_SUCCESS) {
+        fprintf(stderr, "uGDS: HandleDeregister returned %d -- resources "
+                "still live, controller reset required\n", (int)err.err);
+    }
+}
 
-    HandleState* hs = reinterpret_cast<HandleState*>(fh);
+extern "C" uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec)
+{
+    if (fh == nullptr) return UGDS_OK;
+
+    HandleState* raw = reinterpret_cast<HandleState*>(fh);
+
+    /* timeout_sec semantics:
+     *   > 0  -- wait up to N seconds, then return UGDS_BUSY
+     *   0    -- non-blocking, return UGDS_BUSY immediately if in-flight
+     *  -1    -- infinite wait (legacy behaviour)
+     *  <-1   -- force teardown: skip wedged/in-flight checks and free all
+     *           resources unconditionally (caller guarantees no NVMe
+     *           command is still executing, e.g. after controller reset) */
+    bool force = (timeout_sec < -1);
+
+    /* Set closing=true under g_driver.lock so new IO entrypoints are
+     * blocked via handle_lookup/handle_lookup_locked. Keep the handle
+     * in the registry during drain so DriverClose's UGDS_BUSY guard
+     * still sees it. Remove from registry only after all cleanup. */
+    std::shared_ptr<HandleState> hs_sp;
+    {
+        std::lock_guard<std::mutex> g(g_driver.lock);
+        auto it = g_driver.handle_registry.find(raw);
+        if (it == g_driver.handle_registry.end())
+            return UGDS_OK;  /* already deregistered or invalid */
+        /* Atomic single-owner claim: if closing was already true,
+         * another thread is draining. Report busy, not success. */
+        if (it->second->closing.exchange(true, std::memory_order_acq_rel))
+            return make_error(UGDS_BUSY);
+        hs_sp = it->second;  /* copy shared_ptr, keep in registry */
+    }
+
+    HandleState* hs = hs_sp.get();
+
+    /* Wait for outstanding operations with optional timeout. */
+    if (!force && hs->wedged.load(std::memory_order_acquire)) {
+        fprintf(stderr, "uGDS: HandleDeregisterEx: handle is wedged "
+                "(batch timeout with commands in flight). "
+                "Controller reset required.\n");
+        hs->closing.store(false, std::memory_order_release);
+        return make_error(UGDS_BUSY);
+    }
+    if (!force) {
+        struct timespec deadline = {};
+        if (timeout_sec > 0) {
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
+            deadline.tv_sec += timeout_sec;
+        }
+        uint64_t warn_counter = 0;
+        while (hs->handle_in_flight.load(std::memory_order_acquire) > 0) {
+            if (hs->wedged.load(std::memory_order_acquire)) {
+                fprintf(stderr, "uGDS: HandleDeregisterEx: handle became "
+                        "wedged during drain (batch/sync timeout with "
+                        "commands in flight). Controller reset required.\n");
+                hs->closing.store(false, std::memory_order_release);
+                return make_error(UGDS_BUSY);
+            }
+            if (timeout_sec == 0) {
+                hs->closing.store(false, std::memory_order_release);
+                return make_error(UGDS_BUSY);
+            }
+            if (timeout_sec > 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (now.tv_sec > deadline.tv_sec ||
+                    (now.tv_sec == deadline.tv_sec &&
+                     now.tv_nsec >= deadline.tv_nsec)) {
+                    fprintf(stderr, "uGDS: HandleDeregisterEx: timed out "
+                            "waiting for %u in-flight operations\n",
+                            hs->handle_in_flight.load());
+                    hs->closing.store(false, std::memory_order_release);
+                    return make_error(UGDS_BUSY);
+                }
+            }
+            if ((++warn_counter % 100000000ULL) == 0) {
+                fprintf(stderr, "uGDS: HandleDeregister waiting for %u "
+                        "in-flight operations\n",
+                        hs->handle_in_flight.load());
+            }
+            __builtin_ia32_pause();
+        }
+        /* Re-check wedged before cleanup: concurrent timeout may
+         * have set it after the last in-flight reference dropped. */
+        if (hs->wedged.load(std::memory_order_acquire)) {
+            fprintf(stderr, "uGDS: HandleDeregisterEx: handle became wedged "
+                    "during drain. Controller reset required.\n");
+            hs->closing.store(false, std::memory_order_release);
+            return make_error(UGDS_BUSY);
+        }
+    }
 
     if (hs->batch_qp)
         cleanup_batch_qp(hs->aq_ref, hs->batch_qp.get(), hs->fd);
@@ -365,5 +504,16 @@ extern "C" void uGDSHandleDeregister(uGDSHandle_t fh)
     free(hs->aq_buf);
     if (hs->ctrl) nvm_ctrl_free(hs->ctrl);
 
-    delete hs;
+    /* Now that all resources are freed, remove from the registry.
+     * This must happen after cleanup so DriverClose's UGDS_BUSY guard
+     * keeps the handle visible during the entire drain+cleanup window. */
+    {
+        std::lock_guard<std::mutex> g(g_driver.lock);
+        g_driver.handle_registry.erase(raw);
+    }
+
+    /* hs_sp (the last local shared_ptr) drops here. The registry entry
+     * was the other copy; since we just erased it, this drop frees
+     * HandleState. */
+    return UGDS_OK;
 }
