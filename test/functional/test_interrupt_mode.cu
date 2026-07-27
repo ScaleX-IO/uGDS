@@ -18,22 +18,129 @@
 // spurious-wakeup path above is the coalescing-adjacent behavior the wait
 // loop must (and does) handle by always re-polling the CQ.
 //
-// Real-hardware signal: while this test runs, `cat /proc/interrupts | grep ugds`
-// counts are non-zero, proving the MSI-X interrupt actually fired (rather than
-// silently falling back to polling). The lines disappear after the test exits
-// because teardown free_irq()s the vectors.
+// The test snapshots the ugds_drv lines in /proc/interrupts before and after
+// I/O and requires the total count to increase. This proves an MSI-X handler
+// ran during this test instead of data correctness passing through polling
+// fallback alone. The lines disappear after teardown free_irq()s the vectors.
 //
 // Note: setenv must happen before uGDSDriverOpen / handle creation, because
 // interrupt mode is decided when uGDSHandleRegister creates the CQs.
 
 #include "test_utils.h"
-#include <thread>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <limits>
+#include <thread>
 
 static std::atomic<int> g_errors{0};
 
 static const size_t kIoSize = 4096;
 static const int kIosPerWorker = 16;
+
+struct IrqSnapshot {
+    bool readable;
+    unsigned lines;
+    uint64_t total;
+};
+
+static bool has_ugds_irq_action(const char* fields) {
+    static const char action[] = "ugds_drv";
+    const size_t action_len = sizeof(action) - 1;
+
+    while (*fields != '\0') {
+        while (std::isspace(static_cast<unsigned char>(*fields)) || *fields == ',')
+            fields++;
+
+        const char* token = fields;
+        while (*fields != '\0' &&
+               !std::isspace(static_cast<unsigned char>(*fields)) &&
+               *fields != ',')
+            fields++;
+
+        if (static_cast<size_t>(fields - token) == action_len &&
+            strncmp(token, action, action_len) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+static IrqSnapshot read_ugds_irq_snapshot() {
+    IrqSnapshot snapshot{false, 0, 0};
+    FILE* interrupts = fopen("/proc/interrupts", "r");
+    if (!interrupts)
+        return snapshot;
+
+    snapshot.readable = true;
+    char* line = nullptr;
+    size_t line_capacity = 0;
+
+    while (getline(&line, &line_capacity, interrupts) != -1) {
+        char* counts = strchr(line, ':');
+        if (!counts)
+            continue;
+        counts++;
+
+        uint64_t line_total = 0;
+        unsigned count_columns = 0;
+        char* field = counts;
+        while (*field != '\0') {
+            while (std::isspace(static_cast<unsigned char>(*field)))
+                field++;
+
+            char* token = field;
+            while (*field != '\0' &&
+                   !std::isspace(static_cast<unsigned char>(*field)))
+                field++;
+
+            bool decimal = token != field;
+            for (char* digit = token; digit != field; digit++) {
+                if (!std::isdigit(static_cast<unsigned char>(*digit))) {
+                    decimal = false;
+                    break;
+                }
+            }
+            if (!decimal) {
+                field = token;
+                break;
+            }
+
+            errno = 0;
+            char* end = nullptr;
+            unsigned long long value = strtoull(token, &end, 10);
+            if (errno == ERANGE || end != field ||
+                value > std::numeric_limits<uint64_t>::max() ||
+                value > std::numeric_limits<uint64_t>::max() - line_total) {
+                snapshot.readable = false;
+                break;
+            }
+            line_total += static_cast<uint64_t>(value);
+            count_columns++;
+        }
+
+        if (!snapshot.readable)
+            break;
+        if (!has_ugds_irq_action(field))
+            continue;
+        if (count_columns == 0 ||
+            line_total > std::numeric_limits<uint64_t>::max() - snapshot.total) {
+            snapshot.readable = false;
+            break;
+        }
+
+        snapshot.lines++;
+        snapshot.total += line_total;
+    }
+
+    if (ferror(interrupts))
+        snapshot.readable = false;
+    free(line);
+    fclose(interrupts);
+    return snapshot;
+}
 
 // Each worker owns a distinct file region and drives kIosPerWorker
 // write/read/verify cycles while the other workers do the same in parallel.
@@ -111,6 +218,13 @@ int main(int argc, char** argv) {
     uGDSHandle_t fh = open_handle();
     if (!fh) TEST_FAIL("open_handle failed (interrupt mode)");
 
+    IrqSnapshot irq_before = read_ugds_irq_snapshot();
+    printf("IRQ before: lines=%u total=%llu\n", irq_before.lines,
+           static_cast<unsigned long long>(irq_before.total));
+    if (!irq_before.readable)
+        TEST_FAIL("could not read or parse /proc/interrupts");
+    if (irq_before.lines == 0)
+        TEST_FAIL("no ugds_drv IRQ lines found after handle creation");
     const size_t alloc_size = 65536;
     const uint32_t pattern = 0xABCD1234;
 
@@ -162,6 +276,24 @@ int main(int argc, char** argv) {
         threads[i].join();
     if (g_errors.load() != 0)
         TEST_FAIL("%d concurrent interrupt-mode error(s)", g_errors.load());
+
+    IrqSnapshot irq_after{false, 0, 0};
+    for (int attempt = 0; attempt <= 100; attempt++) {
+        irq_after = read_ugds_irq_snapshot();
+        if (!irq_after.readable || irq_after.total > irq_before.total)
+            break;
+        if (attempt < 100)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    printf("IRQ after:  lines=%u total=%llu\n", irq_after.lines,
+           static_cast<unsigned long long>(irq_after.total));
+    if (!irq_after.readable)
+        TEST_FAIL("could not read or parse /proc/interrupts after I/O");
+    if (irq_after.lines == 0)
+        TEST_FAIL("no ugds_drv IRQ lines found after I/O");
+    if (irq_after.total <= irq_before.total)
+        TEST_FAIL("ugds_drv IRQ count did not increase");
 
     close_handle(fh);
     uGDSDriverClose();
