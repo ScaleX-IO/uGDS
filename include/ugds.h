@@ -55,6 +55,11 @@ typedef enum uGDSOpError {
     UGDS_GPU_MEMORY_PINNING_FAILED   = UGDS_BASE_ERR + 36,
 
     UGDS_BATCH_CAPACITY_EXCEEDED     = UGDS_BASE_ERR + 40,
+    UGDS_SAFETENSORS_IO_ERROR         = UGDS_BASE_ERR + 41,
+    UGDS_SAFETENSORS_INVALID_FORMAT   = UGDS_BASE_ERR + 42,
+    UGDS_SAFETENSORS_TENSOR_NOT_FOUND = UGDS_BASE_ERR + 43,
+    UGDS_SAFETENSORS_UNSUPPORTED_DTYPE = UGDS_BASE_ERR + 44,
+    UGDS_SAFETENSORS_INDEX_MISMATCH    = UGDS_BASE_ERR + 45,
 } uGDSOpError;
 
 static inline const char* uGDS_status_error(uGDSOpError status) {
@@ -73,6 +78,14 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
     case UGDS_INTERNAL_ERROR:              return "internal error";
     case UGDS_GPU_MEMORY_PINNING_FAILED:   return "GPU memory pinning failed";
     case UGDS_BATCH_CAPACITY_EXCEEDED:     return "batch capacity exceeded";
+    case UGDS_SAFETENSORS_IO_ERROR:        return "safetensors I/O error";
+    case UGDS_SAFETENSORS_INVALID_FORMAT:  return "invalid safetensors metadata";
+    case UGDS_SAFETENSORS_TENSOR_NOT_FOUND:
+        return "safetensors tensor not found";
+    case UGDS_SAFETENSORS_UNSUPPORTED_DTYPE:
+        return "unsupported safetensors dtype";
+    case UGDS_SAFETENSORS_INDEX_MISMATCH:
+        return "safetensors index does not match its shards";
     default:                                  return "unknown uGDS error";
     }
 }
