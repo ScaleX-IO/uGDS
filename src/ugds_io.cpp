@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <atomic>
 #include <algorithm>
+#include <cstdio>
 #include <poll.h>
 #include <unistd.h>
 #include <time.h>

@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.18)
 project(ugds LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Dependencies
@@ -10,6 +11,7 @@ find_package(Threads REQUIRED)
 # - GPU Backend Selection ---------------------
 option(UGDS_BACKEND_CUDA "Use NVIDIA CUDA backend" ON)
 option(UGDS_BACKEND_HIP  "Use AMD HIP backend"     OFF)
+option(UGDS_ENABLE_SAFETENSORS "Enable safetensors metadata mapping" OFF)
 
 # Both backends can be enabled simultaneously for dual-GPU systems.
 
@@ -105,6 +107,29 @@ set(UGDS_SOURCES
     src/ugds_hugepage.cpp
 )
 
+if(UGDS_ENABLE_SAFETENSORS)
+    if(NOT TARGET nlohmann_json::nlohmann_json)
+        find_package(nlohmann_json 3.11.0 CONFIG QUIET)
+    endif()
+    if(NOT TARGET nlohmann_json::nlohmann_json)
+        include(FetchContent)
+        if(POLICY CMP0135)
+            cmake_policy(SET CMP0135 NEW)
+        endif()
+        FetchContent_Declare(nlohmann_json
+            URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+            URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+        )
+        set(JSON_BuildTests OFF CACHE INTERNAL "")
+        FetchContent_MakeAvailable(nlohmann_json)
+    endif()
+endif()
+
+list(APPEND UGDS_SOURCES src/ugds_safetensors.cpp)
+set_source_files_properties(src/ugds_safetensors.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden"
+)
+
 add_library(ugds SHARED ${UGDS_SOURCES})
 
 target_include_directories(ugds
@@ -115,6 +140,14 @@ target_include_directories(ugds
 
 # Backend includes and compile definitions (independent)
 target_link_libraries(ugds PRIVATE Threads::Threads)
+
+if(UGDS_ENABLE_SAFETENSORS)
+    target_link_libraries(ugds PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_definitions(ugds PRIVATE
+        JSON_USE_IMPLICIT_CONVERSIONS=0
+        UGDS_ENABLE_SAFETENSORS=1
+    )
+endif()
 
 if(UGDS_BACKEND_CUDA)
     target_include_directories(ugds PRIVATE ${UGDS_CUDA_INCLUDES})
@@ -132,6 +165,33 @@ if(UGDS_BACKEND_HIP)
 endif()
 
 target_compile_options(ugds PRIVATE -Wall -O2)
+
+if(UGDS_ENABLE_SAFETENSORS)
+    add_executable(ugds_import_safetensors
+        tools/ugds_import_safetensors.cpp
+    )
+    target_include_directories(ugds_import_safetensors PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${UGDS_CUDA_INCLUDES}
+        ${UGDS_HIP_INCLUDES}
+    )
+    target_link_libraries(ugds_import_safetensors PRIVATE
+        ugds
+        nlohmann_json::nlohmann_json
+    )
+    target_compile_definitions(ugds_import_safetensors PRIVATE
+        JSON_USE_IMPLICIT_CONVERSIONS=0
+    )
+    target_compile_options(ugds_import_safetensors PRIVATE -Wall -O2)
+    if(UGDS_BACKEND_HIP AND NOT UGDS_BACKEND_CUDA)
+        target_compile_definitions(ugds_import_safetensors PRIVATE
+            __HIP_PLATFORM_AMD__
+        )
+    endif()
+    set_target_properties(ugds_import_safetensors PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+endif()
 
 # - Tests and benchmarks -----------------------
 set(FUNCTIONAL_TESTS
