@@ -70,6 +70,13 @@ void reset_lba_plan(uGDSTensorLbaPlan_t* plan) {
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(_CUDA)
+#include <cuda_runtime_api.h>
+#endif
+#if defined(_HIP)
+#include <hip/hip_runtime.h>
+#endif
+
 namespace {
 
 using json = nlohmann::json;
@@ -180,6 +187,58 @@ struct MappingError : std::runtime_error {
 }
 
 }  // namespace abi
+
+namespace gpu {
+
+constexpr uintptr_t kRegistrationAlignment = 1U << 16;
+
+bool supports(int flags) {
+    if (flags == 0) {
+#if defined(_CUDA)
+        return true;
+#else
+        return false;
+#endif
+    }
+    if (flags == UGDS_REGISTER_DMABUF) {
+#if defined(_HIP)
+        return true;
+#else
+        return false;
+#endif
+    }
+    return false;
+}
+
+uGDSError_t copy(int flags, void* destination, const void* source,
+                 size_t size) {
+    if (flags == UGDS_REGISTER_DMABUF) {
+#if defined(_HIP)
+        hipError_t error = hipMemcpy(
+            destination, source, size, hipMemcpyDeviceToDevice);
+        if (error == hipSuccess) {
+            error = hipStreamSynchronize(nullptr);
+        }
+        return error == hipSuccess
+            ? abi::status(UGDS_SUCCESS)
+            : uGDSError_t{UGDS_CUDA_DRIVER_ERROR, static_cast<int>(error)};
+#endif
+    } else if (flags == 0) {
+#if defined(_CUDA)
+        cudaError_t error = cudaMemcpy(
+            destination, source, size, cudaMemcpyDeviceToDevice);
+        if (error == cudaSuccess) {
+            error = cudaStreamSynchronize(nullptr);
+        }
+        return error == cudaSuccess
+            ? abi::status(UGDS_SUCCESS)
+            : uGDSError_t{UGDS_CUDA_DRIVER_ERROR, static_cast<int>(error)};
+#endif
+    }
+    return abi::status(UGDS_IO_NOT_SUPPORTED);
+}
+
+}  // namespace gpu
 
 namespace format {
 
@@ -1278,6 +1337,66 @@ extern "C" uGDSError_t uGDSTensorLbaMapPlan(
     }
 }
 
+extern "C" uGDSError_t uGDSTensorReadInto(
+    uGDSTensorLbaMap_t lba_map, const uGDSTensorMapping_t* tensor,
+    const uGDSTensorReadDescr_t* read) {
+    if (lba_map == nullptr ||
+        !abi::valid_abi(tensor, UGDS_TENSOR_MAPPING_V1_SIZE) ||
+        !abi::valid_abi(read, UGDS_TENSOR_READ_DESCR_V1_SIZE) ||
+        read->io_handle == nullptr ||
+        (read->staging_buffer_flags != 0 &&
+         read->staging_buffer_flags != UGDS_REGISTER_DMABUF) ||
+        tensor->nbytes > read->destination_size ||
+        (tensor->nbytes != 0 && read->destination == nullptr)) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+    if (!gpu::supports(read->staging_buffer_flags)) {
+        return abi::status(UGDS_IO_NOT_SUPPORTED);
+    }
+
+    uGDSTensorLbaPlan_t plan = UGDS_TENSOR_LBA_PLAN_INITIALIZER;
+    const uGDSError_t status = uGDSTensorLbaMapPlan(
+        lba_map, tensor, &plan);
+    if (status.err != UGDS_SUCCESS) {
+        return status;
+    }
+    if (plan.payload_size != tensor->nbytes) {
+        return abi::status(UGDS_INTERNAL_ERROR);
+    }
+    if (tensor->nbytes == 0) {
+        return plan.io_size == 0
+            ? abi::status(UGDS_SUCCESS)
+            : abi::status(UGDS_INTERNAL_ERROR);
+    }
+    if (plan.io_size == 0 ||
+        plan.io_size > static_cast<uint64_t>(
+                           std::numeric_limits<ssize_t>::max()) ||
+        plan.payload_skip > plan.io_size ||
+        plan.payload_size > plan.io_size - plan.payload_skip) {
+        return abi::status(UGDS_INTERNAL_ERROR);
+    }
+    if (read->staging == nullptr ||
+        reinterpret_cast<uintptr_t>(read->staging) %
+                gpu::kRegistrationAlignment != 0 ||
+        plan.io_size > read->staging_size) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+
+    const ssize_t bytes_read = uGDSRead(
+        read->io_handle, read->staging,
+        static_cast<size_t>(plan.io_size),
+        static_cast<off_t>(plan.io_offset), 0);
+    if (bytes_read != static_cast<ssize_t>(plan.io_size)) {
+        // TODO(post-MVP): retain/poison timed-out I/O resources until drain.
+        return abi::status(UGDS_SAFETENSORS_IO_ERROR);
+    }
+
+    const auto* payload = static_cast<const uint8_t*>(read->staging) +
+                          static_cast<size_t>(plan.payload_skip);
+    return gpu::copy(read->staging_buffer_flags, read->destination,
+                     payload, static_cast<size_t>(plan.payload_size));
+}
+
 #else
 
 namespace {
@@ -1390,6 +1509,22 @@ extern "C" uGDSError_t uGDSTensorLbaMapPlan(
         return abi::status(UGDS_INVALID_VALUE);
     }
     abi::reset_lba_plan(plan);
+    return abi::disabled_status();
+}
+
+extern "C" uGDSError_t uGDSTensorReadInto(
+    uGDSTensorLbaMap_t lba_map, const uGDSTensorMapping_t* tensor,
+    const uGDSTensorReadDescr_t* read) {
+    if (lba_map == nullptr ||
+        !abi::valid_abi(tensor, UGDS_TENSOR_MAPPING_V1_SIZE) ||
+        !abi::valid_abi(read, UGDS_TENSOR_READ_DESCR_V1_SIZE) ||
+        read->io_handle == nullptr ||
+        (read->staging_buffer_flags != 0 &&
+         read->staging_buffer_flags != UGDS_REGISTER_DMABUF) ||
+        tensor->nbytes > read->destination_size ||
+        (tensor->nbytes != 0 && read->destination == nullptr)) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
     return abi::disabled_status();
 }
 

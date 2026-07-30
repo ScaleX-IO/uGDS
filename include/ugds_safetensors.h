@@ -175,6 +175,34 @@ UGDS_SAFETENSORS_API uGDSError_t uGDSTensorLbaMapPlan(
     uGDSTensorLbaMap_t map, const uGDSTensorMapping_t* tensor,
     uGDSTensorLbaPlan_t* plan);
 
+/*
+ * destination must be contiguous GPU memory. staging must be a 64 KiB-aligned
+ * exact base registered with uGDSBufRegister(). Both are borrowed until this
+ * synchronous call returns; do not share staging across concurrent calls.
+ */
+typedef struct uGDSTensorReadDescr {
+    size_t       struct_size;
+    uint32_t     abi_version;
+    uGDSHandle_t io_handle;
+    void*        destination;
+    size_t       destination_size;
+    void*        staging;
+    size_t       staging_size;
+    /* Must match the flags used to register staging. */
+    int          staging_buffer_flags;
+} uGDSTensorReadDescr_t;
+
+#define UGDS_TENSOR_READ_DESCR_V1_SIZE                             \
+    (offsetof(uGDSTensorReadDescr_t, staging_buffer_flags) +       \
+     sizeof(((uGDSTensorReadDescr_t*)0)->staging_buffer_flags))
+#define UGDS_TENSOR_READ_DESCR_INITIALIZER                         \
+    {sizeof(uGDSTensorReadDescr_t), UGDS_SAFETENSORS_ABI_VERSION, \
+     NULL, NULL, 0, NULL, 0, 0}
+
+UGDS_SAFETENSORS_API uGDSError_t uGDSTensorReadInto(
+    uGDSTensorLbaMap_t lba_map, const uGDSTensorMapping_t* tensor,
+    const uGDSTensorReadDescr_t* read);
+
 #ifdef __cplusplus
 }
 #endif
