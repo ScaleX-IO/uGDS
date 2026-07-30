@@ -60,6 +60,8 @@ typedef enum uGDSOpError {
     UGDS_SAFETENSORS_TENSOR_NOT_FOUND = UGDS_BASE_ERR + 43,
     UGDS_SAFETENSORS_UNSUPPORTED_DTYPE = UGDS_BASE_ERR + 44,
     UGDS_SAFETENSORS_INDEX_MISMATCH    = UGDS_BASE_ERR + 45,
+    UGDS_SAFETENSORS_INVALID_MANIFEST  = UGDS_BASE_ERR + 46,
+    UGDS_SAFETENSORS_DEVICE_MISMATCH   = UGDS_BASE_ERR + 47,
 } uGDSOpError;
 
 static inline const char* uGDS_status_error(uGDSOpError status) {
@@ -86,6 +88,10 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
         return "unsupported safetensors dtype";
     case UGDS_SAFETENSORS_INDEX_MISMATCH:
         return "safetensors index does not match its shards";
+    case UGDS_SAFETENSORS_INVALID_MANIFEST:
+        return "invalid safetensors raw-object manifest";
+    case UGDS_SAFETENSORS_DEVICE_MISMATCH:
+        return "safetensors manifest device mismatch";
     default:                                  return "unknown uGDS error";
     }
 }

@@ -112,6 +112,69 @@ UGDS_SAFETENSORS_API uGDSError_t uGDSTensorMapGetShardCount(
 UGDS_SAFETENSORS_API uGDSError_t uGDSTensorMapGetShardByIndex(
     uGDSTensorMap_t map, size_t index, uGDSTensorShardInfo_t* shard);
 
+/* Secondary mapping: canonical shard byte ranges to aligned namespace LBAs. */
+typedef void* uGDSTensorLbaMap_t;
+
+typedef struct uGDSTensorDeviceGeometry {
+    size_t   struct_size;
+    uint32_t abi_version;
+    uint32_t namespace_id;
+    uint32_t lba_size;
+    uint32_t controller_page_size;
+    uint64_t capacity_lbas;
+} uGDSTensorDeviceGeometry_t;
+
+#define UGDS_TENSOR_DEVICE_GEOMETRY_V1_SIZE                        \
+    (offsetof(uGDSTensorDeviceGeometry_t, capacity_lbas) +         \
+     sizeof(((uGDSTensorDeviceGeometry_t*)0)->capacity_lbas))
+#define UGDS_TENSOR_DEVICE_GEOMETRY_INITIALIZER                    \
+    {sizeof(uGDSTensorDeviceGeometry_t),                           \
+     UGDS_SAFETENSORS_ABI_VERSION, 0, 0, 0, 0}
+
+typedef struct uGDSTensorLbaMapDescr {
+    size_t                           struct_size;
+    uint32_t                         abi_version;
+    const char*                      manifest_path;
+    /* Used only during open to bind manifest objects to canonical shards. */
+    uGDSTensorMap_t                  tensor_map;
+    const uGDSTensorDeviceGeometry_t* geometry;
+} uGDSTensorLbaMapDescr_t;
+
+#define UGDS_TENSOR_LBA_MAP_DESCR_V1_SIZE                          \
+    (offsetof(uGDSTensorLbaMapDescr_t, geometry) +                 \
+     sizeof(((uGDSTensorLbaMapDescr_t*)0)->geometry))
+#define UGDS_TENSOR_LBA_MAP_DESCR_INITIALIZER                      \
+    {sizeof(uGDSTensorLbaMapDescr_t),                              \
+     UGDS_SAFETENSORS_ABI_VERSION, NULL, NULL, NULL}
+
+typedef struct uGDSTensorLbaPlan {
+    size_t   struct_size;
+    uint32_t abi_version;
+    uint64_t io_begin_lba;
+    uint64_t io_lba_count;
+    /* io_offset and io_size can be passed to the current uGDS read API. */
+    uint64_t io_offset;
+    uint64_t io_size;
+    uint64_t payload_skip;
+    uint64_t payload_size;
+} uGDSTensorLbaPlan_t;
+
+#define UGDS_TENSOR_LBA_PLAN_V1_SIZE                               \
+    (offsetof(uGDSTensorLbaPlan_t, payload_size) +                 \
+     sizeof(((uGDSTensorLbaPlan_t*)0)->payload_size))
+#define UGDS_TENSOR_LBA_PLAN_INITIALIZER                           \
+    {sizeof(uGDSTensorLbaPlan_t), UGDS_SAFETENSORS_ABI_VERSION,   \
+     0, 0, 0, 0, 0, 0}
+
+UGDS_SAFETENSORS_API uGDSError_t uGDSTensorLbaMapOpen(
+    uGDSTensorLbaMap_t* map, const uGDSTensorLbaMapDescr_t* descr);
+
+UGDS_SAFETENSORS_API void uGDSTensorLbaMapClose(uGDSTensorLbaMap_t map);
+
+UGDS_SAFETENSORS_API uGDSError_t uGDSTensorLbaMapPlan(
+    uGDSTensorLbaMap_t map, const uGDSTensorMapping_t* tensor,
+    uGDSTensorLbaPlan_t* plan);
+
 #ifdef __cplusplus
 }
 #endif

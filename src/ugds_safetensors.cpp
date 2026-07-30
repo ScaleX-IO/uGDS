@@ -34,6 +34,15 @@ void reset_shard_info(uGDSTensorShardInfo_t* shard) {
     shard->header_length = 0;
 }
 
+void reset_lba_plan(uGDSTensorLbaPlan_t* plan) {
+    plan->io_begin_lba = 0;
+    plan->io_lba_count = 0;
+    plan->io_offset = 0;
+    plan->io_size = 0;
+    plan->payload_skip = 0;
+    plan->payload_size = 0;
+}
+
 }  // namespace abi
 }  // namespace
 
@@ -140,6 +149,23 @@ struct TensorMapState {
     std::vector<TensorEntry> tensors;
 };
 
+struct RawObjectState {
+    std::string shard_name;
+    uint64_t base_lba = 0;
+    uint64_t canonical_size = 0;
+    uint64_t padded_size = 0;
+    uint64_t header_length = 0;
+};
+
+struct LbaMapState {
+    uint64_t lba_size = 0;
+    uint64_t io_alignment = 0;
+    uint64_t region_begin = 0;
+    uint64_t region_end = 0;
+    uint64_t capacity_bytes = 0;
+    std::vector<RawObjectState> objects;
+};
+
 namespace abi {
 
 struct MappingError : std::runtime_error {
@@ -188,7 +214,9 @@ void validate_c_string(const std::string& value, const char* field) {
     }
 }
 
-json parse_json(const char* data, size_t size) {
+json parse_json(
+    const char* data, size_t size,
+    uGDSOpError invalid_status = UGDS_SAFETENSORS_INVALID_FORMAT) {
     std::vector<std::unordered_set<std::string>> keys;
     std::vector<size_t> array_items;
     std::vector<bool> array_at_depth;
@@ -196,16 +224,14 @@ json parse_json(const char* data, size_t size) {
     auto count_array_item = [&](size_t depth) {
         if (depth < array_at_depth.size() && array_at_depth[depth] &&
             ++array_items[depth] > kMaxRank) {
-            abi::fail(UGDS_SAFETENSORS_INVALID_FORMAT,
-                      "JSON array item limit exceeded");
+            abi::fail(invalid_status, "JSON array item limit exceeded");
         }
     };
 
     auto strict_callback = [&](int depth, json::parse_event_t event,
                                json& parsed) {
         if (depth < 0 || static_cast<size_t>(depth) > kMaxJsonDepth) {
-            abi::fail(UGDS_SAFETENSORS_INVALID_FORMAT,
-                      "JSON nesting limit exceeded");
+            abi::fail(invalid_status, "JSON nesting limit exceeded");
         }
         const size_t current_depth = static_cast<size_t>(depth);
         if (event == json::parse_event_t::value ||
@@ -216,8 +242,7 @@ json parse_json(const char* data, size_t size) {
         if (event == json::parse_event_t::object_start) {
             const size_t key_depth = current_depth + 1;
             if (key_depth > kMaxJsonDepth) {
-                abi::fail(UGDS_SAFETENSORS_INVALID_FORMAT,
-                          "JSON nesting limit exceeded");
+                abi::fail(invalid_status, "JSON nesting limit exceeded");
             }
             if (keys.size() <= key_depth) {
                 keys.resize(key_depth + 1);
@@ -231,11 +256,11 @@ json parse_json(const char* data, size_t size) {
             const auto& key = parsed.get_ref<const std::string&>();
             if (key.size() > kMaxNameBytes ||
                 !keys[key_depth].insert(key).second) {
-                abi::fail(UGDS_SAFETENSORS_INVALID_FORMAT,
+                abi::fail(invalid_status,
                           "invalid or duplicate JSON object key");
             }
             if (keys[key_depth].size() > kMaxObjectItems) {
-                abi::fail(UGDS_SAFETENSORS_INVALID_FORMAT,
+                abi::fail(invalid_status,
                           "JSON object item limit exceeded");
             }
         } else if (event == json::parse_event_t::array_start) {
@@ -260,7 +285,7 @@ json parse_json(const char* data, size_t size) {
     } catch (const abi::MappingError&) {
         throw;
     } catch (const json::exception&) {
-        abi::fail(UGDS_SAFETENSORS_INVALID_FORMAT, "invalid JSON");
+        abi::fail(invalid_status, "invalid JSON");
     }
 }
 
@@ -608,7 +633,302 @@ fs::path resolve_shard_path(const fs::path& base,
 
 }  // namespace format
 
-namespace mapping {
+namespace arithmetic {
+
+uint64_t checked_add(uint64_t left, uint64_t right,
+                     uGDSOpError status, const char* message) {
+    if (right > std::numeric_limits<uint64_t>::max() - left) {
+        abi::fail(status, message);
+    }
+    return left + right;
+}
+
+uint64_t checked_mul(uint64_t left, uint64_t right,
+                     uGDSOpError status, const char* message) {
+    if (left != 0 && right > std::numeric_limits<uint64_t>::max() / left) {
+        abi::fail(status, message);
+    }
+    return left * right;
+}
+
+uint64_t gcd(uint64_t left, uint64_t right) {
+    while (right != 0) {
+        const uint64_t remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    return left;
+}
+
+uint64_t checked_lcm(uint64_t left, uint64_t right,
+                     uGDSOpError status) {
+    if (left == 0 || right == 0) {
+        abi::fail(status, "zero alignment");
+    }
+    return checked_mul(left / gcd(left, right), right, status,
+                       "alignment overflow");
+}
+
+uint64_t align_down(uint64_t value, uint64_t alignment) {
+    return value - value % alignment;
+}
+
+uint64_t align_up(uint64_t value, uint64_t alignment,
+                  uGDSOpError status) {
+    const uint64_t remainder = value % alignment;
+    return remainder == 0
+               ? value
+               : checked_add(value, alignment - remainder, status,
+                             "aligned range overflow");
+}
+
+}  // namespace arithmetic
+
+namespace manifest {
+
+constexpr const char* kFormat = "ugds-safetensors-manifest";
+constexpr uint64_t kVersion = 1;
+constexpr uint64_t kObjectAlignmentFloor = 64U * 1024U;
+
+[[noreturn]] void invalid(const std::string& message) {
+    abi::fail(UGDS_SAFETENSORS_INVALID_MANIFEST, message);
+}
+
+const json& member(const json& object, const char* name) {
+    const auto found = object.find(name);
+    if (found == object.end()) {
+        invalid(std::string("missing manifest field: ") + name);
+    }
+    return *found;
+}
+
+const json& object_member(const json& object, const char* name) {
+    const json& value = member(object, name);
+    if (!value.is_object()) {
+        invalid(std::string("manifest field must be an object: ") + name);
+    }
+    return value;
+}
+
+uint64_t unsigned_member(const json& object, const char* name) {
+    const json& value = member(object, name);
+    if (value.is_number_unsigned()) {
+        return value.get<uint64_t>();
+    }
+    if (value.is_number_integer()) {
+        const int64_t number = value.get<int64_t>();
+        if (number >= 0) {
+            return static_cast<uint64_t>(number);
+        }
+    }
+    invalid(std::string("manifest field must be a non-negative integer: ") +
+            name);
+}
+
+std::string string_member(const json& object, const char* name) {
+    const json& value = member(object, name);
+    if (!value.is_string()) {
+        invalid(std::string("manifest field must be a string: ") + name);
+    }
+    std::string result = value.get<std::string>();
+    if (result.size() > kMaxNameBytes ||
+        result.find('\0') != std::string::npos) {
+        invalid(std::string("invalid manifest string: ") + name);
+    }
+    return result;
+}
+
+bool power_of_two(uint64_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+void validate_geometry(const uGDSTensorDeviceGeometry_t& geometry) {
+    if (geometry.namespace_id == 0 || geometry.capacity_lbas == 0 ||
+        !power_of_two(geometry.lba_size) ||
+        !power_of_two(geometry.controller_page_size)) {
+        abi::fail(UGDS_INVALID_VALUE, "invalid namespace geometry");
+    }
+}
+
+std::unique_ptr<LbaMapState> load(
+    const fs::path& path, const TensorMapState& primary,
+    const uGDSTensorDeviceGeometry_t& geometry) {
+    validate_geometry(geometry);
+    const std::string data = io::read_json_file(path);
+    const json root = format::parse_json(
+        data.data(), data.size(), UGDS_SAFETENSORS_INVALID_MANIFEST);
+    if (!root.is_object() || string_member(root, "format") != kFormat ||
+        unsigned_member(root, "version") != kVersion) {
+        invalid("unsupported raw-object manifest");
+    }
+    const json& device = object_member(root, "device");
+    const uint64_t namespace_id = unsigned_member(device, "namespace_id");
+    const uint64_t lba_size = unsigned_member(device, "lba_size");
+    const uint64_t capacity_lbas =
+        unsigned_member(device, "capacity_lbas");
+    if (namespace_id != geometry.namespace_id ||
+        lba_size != geometry.lba_size ||
+        capacity_lbas != geometry.capacity_lbas) {
+        abi::fail(UGDS_SAFETENSORS_DEVICE_MISMATCH,
+                  "manifest namespace geometry does not match runtime");
+    }
+
+    const uint64_t capacity_bytes = arithmetic::checked_mul(
+        geometry.capacity_lbas, geometry.lba_size,
+        UGDS_SAFETENSORS_INVALID_MANIFEST, "namespace capacity overflow");
+    const json& region = object_member(root, "region");
+    const uint64_t region_begin = arithmetic::checked_mul(
+        unsigned_member(region, "base_lba"), geometry.lba_size,
+        UGDS_SAFETENSORS_INVALID_MANIFEST, "region offset overflow");
+    const uint64_t region_size = arithmetic::checked_mul(
+        unsigned_member(region, "length_lbas"), geometry.lba_size,
+        UGDS_SAFETENSORS_INVALID_MANIFEST, "region size overflow");
+    const uint64_t region_end = arithmetic::checked_add(
+        region_begin, region_size, UGDS_SAFETENSORS_INVALID_MANIFEST,
+        "region end overflow");
+    if (region_size == 0 || region_end > capacity_bytes) {
+        invalid("reserved region exceeds namespace capacity");
+    }
+
+    const uint64_t io_alignment = arithmetic::checked_lcm(
+        geometry.lba_size, geometry.controller_page_size,
+        UGDS_SAFETENSORS_INVALID_MANIFEST);
+    const uint64_t object_alignment = arithmetic::checked_lcm(
+        kObjectAlignmentFloor, io_alignment,
+        UGDS_SAFETENSORS_INVALID_MANIFEST);
+
+    const json& objects = object_member(root, "objects");
+    if (objects.size() != primary.shards.size() ||
+        objects.size() > kMaxShards) {
+        invalid("manifest objects do not match primary shards");
+    }
+
+    std::unordered_map<std::string, RawObjectState> parsed;
+    parsed.reserve(objects.size());
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    ranges.reserve(objects.size());
+    for (const auto& item : objects.items()) {
+        if (item.key().size() > kMaxNameBytes ||
+            item.key().find('\0') != std::string::npos ||
+            !item.value().is_object()) {
+            invalid("invalid raw-object entry");
+        }
+        const json& value = item.value();
+        RawObjectState object;
+        object.shard_name = item.key();
+        object.base_lba = unsigned_member(value, "base_lba");
+        object.canonical_size =
+            unsigned_member(value, "canonical_size");
+        object.padded_size = unsigned_member(value, "padded_size");
+        object.header_length = unsigned_member(value, "header_length");
+        const uint64_t begin = arithmetic::checked_mul(
+            object.base_lba, geometry.lba_size,
+            UGDS_SAFETENSORS_INVALID_MANIFEST, "object offset overflow");
+        const uint64_t end = arithmetic::checked_add(
+            begin, object.padded_size,
+            UGDS_SAFETENSORS_INVALID_MANIFEST, "object end overflow");
+        if (object.canonical_size > object.padded_size ||
+            begin % object_alignment != 0 ||
+            object.padded_size % object_alignment != 0 ||
+            begin < region_begin || end > region_end ||
+            end > capacity_bytes) {
+            invalid("raw object is unaligned or outside its reserved region");
+        }
+        ranges.emplace_back(begin, end);
+        parsed.emplace(object.shard_name, std::move(object));
+    }
+
+    std::sort(ranges.begin(), ranges.end());
+    for (size_t index = 1; index < ranges.size(); ++index) {
+        if (ranges[index].first < ranges[index - 1].second) {
+            invalid("raw objects overlap");
+        }
+    }
+
+    auto state = std::make_unique<LbaMapState>();
+    state->lba_size = geometry.lba_size;
+    state->io_alignment = io_alignment;
+    state->region_begin = region_begin;
+    state->region_end = region_end;
+    state->capacity_bytes = capacity_bytes;
+    state->objects.reserve(primary.shards.size());
+    for (const ShardState& shard : primary.shards) {
+        auto found = parsed.find(shard.name);
+        if (found == parsed.end() ||
+            found->second.canonical_size != shard.canonical_size ||
+            found->second.header_length != shard.header_length) {
+            invalid("manifest object identity does not match its shard");
+        }
+        state->objects.push_back(std::move(found->second));
+    }
+    return state;
+}
+
+}  // namespace manifest
+
+namespace secondary {
+
+void make_plan(const LbaMapState& state,
+               const uGDSTensorMapping_t& tensor,
+               uGDSTensorLbaPlan_t* plan) {
+    abi::reset_lba_plan(plan);
+    if (tensor.shard_index >= state.objects.size() ||
+        tensor.shard_name == nullptr) {
+        abi::fail(UGDS_INVALID_VALUE, "invalid tensor shard mapping");
+    }
+    const RawObjectState& object = state.objects[tensor.shard_index];
+    if (object.shard_name != tensor.shard_name) {
+        abi::fail(UGDS_INVALID_VALUE, "tensor shard identity mismatch");
+    }
+    const uint64_t file_end = arithmetic::checked_add(
+        tensor.file_offset, tensor.nbytes, UGDS_INVALID_VALUE,
+        "tensor file range overflow");
+    if (file_end > object.canonical_size) {
+        abi::fail(UGDS_INVALID_VALUE,
+                  "tensor range exceeds its canonical shard");
+    }
+    plan->payload_size = tensor.nbytes;
+    if (tensor.nbytes == 0) {
+        return;
+    }
+
+    const uint64_t object_begin = arithmetic::checked_mul(
+        object.base_lba, state.lba_size, UGDS_INTERNAL_ERROR,
+        "validated object offset overflow");
+    const uint64_t physical_begin = arithmetic::checked_add(
+        object_begin, tensor.file_offset, UGDS_INVALID_VALUE,
+        "tensor physical offset overflow");
+    const uint64_t physical_end = arithmetic::checked_add(
+        object_begin, file_end, UGDS_INVALID_VALUE,
+        "tensor physical end overflow");
+    const uint64_t io_begin =
+        arithmetic::align_down(physical_begin, state.io_alignment);
+    const uint64_t io_end = arithmetic::align_up(
+        physical_end, state.io_alignment, UGDS_INVALID_VALUE);
+    const uint64_t object_end = arithmetic::checked_add(
+        object_begin, object.padded_size, UGDS_INTERNAL_ERROR,
+        "validated object end overflow");
+    const uint64_t io_size = io_end - io_begin;
+    if (io_begin < object_begin || io_end > object_end ||
+        io_begin < state.region_begin || io_end > state.region_end ||
+        io_end > state.capacity_bytes ||
+        io_end > static_cast<uint64_t>(
+                     std::numeric_limits<off_t>::max()) ||
+        io_size > std::numeric_limits<size_t>::max()) {
+        abi::fail(UGDS_INVALID_VALUE,
+                  "aligned tensor range exceeds the raw object");
+    }
+
+    plan->io_begin_lba = io_begin / state.lba_size;
+    plan->io_lba_count = io_size / state.lba_size;
+    plan->io_offset = io_begin;
+    plan->io_size = io_size;
+    plan->payload_skip = physical_begin - io_begin;
+}
+
+}  // namespace secondary
+
+namespace primary {
 
 std::unique_ptr<TensorMapState> build_single(const fs::path& path) {
     ParsedShard shard = format::parse_shard(path, "");
@@ -755,7 +1075,7 @@ void fill_mapping(const TensorMapState& state, const TensorEntry& tensor,
     mapping->nbytes = tensor.nbytes;
 }
 
-}  // namespace mapping
+}  // namespace primary
 }  // namespace
 
 extern "C" uGDSError_t uGDSTensorMapOpen(
@@ -773,13 +1093,13 @@ extern "C" uGDSError_t uGDSTensorMapOpen(
     try {
         std::unique_ptr<TensorMapState> state;
         if (descr->type == UGDS_TENSOR_MAP_SINGLE_FILE) {
-            state = mapping::build_single(fs::u8path(descr->path));
+            state = primary::build_single(fs::u8path(descr->path));
         } else if (descr->type == UGDS_TENSOR_MAP_HF_INDEX) {
-            state = mapping::build_index(fs::u8path(descr->path));
+            state = primary::build_index(fs::u8path(descr->path));
         } else {
             return abi::status(UGDS_INVALID_VALUE);
         }
-        mapping::finish_map(*state);
+        primary::finish_map(*state);
         *map = state.release();
         return abi::status(UGDS_SUCCESS);
     } catch (const abi::MappingError& error) {
@@ -845,7 +1165,7 @@ extern "C" uGDSError_t uGDSTensorMapFindN(
         std::string_view(found->name.data(), found->name.size()) != name) {
         return abi::status(UGDS_SAFETENSORS_TENSOR_NOT_FOUND);
     }
-    mapping::fill_mapping(*state, *found, mapping);
+    primary::fill_mapping(*state, *found, mapping);
     return abi::status(UGDS_SUCCESS);
 }
 
@@ -862,7 +1182,7 @@ extern "C" uGDSError_t uGDSTensorMapGetByIndex(
     if (index >= state->tensors.size()) {
         return abi::status(UGDS_INVALID_VALUE);
     }
-    mapping::fill_mapping(*state, state->tensors[index], mapping);
+    primary::fill_mapping(*state, state->tensors[index], mapping);
     return abi::status(UGDS_SUCCESS);
 }
 
@@ -900,6 +1220,62 @@ extern "C" uGDSError_t uGDSTensorMapGetShardByIndex(
     shard->canonical_size = value.canonical_size;
     shard->header_length = value.header_length;
     return abi::status(UGDS_SUCCESS);
+}
+
+extern "C" uGDSError_t uGDSTensorLbaMapOpen(
+    uGDSTensorLbaMap_t* map, const uGDSTensorLbaMapDescr_t* descr) {
+    if (map == nullptr) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+    *map = nullptr;
+    if (!abi::valid_abi(descr, UGDS_TENSOR_LBA_MAP_DESCR_V1_SIZE) ||
+        descr->manifest_path == nullptr || descr->manifest_path[0] == '\0' ||
+        descr->tensor_map == nullptr ||
+        !abi::valid_abi(descr->geometry,
+                        UGDS_TENSOR_DEVICE_GEOMETRY_V1_SIZE)) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+
+    try {
+        const auto* primary =
+            static_cast<const TensorMapState*>(descr->tensor_map);
+        std::unique_ptr<LbaMapState> state = manifest::load(
+            fs::u8path(descr->manifest_path), *primary, *descr->geometry);
+        *map = state.release();
+        return abi::status(UGDS_SUCCESS);
+    } catch (const abi::MappingError& error) {
+        return abi::status(error.status);
+    } catch (const std::bad_alloc&) {
+        return abi::status(UGDS_INTERNAL_ERROR);
+    } catch (...) {
+        return abi::status(UGDS_INTERNAL_ERROR);
+    }
+}
+
+extern "C" void uGDSTensorLbaMapClose(uGDSTensorLbaMap_t map) {
+    delete static_cast<LbaMapState*>(map);
+}
+
+extern "C" uGDSError_t uGDSTensorLbaMapPlan(
+    uGDSTensorLbaMap_t map, const uGDSTensorMapping_t* tensor,
+    uGDSTensorLbaPlan_t* plan) {
+    if (!abi::valid_abi(tensor, UGDS_TENSOR_MAPPING_V1_SIZE) ||
+        !abi::valid_abi(plan, UGDS_TENSOR_LBA_PLAN_V1_SIZE)) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+    abi::reset_lba_plan(plan);
+    if (map == nullptr) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+    try {
+        secondary::make_plan(*static_cast<const LbaMapState*>(map),
+                             *tensor, plan);
+        return abi::status(UGDS_SUCCESS);
+    } catch (const abi::MappingError& error) {
+        return abi::status(error.status);
+    } catch (...) {
+        return abi::status(UGDS_INTERNAL_ERROR);
+    }
 }
 
 #else
@@ -985,6 +1361,35 @@ extern "C" uGDSError_t uGDSTensorMapGetShardByIndex(
         return abi::status(UGDS_INVALID_VALUE);
     }
     abi::reset_shard_info(shard);
+    return abi::disabled_status();
+}
+
+extern "C" uGDSError_t uGDSTensorLbaMapOpen(
+    uGDSTensorLbaMap_t* map, const uGDSTensorLbaMapDescr_t* descr) {
+    if (map == nullptr) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+    *map = nullptr;
+    if (!abi::valid_abi(descr, UGDS_TENSOR_LBA_MAP_DESCR_V1_SIZE) ||
+        descr->manifest_path == nullptr || descr->manifest_path[0] == '\0' ||
+        descr->tensor_map == nullptr ||
+        !abi::valid_abi(descr->geometry,
+                        UGDS_TENSOR_DEVICE_GEOMETRY_V1_SIZE)) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+    return abi::disabled_status();
+}
+
+extern "C" void uGDSTensorLbaMapClose(uGDSTensorLbaMap_t) {}
+
+extern "C" uGDSError_t uGDSTensorLbaMapPlan(
+    uGDSTensorLbaMap_t, const uGDSTensorMapping_t* tensor,
+    uGDSTensorLbaPlan_t* plan) {
+    if (!abi::valid_abi(tensor, UGDS_TENSOR_MAPPING_V1_SIZE) ||
+        !abi::valid_abi(plan, UGDS_TENSOR_LBA_PLAN_V1_SIZE)) {
+        return abi::status(UGDS_INVALID_VALUE);
+    }
+    abi::reset_lba_plan(plan);
     return abi::disabled_status();
 }
 
