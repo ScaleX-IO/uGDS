@@ -166,6 +166,33 @@ endif()
 
 target_compile_options(ugds PRIVATE -Wall -O2)
 
+if(UGDS_ENABLE_SAFETENSORS)
+    add_executable(ugds_import_safetensors
+        tools/ugds_import_safetensors.cpp
+    )
+    target_include_directories(ugds_import_safetensors PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${UGDS_CUDA_INCLUDES}
+        ${UGDS_HIP_INCLUDES}
+    )
+    target_link_libraries(ugds_import_safetensors PRIVATE
+        ugds
+        nlohmann_json::nlohmann_json
+    )
+    target_compile_definitions(ugds_import_safetensors PRIVATE
+        JSON_USE_IMPLICIT_CONVERSIONS=0
+    )
+    target_compile_options(ugds_import_safetensors PRIVATE -Wall -O2)
+    if(UGDS_BACKEND_HIP AND NOT UGDS_BACKEND_CUDA)
+        target_compile_definitions(ugds_import_safetensors PRIVATE
+            __HIP_PLATFORM_AMD__
+        )
+    endif()
+    set_target_properties(ugds_import_safetensors PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+endif()
+
 # - Tests and benchmarks -----------------------
 set(FUNCTIONAL_TESTS
     test_driver_lifecycle

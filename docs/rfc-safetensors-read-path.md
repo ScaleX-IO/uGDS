@@ -37,6 +37,7 @@ filesystem features.
 - Make `read_into(tensor_name, destination)` the main data operation.
 - Validate metadata and physical ranges before submitting NVMe commands.
 - Keep the implementation and test matrix deliberately small.
+- Target only the vLLM model-weight loading path.
 
 ## Non-goals
 
@@ -95,9 +96,9 @@ only sees aligned physical byte offsets, sizes, and registered GPU buffers.
 The primary mapping consumes either a single canonical shard or the standard
 Hugging Face `model.safetensors.index.json` convention.
 
-The canonical header and shard index are parsed on the CPU during import. The
-validated tensor entries are persisted in the sidecar, so the runtime does not
-need to recover metadata through a GPU data read.
+The canonical header and shard index are parsed on the CPU when the primary map
+is opened. The sidecar stores only the raw-object placement needed by the
+secondary map.
 
 For a tensor entry:
 
@@ -192,10 +193,8 @@ representation is:
 {
   "format": "ugds-safetensors-manifest",
   "version": 1,
-  "generation": 7,
   "device": {
     "namespace_id": 1,
-    "namespace_identity": "device-specific-stable-id",
     "lba_size": 4096,
     "capacity_lbas": 1000000000
   },
@@ -208,73 +207,53 @@ representation is:
       "base_lba": 65536,
       "canonical_size": 4294967296,
       "padded_size": 4295032832,
-      "canonical_sha256": "...",
-      "header_sha256": "...",
-      "header_length": 16384,
-      "tensors": {
-        "model.layers.0.input_layernorm.weight": {
-          "dtype": "F16",
-          "shape": [4096],
-          "data_offsets": [0, 8192]
-        }
-      }
+      "header_length": 16384
     }
   }
 }
 ```
 
-The exact serialization is an implementation detail, but the version,
-generation, device identity, geometry, bounds, sizes, hashes, and validated
-tensor metadata are mandatory. Tensor metadata must remain derivable from and
-bound to the canonical header hash. Runtime geometry must match the geometry
-used to calculate the imported object alignment.
+The MVP binds each object to its canonical shard name, size, and header length,
+and validates the namespace geometry and reserved-region bounds. Generation
+and content hashes are post-MVP work.
 
 The standard Hugging Face index is not modified with uGDS-specific fields.
 
 ## 3. Tensor mapping
 
-The core adapter remains framework-neutral. It exposes validated tensor
-metadata and accepts a destination descriptor conceptually equivalent to:
+The C adapter does not depend on vLLM, but it is intentionally limited to the
+vLLM model-weight loading path. It exposes validated weight metadata and reads
+one weight into an already allocated contiguous GPU buffer:
 
 ```text
-TensorInfo       = {dtype, rank, shape, nbytes}
-TensorDestination = {base pointer, allocation bytes, valid offset,
-                     backend, device}
+TensorInfo        = {name, dtype, rank, shape, nbytes}
+TensorDestination = {device pointer, capacity bytes}
 ```
 
-The core operation is `read_into(name, destination)`. Constructing a PyTorch,
-JAX, or other framework object is the responsibility of a later framework
-adapter.
+The public data operation is one synchronous `TensorReadInto`. The caller owns
+one registered staging buffer and reuses it across all weights.
 
-### Framework allocation convenience
+### vLLM-facing shape
 
-An optional framework adapter may implement `get_tensor(name)` by allocating a
-GPU arena with alignment headroom, registering the aligned base once, and
-reading `[io_begin, io_end)` into that base. The returned framework tensor is a
-view beginning at `payload_skip`, with the dtype and shape from the validated
-primary mapping.
+A thin Python binding matches vLLM's existing weight iterator without changing
+vLLM model code:
 
-The tensor view retains shared ownership of the backing arena and buffer
-registration. Releasing the archive or request must not invalidate a live
-tensor.
+```python
+config = UGDSWeightConfig(...)
+model.load_weights(ugds_weights_iterator(config))
+```
 
-If `payload_skip` does not satisfy the dtype alignment required to create a
-typed view, the adapter uses staging plus a device-to-device copy.
+The binding only allocates CUDA weights, calls `TensorReadInto`, and yields
+`(checkpoint_name, torch.Tensor)`. It does not import or modify vLLM and does
+not implement a general-purpose raw-file API.
 
-### Existing destination
+### Staging
 
-For `read_into(name, destination)`, direct DMA is allowed only when all of the
-following hold:
-
-- the destination is contiguous and on a supported GPU device;
-- its dtype, shape, and byte length match the tensor metadata;
-- its registered range includes any required aligned guard bytes;
-- the source and destination layout can be represented by the current uGDS
-  page-based PRP path.
-
-Otherwise, the adapter reads into a registered staging arena and copies only
-the valid payload into the destination. An aligned raw read must never
-overwrite memory before or after an existing framework tensor.
+The MVP always reads the outward-aligned envelope into the caller's reusable
+64 KiB-aligned staging base registered at that exact address, then
+synchronously copies only `payload_size` bytes from `payload_skip` into the
+destination. The same staging buffer is not shared by concurrent calls. Direct
+DMA into a framework tensor is a later optimization.
 
 ### Completion
 
@@ -283,73 +262,32 @@ only after every underlying command succeeds and any staging copy completes.
 Partial reads and timed-out requests are errors and never publish a tensor.
 
 The current uGDS timeout paths do not prove that an outstanding command has
-been drained before returning. Before hardware tensor mapping is enabled, a
-narrow core prerequisite must ensure that a timed-out queue is poisoned and
-that its handle, PRPs, and registered buffers remain alive until the command is
-drained or the controller is safely reset. No new asynchronous engine is
-required, but the adapter alone cannot provide this guarantee.
+been drained before returning.
 
-## 4. Read-only and safety rules
+TODO(post-MVP): poison a timed-out queue and keep its handle, PRPs, and
+registered buffers alive until the command is drained or the controller is
+safely reset. Until this is implemented, timeout recovery is not
+production-safe and a timeout must not be interpreted as command cancellation.
 
-### Immutability
-
-- An object is immutable after it is committed.
-- A model update writes new objects under a new manifest generation.
-- Readers open one immutable manifest snapshot for their lifetime.
-- The active generation changes only after every new object is complete and
-  validated.
-- Old generations can be reclaimed only when no reader references them.
-
-### Import and commit
-
-The importer performs these steps in order:
-
-1. Validate the canonical shard and compute its identity hashes.
-2. Reserve a non-overlapping aligned raw range.
-3. Write the exact canonical bytes and zero padding.
-4. Complete the storage durability operation supported by the import path.
-5. Verify object bounds and, in strict mode, its content hash.
-6. Publish the new sidecar generation last.
-
-A partially imported object is unreachable because no committed manifest
-references it.
+## 4. MVP read-only rules
 
 ### Runtime validation
 
-Before reading data, the runtime validates:
+The performance-validation build keeps only checks that prevent an invalid
+read or memory overwrite:
 
-- manifest magic, version, and supported flags;
-- namespace identity, NSID, LBA size, and capacity;
-- reserved region and object bounds without integer overflow;
-- canonical and padded sizes;
-- header identity and tensor metadata bounds;
-- destination pointer, allocation length, and registration ownership.
+- tensor and aligned LBA ranges stay within the declared object, region, and
+  namespace capacity;
+- checked arithmetic is used for offsets and sizes;
+- destination capacity is at least the tensor byte length;
+- the copied payload stays within the staging envelope.
 
-The runtime treats raw storage as read-only even though the lower-level uGDS
-API also exposes writes.
+The adapter exposes no write operation. During a benchmark, the caller must not
+modify the manifest/raw objects or close maps, handles, and buffers while a
+reader call is active.
 
-The MVP supports one controller and NSID 1 per process, matching the current
-uGDS handle and global buffer-registration model. The archive owns that handle
-for its lifetime. Supporting multiple controllers requires a later
-controller-scoped buffer-registration API.
-
-### Lifetime
-
-The ownership chain is:
-
-```text
-archive -> plan/request -> GPU arena -> uGDS buffer registration
-```
-
-Each in-flight request retains every object it needs. Buffer deregistration and
-handle close must fail or wait while a request is in flight. Cancellation may
-stop unsubmitted work, but submitted NVMe commands must still be drained before
-their buffers are released.
-
-The initial implementation should enforce these rules in the safetensors
-adapter without requiring a broad uGDS core refactor. The timeout/drain rule
-described above is a separately reviewed prerequisite because it cannot be
-contained safely in the adapter.
+Generation switching, hashes, concurrent-close protection, and in-flight
+reference tracking are post-MVP TODOs, consistent with the current uGDS core.
 
 ## 5. Focused test matrix
 
@@ -361,11 +299,24 @@ The test matrix intentionally covers boundaries rather than every combination.
 | Two shards with a standard index | Tensor-to-shard selection |
 | Unaligned tensor begin and length | Outward-aligned envelope and guard-byte safety |
 | Invalid header or out-of-bounds range | Parser and checked-arithmetic rejection |
-| Stale manifest or device mismatch | Read-only identity enforcement |
+| Device mismatch or short destination | Bounds enforcement |
 | Differential comparison | Bytes, dtype, and shape match the official loader |
 
 Hardware tests should use a dedicated test region and never assume that LBA 0
 is safe. Pure metadata and planning tests do not require an NVMe device.
+
+The weight-load benchmark uses one fresh process per sample. It preallocates
+GPU parameters outside the timed region, consumes the loader's `(name, tensor)`
+pairs into those parameters, and stops only after GPU synchronization. This
+matches the intended vLLM loading boundary without importing vLLM itself.
+
+### Current validation status
+
+Metadata mapping, LBA planning, the tensor-read boundary, and the benchmark
+contract have been validated without storage hardware. The current development
+environment has no usable uGDS device or dedicated writable NVMe namespace, so
+real uGDS reads and uGDS performance remain unverified. This RFC makes no uGDS
+performance claim until that hardware validation is completed.
 
 ## Proposed implementation shape
 
@@ -375,13 +326,13 @@ uGDS sources. The expected additions are limited to:
 - one small public safetensors adapter interface;
 - one compact implementation unit for metadata, manifest, and planning;
 - one offline import/index utility;
-- one focused functional test and metadata-only unit tests;
-- an optional Python/framework adapter after the raw read path works.
+- one focused correctness/performance case;
+- one thin vLLM-shaped Python weight iterator.
 
 A small read-only device query may be added to expose controller serial/model,
 NSID, LBA size, and namespace capacity to the adapter. This does not change the
 semantics of existing I/O entry points. During the single-controller MVP, the
-query and buffer registration refer to the same archive-owned controller.
+I/O handle, query, and buffer registration refer to the same controller.
 
 The exact parser dependency and public symbol names will be reviewed with the
 first implementation step. A permissive handwritten JSON parser is not
@@ -394,12 +345,14 @@ The draft implementation PR proceeds in separately reviewable steps:
 
 1. Primary mapping and metadata-only tests.
 2. Secondary contiguous-object mapping and manifest validation.
-3. The narrow timeout/drain prerequisite, then GPU tensor mapping with aligned
-   envelope and framework-neutral `read_into`.
-4. Read-only generation, identity, bounds, and lifetime rules.
+3. GPU weight mapping with aligned envelope and vLLM-oriented `read_into`.
+4. Minimal read-only and bounds rules for performance validation.
 5. The focused end-to-end case matrix.
 
 No later step starts until the preceding step has been reviewed.
+
+The timeout/drain prerequisite is deliberately deferred to the post-MVP TODO
+in the Completion section.
 
 ## Alternatives considered
 
