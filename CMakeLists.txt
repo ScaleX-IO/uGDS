@@ -167,6 +167,40 @@ endif()
 target_compile_options(ugds PRIVATE -Wall -O2)
 
 # - Tests and benchmarks -----------------------
+enable_testing()
+
+add_executable(test_safetensors_mapping
+    test/safetensors/test_mapping.cpp
+)
+target_include_directories(test_safetensors_mapping PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${UGDS_CUDA_INCLUDES}
+    ${UGDS_HIP_INCLUDES}
+)
+target_link_libraries(test_safetensors_mapping PRIVATE ugds)
+target_compile_options(test_safetensors_mapping PRIVATE -Wall -Wextra -Werror)
+if(UGDS_ENABLE_SAFETENSORS)
+    target_compile_definitions(test_safetensors_mapping PRIVATE
+        UGDS_TEST_SAFETENSORS_ENABLED=1
+    )
+    set(UGDS_SAFETENSORS_TEST_NAME safetensors_mapping_enabled)
+else()
+    set(UGDS_SAFETENSORS_TEST_NAME safetensors_mapping_disabled)
+endif()
+if(UGDS_BACKEND_HIP AND NOT UGDS_BACKEND_CUDA)
+    target_compile_definitions(test_safetensors_mapping PRIVATE
+        __HIP_PLATFORM_AMD__
+    )
+endif()
+set_target_properties(test_safetensors_mapping PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+)
+add_test(NAME ${UGDS_SAFETENSORS_TEST_NAME}
+         COMMAND test_safetensors_mapping)
+set_tests_properties(${UGDS_SAFETENSORS_TEST_NAME} PROPERTIES
+    LABELS "cpu;safetensors"
+)
+
 set(FUNCTIONAL_TESTS
     test_driver_lifecycle
     test_handle_register
