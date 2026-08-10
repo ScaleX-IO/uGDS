@@ -299,7 +299,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         /* Do NOT unmap on-the-fly buffer or release in-flight ref. */
     } else if (on_the_fly && buf_dma != nullptr) {
         nvm_dma_unmap(buf_dma);
-    } else if (buf_dma != nullptr) {
+    } else if (!on_the_fly && buf_dma != nullptr) {
         /* Registered buffer: release in-flight reference. */
         std::lock_guard<std::mutex> drv_lock(g_driver.lock);
         auto it = g_driver.buf_registry.find(bufPtr_base);
