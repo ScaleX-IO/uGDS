@@ -209,6 +209,10 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 nvm_cpl_t* drain = wait_for_completion(hs, qp);
                 if (drain == nullptr) {
                     result = -EIO;
+                    /* An older submitted command may still DMA. Treat this
+                     * exactly like a post-submit completion timeout. */
+                    timed_out = true;
+                    hs->wedged.store(true, std::memory_order_release);
                     goto out;
                 }
                 uint16_t st = UGDS_CPL_SCT_SC(drain);
@@ -282,6 +286,14 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
     if (timed_out) {
         /* NVMe command may still be executing. wedged was set
          * under qp.lock. Retain all resources. */
+        if (on_the_fly) {
+            /* Transfer ownership from this stack frame to the QP. */
+            qp.timeout_dma = buf_dma;
+        } else {
+            /* Keep the registered buffer's in-flight reference. */
+            qp.timeout_registered_buf = bufPtr_base;
+        }
+        buf_dma = nullptr;
         fprintf(stderr, "uGDS: I/O timeout -- handle wedged. "
                 "Controller reset required.\n");
         /* Do NOT unmap on-the-fly buffer or release in-flight ref. */

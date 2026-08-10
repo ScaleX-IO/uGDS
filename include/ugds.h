@@ -131,9 +131,10 @@ void uGDSHandleDeregister(uGDSHandle_t fh);
  * before all in-flight operations (including batch handles) complete.
  * timeout_sec == 0 means non-blocking check only.
  * timeout_sec < 0 means infinite wait (equivalent to uGDSHandleDeregister).
- * timeout_sec < -1 means force teardown: skip wedged/in-flight checks
- * and free all resources unconditionally.  The caller must guarantee
- * that no NVMe command is still executing (e.g. after a controller reset). */
+ * timeout_sec < -1 means after-reset teardown: release resources retained
+ * by timed-out I/O, skip wedged/in-flight checks, and free all resources.
+ * The caller must guarantee that no NVMe command is still executing (e.g.
+ * after a controller reset). */
 uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec);
 
 uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int flags);
