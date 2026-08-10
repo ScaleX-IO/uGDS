@@ -47,6 +47,33 @@ static void cleanup_batch_qp(nvm_aq_ref aq_ref, IOQueuePairHuge* bqp, int dev_fd
         hugepage_free(bqp->cq_huge, bqp->cq_huge_size);
 }
 
+/* Release resources retained by timed-out synchronous I/O. The caller must
+ * have already reset the controller and proved that old commands cannot DMA. */
+static void cleanup_timeout_resources(HandleState* hs) {
+    for (auto& qp_ptr : hs->qps) {
+        IOQueuePair& qp = *qp_ptr;
+        nvm_dma_t* timeout_dma = nullptr;
+        const void* registered_buf = nullptr;
+        {
+            std::lock_guard<std::mutex> qp_lock(qp.lock);
+            timeout_dma = qp.timeout_dma;
+            registered_buf = qp.timeout_registered_buf;
+            qp.timeout_dma = nullptr;
+            qp.timeout_registered_buf = nullptr;
+        }
+
+        if (timeout_dma != nullptr)
+            nvm_dma_unmap(timeout_dma);
+
+        if (registered_buf != nullptr) {
+            std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+            auto it = g_driver.buf_registry.find(registered_buf);
+            if (it != g_driver.buf_registry.end())
+                it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+}
+
 extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
 {
     if (fh == nullptr || descr == nullptr)
@@ -484,6 +511,9 @@ extern "C" uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec)
             return make_error(UGDS_BUSY);
         }
     }
+
+    if (force)
+        cleanup_timeout_resources(hs);
 
     if (hs->batch_qp)
         cleanup_batch_qp(hs->aq_ref, hs->batch_qp.get(), hs->fd);

@@ -47,6 +47,10 @@ struct IOQueuePair {
     void*          prp_buf = nullptr;
     int            irq_efd = -1;   /* eventfd for interrupt mode; -1 = poll */
     uint16_t       irq_vec = 0;    /* MSI-X vector bound to this CQ */
+    /* Timeout resources remain owned by the QP until controller recovery.
+     * At most one synchronous operation can hold this QP lock. */
+    nvm_dma_t*     timeout_dma = nullptr;           /* on-the-fly mapping */
+    const void*    timeout_registered_buf = nullptr; /* registered ref */
     std::mutex     lock;
 };
 

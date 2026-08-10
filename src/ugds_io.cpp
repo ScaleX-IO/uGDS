@@ -209,6 +209,10 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 nvm_cpl_t* drain = wait_for_completion(hs, qp);
                 if (drain == nullptr) {
                     result = -EIO;
+                    /* An older submitted command may still DMA. Treat this
+                     * exactly like a post-submit completion timeout. */
+                    timed_out = true;
+                    hs->wedged.store(true, std::memory_order_release);
                     goto out;
                 }
                 uint16_t st = UGDS_CPL_SCT_SC(drain);
@@ -276,18 +280,31 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         }
 
         result = static_cast<ssize_t>(bytes_done);
+
+        /* Transfer timeout resources to the QP while we still hold
+         * qp.lock.  A concurrent force teardown also acquires qp.lock
+         * in cleanup_timeout_resources(), so this prevents the race
+         * where teardown destroys the QP before we store the mapping. */
+        if (timed_out) {
+            if (on_the_fly) {
+                qp.timeout_dma = buf_dma;
+            } else {
+                qp.timeout_registered_buf = bufPtr_base;
+            }
+            buf_dma = nullptr;
+        }
+
     out:;
     }
 
     if (timed_out) {
         /* NVMe command may still be executing. wedged was set
-         * under qp.lock. Retain all resources. */
+         * under qp.lock. Resources were transferred to the QP above. */
         fprintf(stderr, "uGDS: I/O timeout -- handle wedged. "
                 "Controller reset required.\n");
-        /* Do NOT unmap on-the-fly buffer or release in-flight ref. */
     } else if (on_the_fly && buf_dma != nullptr) {
         nvm_dma_unmap(buf_dma);
-    } else if (buf_dma != nullptr) {
+    } else if (!on_the_fly && buf_dma != nullptr) {
         /* Registered buffer: release in-flight reference. */
         std::lock_guard<std::mutex> drv_lock(g_driver.lock);
         auto it = g_driver.buf_registry.find(bufPtr_base);
