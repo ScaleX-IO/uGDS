@@ -121,7 +121,7 @@ struct ctrl* ctrl_find_and_get_by_inode(struct list* list, const struct inode* i
             /* Refuse opens on controllers being removed. The dying
              * flag is set under the list spinlock in remove_pci_dev,
              * so this check is atomic with respect to list removal. */
-            if (ctrl->dying)
+            if (READ_ONCE(ctrl->dying))
             {
                 break;
             }
