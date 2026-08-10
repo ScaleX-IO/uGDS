@@ -130,7 +130,7 @@ void uGDSHandleDeregister(uGDSHandle_t fh);
  * Returns UGDS_OK on success, or UGDS_BUSY if the timeout expires
  * before all in-flight operations (including batch handles) complete.
  * timeout_sec == 0 means non-blocking check only.
- * timeout_sec < 0 means infinite wait (equivalent to uGDSHandleDeregister).
+ * timeout_sec == -1 means infinite wait (equivalent to uGDSHandleDeregister).
  * timeout_sec < -1 means after-reset teardown: release resources retained
  * by timed-out I/O, skip wedged/in-flight checks, and free all resources.
  * The caller must guarantee that no NVMe command is still executing (e.g.
