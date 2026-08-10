@@ -22,6 +22,7 @@
 #include <linux/device.h>
 #include <linux/version.h>
 #include <linux/overflow.h>
+#include <linux/idr.h>
 #include <linux/uaccess.h>
 #include "irq.h"
 #include <asm/io.h>
@@ -84,7 +85,8 @@ static int max_num_ctrls = 64;
 module_param(max_num_ctrls, int, 0);
 MODULE_PARM_DESC(max_num_ctrls, "Number of controller devices");
 
-static int curr_ctrls = 0;
+/* Only the minor number is tracked; IDA is the ID-only allocator. */
+static DEFINE_IDA(ctrl_ida);
 
 
 enum handle_type
@@ -227,6 +229,16 @@ static int dev_open(struct inode* inode, struct file* file)
     file->private_data = ctx;
 
     mutex_lock(&ctx_list_mutex);
+    /* Re-check dying under ctx_list_mutex: remove_pci_dev sets dying
+     * and then iterates ctx_list under this same mutex. If we add
+     * our ctx after that iteration completed, dying is already true. */
+    if (READ_ONCE(ctrl->dying))
+    {
+        mutex_unlock(&ctx_list_mutex);
+        ctrl_put(ctrl);
+        kfree(ctx);
+        return -ENODEV;
+    }
     list_add(&ctx->global_node, &ctx_list);
     mutex_unlock(&ctx_list_mutex);
 
@@ -668,20 +680,33 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
     int err;
     struct ctrl* ctrl = NULL;
 
-    if (curr_ctrls >= max_num_ctrls)
-    {
-        printk(KERN_NOTICE "Maximum number of controller devices added\n");
-        return 0;
-    }
-
     printk(KERN_INFO "Adding controller device: %02x:%02x.%1x",
             dev->bus->number, PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn));
 
+    if (max_num_ctrls <= 0)
+    {
+        printk(KERN_NOTICE "Maximum number of controller devices is zero\n");
+        return 0;
+    }
+
+    int ctrl_num = ida_alloc_range(&ctrl_ida, 0, max_num_ctrls - 1,
+                                   GFP_KERNEL);
+    if (ctrl_num < 0)
+    {
+        if (ctrl_num == -ENOSPC)
+        {
+            printk(KERN_NOTICE "Maximum number of controller devices added\n");
+            return 0;  /* capacity is not an error */
+        }
+        return ctrl_num;  /* propagate -ENOMEM etc. */
+    }
+
     // Create controller reference
-    ctrl = ctrl_get(dev_class, dev, curr_ctrls);
+    ctrl = ctrl_get(dev_class, dev, ctrl_num);
     if (IS_ERR(ctrl))
     {
-        return PTR_ERR(ctrl);
+        err = PTR_ERR(ctrl);
+        goto fail_ida;
     }
 
     // Get a reference to device memory
@@ -690,7 +715,7 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
     {
         ctrl_put(ctrl);
         printk(KERN_ERR "Failed to get controller register memory\n");
-        return err;
+        goto fail_ida;
     }
 
     // Enable PCI device
@@ -700,7 +725,7 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
         pci_release_region(dev, 0);
         ctrl_put(ctrl);
         printk(KERN_ERR "Failed to enable controller\n");
-        return err;
+        goto fail_ida;
     }
 
     // Create character device file
@@ -710,7 +735,7 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
         pci_disable_device(dev);
         pci_release_region(dev, 0);
         ctrl_put(ctrl);
-        return err;
+        goto fail_ida;
     }
 
     // Enable DMA
@@ -728,7 +753,8 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
         pci_disable_device(dev);
         pci_release_region(dev, 0);
         ctrl_put(ctrl);
-        return -EIO;
+        err = -EIO;
+        goto fail_ida;
     }
     ctrl->dmabuf_supported = 1;
 #elif defined(UGDS_HAVE_DMABUF)
@@ -766,7 +792,8 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
             pci_disable_device(dev);
             pci_release_region(dev, 0);
             ctrl_put(ctrl);
-            return -EIO;
+            err = -EIO;
+            goto fail_ida;
         }
         printk(KERN_WARNING DRIVER_NAME " using 32-bit DMA mask\n");
     }
@@ -779,8 +806,11 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
      * initialized controller. */
     ctrl_publish(&ctrl_list, ctrl);
 
-    ++curr_ctrls;
     return 0;
+
+fail_ida:
+    ida_free(&ctrl_ida, ctrl_num);
+    return err;
 }
 
 
@@ -803,10 +833,19 @@ static void remove_pci_dev(struct pci_dev* dev)
         return;
     }
 
-    /* 1. Unpublish: new opens can no longer find this controller.
-     *    (list_remove takes the list spinlock -- same lock domain as
-     *    ctrl_find_and_get_by_inode.) */
-    list_remove(&ctrl->list);
+    /* 1. Unpublish: mark dying under list spinlock, then remove from list.
+     *    dev_open checks dying atomically so it cannot miss removal. */
+    spin_lock(&ctrl_list.lock);
+    WRITE_ONCE(ctrl->dying, true);
+    if (likely(ctrl->list.list != NULL && &ctrl->list != &ctrl->list.list->head))
+    {
+        ctrl->list.prev->next = ctrl->list.next;
+        ctrl->list.next->prev = ctrl->list.prev;
+        ctrl->list.list = NULL;
+        ctrl->list.next = NULL;
+        ctrl->list.prev = NULL;
+    }
+    spin_unlock(&ctrl_list.lock);
 
     /* 2. Device node disappears. */
     ctrl_chrdev_remove(ctrl);
@@ -843,7 +882,7 @@ static void remove_pci_dev(struct pci_dev* dev)
 
     /* 5. All DMA on this controller is now unmapped, satisfying the
      *    DMA API contract before the device goes away. */
-    --curr_ctrls;
+    ida_free(&ctrl_ida, ctrl->number);
     pci_release_region(dev, 0);
     pci_clear_master(dev);
     pci_disable_device(dev);

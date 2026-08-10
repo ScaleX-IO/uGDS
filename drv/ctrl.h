@@ -42,6 +42,7 @@ struct ctrl
     struct cdev*        cdev;       /* Character device (cdev_alloc'd) */
     struct device*      chrdev;     /* Character device handle */
     bool                dmabuf_supported; /* 64-bit DMA mask established */
+    bool                dying;      /* Set in remove_pci_dev, checked in dev_open */
 
     struct ugds_irq_state* irq;     /* Opaque; managed by irq.c */
 };
