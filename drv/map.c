@@ -573,7 +573,7 @@ struct map* map_device_memory(const struct ctrl* ctrl, u64 vaddr, unsigned long 
 
 /* - AMD HIP / DMA-buf backend ------------------ */
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
 #include <linux/dma-buf.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-resv.h>
@@ -587,28 +587,13 @@ struct dmabuf_region
 
 
 /*
- * move_notify callback -- called by the exporter if it needs to move the buffer.
- * With dma_buf_pin() held for the mapping lifetime, the exporter cannot move
- * the buffer, so this callback should never fire. If it does, we set the
- * invalid flag. The setup-time check in pci.c returns -EIO if invalid is
- * set before addresses are copied to userspace.
+ * We intentionally do NOT provide move_notify / invalidate_mappings.
+ * The buffer is pinned (dma_buf_pin) for the entire mapping lifetime,
+ * so the exporter cannot move it. If the kernel ever requires this
+ * callback, the attachment will fail at dma_buf_attach time.
  */
-static void ugds_dmabuf_move_notify(struct dma_buf_attachment* attachment)
-{
-    struct map* map = (struct map*) attachment->importer_priv;
-
-    if (map)
-    {
-        atomic_set(&map->invalid, 1);
-        WARN_ONCE(1, "uGDS: dmabuf move_notify -- mapping %llx invalidated. "
-                     "Pinned VRAM must not migrate.\n", map->vaddr);
-    }
-}
-
-
 static const struct dma_buf_attach_ops ugds_dmabuf_attach_ops = {
     .allow_peer2peer = true,
-    .move_notify     = ugds_dmabuf_move_notify,
 };
 
 
@@ -744,8 +729,9 @@ static int map_dmabuf_memory(struct map* map, int dmabuf_fd,
     dr->dmabuf = dma_buf_get(dmabuf_fd);
     if (IS_ERR(dr->dmabuf))
     {
+        int ret = PTR_ERR(dr->dmabuf);
         kfree(dr);
-        return PTR_ERR(dr->dmabuf);
+        return ret;
     }
 
     /* Cross-check requested range against actual dma-buf size.
@@ -766,9 +752,10 @@ static int map_dmabuf_memory(struct map* map, int dmabuf_fd,
                                              &ugds_dmabuf_attach_ops, map);
     if (IS_ERR(dr->attachment))
     {
+        int ret = PTR_ERR(dr->attachment);
         dma_buf_put(dr->dmabuf);
         kfree(dr);
-        return PTR_ERR(dr->attachment);
+        return ret;
     }
 
     /*

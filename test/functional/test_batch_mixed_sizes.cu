@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_buf, total);
     if (!d_buf) TEST_FAIL("cudaMalloc failed");
 
-    st = uGDSBufRegister(d_buf, total, 0);
+    st = uGDSBufRegister(d_buf, total, TEST_BUF_FLAGS);
     ASSERT_OK(st, "BufRegister");
 
     // Step 1: sync-write each region with a distinct pattern

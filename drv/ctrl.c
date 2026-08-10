@@ -49,6 +49,7 @@ struct ctrl* ctrl_get(struct class* cls, struct pci_dev* pdev, int number)
     ctrl->cls = cls;
     ctrl->cdev = NULL;
     ctrl->chrdev = NULL;
+    ctrl->dmabuf_supported = 0;
 
     ctrl->irq = NULL;
 

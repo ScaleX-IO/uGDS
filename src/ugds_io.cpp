@@ -1,6 +1,7 @@
 #include "ugds_internal.h"
 
 #include <cstring>
+#include <cstdio>
 #include <cerrno>
 #include <atomic>
 #include <algorithm>
@@ -112,17 +113,30 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         std::lock_guard<std::mutex> drv_lock(g_driver.lock);
         auto it = g_driver.buf_registry.find(bufPtr_base);
         if (it != g_driver.buf_registry.end()) {
-            buf_dma = it->second;
+            buf_dma = it->second.dma;
+            it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
         }
     }
 
     if (buf_dma != nullptr) {
         if ((static_cast<size_t>(bufPtr_offset) % page_size) != 0) {
+            std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+            auto it = g_driver.buf_registry.find(bufPtr_base);
+            if (it != g_driver.buf_registry.end())
+                it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
             return -EINVAL;
         }
         buf_page_start = static_cast<size_t>(bufPtr_offset) / page_size;
-        size_t total_pages_needed = buf_page_start + (size + page_size - 1) / page_size;
-        if (total_pages_needed > buf_dma->n_ioaddrs) {
+        /* Overflow-safe bounds check: compute pages_needed separately,
+         * then verify buf_page_start + pages_needed <= n_ioaddrs
+         * without risking wrap. */
+        size_t pages_needed = (size - 1) / page_size + 1;
+        if (pages_needed > buf_dma->n_ioaddrs ||
+            buf_page_start > buf_dma->n_ioaddrs - pages_needed) {
+            std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+            auto it = g_driver.buf_registry.find(bufPtr_base);
+            if (it != g_driver.buf_registry.end())
+                it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
             return -EINVAL;
         }
     } else {
@@ -161,12 +175,20 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
     IOQueuePair& qp = *hs->qps[qp_idx];
 
     ssize_t result = 0;
+    bool timed_out = false;
     size_t bytes_done = 0;
     uint64_t current_lba = start_lba;
     size_t current_page = buf_page_start;
 
     {
         std::lock_guard<std::mutex> qp_lock(qp.lock);
+
+        /* Re-check wedged after acquiring QP lock: a previous
+         * operation may have timed out while we waited. */
+        if (hs->wedged.load(std::memory_order_acquire)) {
+            result = -EBADF;
+            goto out;
+        }
 
         while (bytes_done < size) {
             size_t remaining = size - bytes_done;
@@ -230,6 +252,10 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             nvm_cpl_t* cpl = wait_for_completion(hs, qp);
             if (cpl == nullptr) {
                 result = -EIO;
+                timed_out = true;
+                /* Mark wedged while still holding qp.lock to prevent
+                 * QP reuse before the flag is visible. */
+                hs->wedged.store(true, std::memory_order_release);
                 goto out;
             }
 
@@ -253,8 +279,20 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
     out:;
     }
 
-    if (on_the_fly && buf_dma != nullptr) {
+    if (timed_out) {
+        /* NVMe command may still be executing. wedged was set
+         * under qp.lock. Retain all resources. */
+        fprintf(stderr, "uGDS: I/O timeout -- handle wedged. "
+                "Controller reset required.\n");
+        /* Do NOT unmap on-the-fly buffer or release in-flight ref. */
+    } else if (on_the_fly && buf_dma != nullptr) {
         nvm_dma_unmap(buf_dma);
+    } else if (buf_dma != nullptr) {
+        /* Registered buffer: release in-flight reference. */
+        std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+        auto it = g_driver.buf_registry.find(bufPtr_base);
+        if (it != g_driver.buf_registry.end())
+            it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
     }
 
     return result;
@@ -263,12 +301,24 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 extern "C" ssize_t uGDSRead(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                               off_t file_offset, off_t bufPtr_offset)
 {
-    return do_io_internal(fh, bufPtr_base, size, file_offset, bufPtr_offset, NVM_IO_READ);
+    if (fh == nullptr) return -EINVAL;
+    std::shared_ptr<HandleState> hs_sp;
+    HandleState* hs = handle_lookup(fh, &hs_sp);
+    if (!hs) return -EBADF;
+    ssize_t ret = do_io_internal(fh, bufPtr_base, size, file_offset, bufPtr_offset, NVM_IO_READ);
+    handle_release(hs);
+    return ret;
 }
 
 extern "C" ssize_t uGDSWrite(uGDSHandle_t fh, const void* bufPtr_base, size_t size,
                                off_t file_offset, off_t bufPtr_offset)
 {
-    return do_io_internal(fh, const_cast<void*>(bufPtr_base), size, file_offset, bufPtr_offset,
+    if (fh == nullptr) return -EINVAL;
+    std::shared_ptr<HandleState> hs_sp;
+    HandleState* hs = handle_lookup(fh, &hs_sp);
+    if (!hs) return -EBADF;
+    ssize_t ret = do_io_internal(fh, const_cast<void*>(bufPtr_base), size, file_offset, bufPtr_offset,
                  NVM_IO_WRITE);
+    handle_release(hs);
+    return ret;
 }

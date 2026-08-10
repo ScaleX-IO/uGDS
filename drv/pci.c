@@ -21,6 +21,7 @@
 #include <linux/mutex.h>
 #include <linux/device.h>
 #include <linux/version.h>
+#include <linux/overflow.h>
 #include <linux/uaccess.h>
 #include "irq.h"
 #include <asm/io.h>
@@ -34,8 +35,12 @@
 
 MODULE_DESCRIPTION("UserSpace-GDS NVMe DMA helper");
 MODULE_LICENSE("Dual BSD/GPL");
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("DMA_BUF");
+#else
 MODULE_IMPORT_NS(DMA_BUF);
+#endif
 #endif
 MODULE_VERSION("1.0");
 
@@ -118,6 +123,7 @@ struct map_handle
     struct map*         map;
     int                 type;           /* enum handle_type */
     u64                 vaddr;          /* Raw user address (MAP == UNMAP key) */
+    size_t              size;           /* Range size for overlap detection */
     unsigned long       n_pages;
     int                 dmabuf_fd;      /* -1 unless HANDLE_DMABUF */
     u64                 dmabuf_offset;
@@ -125,6 +131,14 @@ struct map_handle
 };
 
 
+/* Page size for a given handle type.
+ * HOST/DMABUF use the system page size; CUDA uses GPU_PAGE_SIZE (64 KiB). */
+#ifdef _CUDA
+#define GPU_PAGE_SIZE_PER_TYPE(t) \
+    ((t) == HANDLE_CUDA ? (1UL << 16) : PAGE_SIZE)
+#else
+#define GPU_PAGE_SIZE_PER_TYPE(t)  PAGE_SIZE
+#endif
 static struct map_handle* handle_find(struct ugds_file_ctx* ctx, u64 vaddr)
 {
     struct map_handle* handle;
@@ -132,6 +146,34 @@ static struct map_handle* handle_find(struct ugds_file_ctx* ctx, u64 vaddr)
     list_for_each_entry(handle, &ctx->handles, node)
     {
         if (handle->vaddr == vaddr)
+        {
+            return handle;
+        }
+    }
+
+    return NULL;
+}
+
+/* Check if a proposed [vaddr, vaddr+size) range overlaps any existing
+ * mapping. Returns the conflicting handle or NULL. */
+static struct map_handle* handle_find_overlap(struct ugds_file_ctx* ctx,
+                                               u64 vaddr, u64 size)
+{
+    struct map_handle* handle;
+
+    if (size == 0)
+        return NULL;
+
+    /* Guard against overflow in end computation */
+    if (vaddr > U64_MAX - size)
+        return (struct map_handle*)1;  /* invalid range, reject */
+
+    u64 vaddr_end = vaddr + size;
+
+    list_for_each_entry(handle, &ctx->handles, node)
+    {
+        u64 h_end = handle->vaddr + handle->size;
+        if (vaddr < h_end && vaddr_end > handle->vaddr)
         {
             return handle;
         }
@@ -325,6 +367,24 @@ static long do_map(struct ugds_file_ctx* ctx, enum handle_type type,
         goto out;
     }
 
+    /* New mapping: reject if range overlaps an existing one */
+    {
+        u64 page_sz = GPU_PAGE_SIZE_PER_TYPE(type);
+        u64 map_size;
+        if (check_mul_overflow((u64)n_pages, page_sz, &map_size))
+        {
+            retval = -EINVAL;
+            goto out;
+        }
+        if (handle_find_overlap(ctx, vaddr, map_size) != NULL)
+        {
+            printk(KERN_WARNING "uGDS: address %llx+%llu overlaps "
+                   "existing mapping\n", vaddr, map_size);
+            retval = -EEXIST;
+            goto out;
+        }
+    }
+
     switch (type)
     {
         case HANDLE_HOST:
@@ -337,8 +397,13 @@ static long do_map(struct ugds_file_ctx* ctx, enum handle_type type,
             break;
 #endif
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
         case HANDLE_DMABUF:
+            if (!ctx->ctrl->dmabuf_supported)
+            {
+                map = ERR_PTR(-EOPNOTSUPP);
+                break;
+            }
             map = map_dmabuf(ctx->ctrl, vaddr, dmabuf_fd, dmabuf_offset,
                              n_pages, ioaddrs_capacity);
             break;
@@ -403,6 +468,7 @@ static long do_map(struct ugds_file_ctx* ctx, enum handle_type type,
     handle->map = map;
     handle->type = (int) type;
     handle->vaddr = vaddr;
+    handle->size = (size_t)n_pages * GPU_PAGE_SIZE_PER_TYPE(type);
     handle->n_pages = n_pages;
     handle->dmabuf_fd = dmabuf_fd;
     handle->dmabuf_offset = dmabuf_offset;
@@ -488,7 +554,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
                           (void __user*) request.ioaddrs, SIZE_MAX);
 #endif
 
-#ifdef _HIP
+#if defined(UGDS_HAVE_DMABUF)
         case NVM_MAP_DMABUF_MEMORY:
         {
             struct nvm_ioctl_dmabuf dreq;
@@ -534,6 +600,9 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
                           (void __user*)(uintptr_t) dreq.ioaddrs,
                           dreq.ioaddrs_capacity);
         }
+#else
+        case NVM_MAP_DMABUF_MEMORY:
+            return -EOPNOTSUPP;
 #endif
 
         case NVM_UNMAP_MEMORY:
@@ -660,6 +729,30 @@ static int add_pci_dev(struct pci_dev* dev, const struct pci_device_id* id)
         pci_release_region(dev, 0);
         ctrl_put(ctrl);
         return -EIO;
+    }
+    ctrl->dmabuf_supported = 1;
+#elif defined(UGDS_HAVE_DMABUF)
+    /* CUDA dmabuf: try 64-bit DMA, fall back to 32-bit.
+     * dmabuf export is disabled if 64-bit DMA fails. */
+    if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64)))
+    {
+        if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(32)))
+        {
+            printk(KERN_ERR DRIVER_NAME " failed to set DMA mask\n");
+            pci_clear_master(dev);
+            ctrl_chrdev_remove(ctrl);
+            pci_disable_device(dev);
+            pci_release_region(dev, 0);
+            ctrl_put(ctrl);
+            return -EIO;
+        }
+        printk(KERN_WARNING DRIVER_NAME " using 32-bit DMA mask "
+               "(dmabuf export disabled)\n");
+        ctrl->dmabuf_supported = 0;
+    }
+    else
+    {
+        ctrl->dmabuf_supported = 1;
     }
 #else
     /* Default CUDA: try 64-bit, fall back to 32-bit. */

@@ -71,7 +71,7 @@ int main(int argc, char** argv)
     {
         void* d_buf;
         cudaMalloc(&d_buf, 65536);
-        ASSERT_OK(uGDSBufRegister(d_buf, 65536, 0), "BufRegister");
+        ASSERT_OK(uGDSBufRegister(d_buf, 65536, TEST_BUF_FLAGS), "BufRegister");
 
         ssize_t bytes = 0;
         uGDSError_t st = uGDSReadAsync(fh, d_buf, &size, &file_off, &buf_off,

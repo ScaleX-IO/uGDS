@@ -9,21 +9,21 @@
   #define cudaFree              hipFree
   #define cudaMemcpy           hipMemcpy
   #define cudaMemset            hipMemset
+  #define cudaMemsetAsync       hipMemsetAsync
   #define cudaSetDevice         hipSetDevice
   #define cudaDeviceSynchronize hipDeviceSynchronize
   #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
   #define cudaSuccess           hipSuccess
   #define cudaError_t           hipError_t
   #define cudaGetErrorString    hipGetErrorString
-  #define cudaStreamSynchronize hipStreamSynchronize
+  #define cudaStream_t          hipStream_t
   #define cudaStreamCreate      hipStreamCreate
   #define cudaStreamDestroy     hipStreamDestroy
-  #define cudaMemsetAsync       hipMemsetAsync
+  #define cudaStreamSynchronize hipStreamSynchronize
   #define cudaHostAlloc         hipHostMalloc
   #define cudaHostAllocDefault  hipHostMallocDefault
   #define cudaFreeHost          hipHostFree
   #define cudaLaunchHostFunc    hipLaunchHostFunc
-  #define cudaStream_t          hipStream_t
   /* HIP builds must use dmabuf path */
   #define TEST_BUF_FLAGS  UGDS_REGISTER_DMABUF
 #else

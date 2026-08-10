@@ -54,4 +54,33 @@ int _nvm_dma_init(nvm_dma_t** handle,
 const struct va_range* _nvm_dma_va(const nvm_dma_t* handle);
 
 
+/*
+ * Set dmabuf metadata on a DMA handle's internal map.
+ * Called by linux_dma.cpp AFTER the retain/close decision.
+ */
+int _nvm_dma_set_dmabuf_info(nvm_dma_t* handle,
+                              int fd, uint64_t offset, size_t length);
+
+/*
+ * Tag a DMA handle as originating from the HIP/dmabuf path.
+ * Called after _nvm_dma_init for HIP mappings, regardless of
+ * whether the dmabuf fd was retained or closed.
+ */
+void _nvm_dma_set_hip_origin(nvm_dma_t* handle);
+
+/*
+ * Retrieve dmabuf metadata from a DMA handle (internal only).
+ * Returns 0 on success, -1 if handle is not dmabuf-backed.
+ * Does NOT dup() -- returns internal fd. Callers must NOT close it.
+ */
+int nvm_dma_get_dmabuf_info(const nvm_dma_t* handle,
+                             int* out_fd, uint64_t* out_offset, size_t* out_length);
+
+/*
+ * Query whether a DMA handle was created through the HIP/dmabuf path.
+ * Returns true even if the fd was closed after kernel import.
+ * Used by dual-backend dispatch to select the correct async launch.
+ */
+bool nvm_dma_is_hip_origin(const nvm_dma_t* handle);
+
 #endif /* __NVM_INTERNAL_DMA_H__ */

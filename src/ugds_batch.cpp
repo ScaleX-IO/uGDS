@@ -6,6 +6,17 @@
 #include <algorithm>
 #include <atomic>
 #include <time.h>
+#include <cstdio>
+
+/* Release in-flight reference held by batch submit.
+ * Called on validation failure or when batch entry completes. */
+static void async_release_inflight_batch(void* devPtr_base)
+{
+    std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+    auto it = g_driver.buf_registry.find(devPtr_base);
+    if (it != g_driver.buf_registry.end())
+        it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+}
 
 static void cleanup_prp_pool(BatchState* bs)
 {
@@ -64,6 +75,8 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
         }
         entry.error_code = entry.bytes_done;
         bs->n_completed++;
+        /* Release in-flight reference when all sub-commands complete */
+        async_release_inflight_batch(entry.devPtr_base);
     }
 
     return true;
@@ -92,23 +105,34 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
     if (nr == 0 || nr > UGDS_MAX_BATCH_IO_SIZE)
         return make_error(UGDS_INVALID_VALUE);
 
-    HandleState* hs = static_cast<HandleState*>(fh);
+    /* Look up handle via global registry to safely acquire a shared_ptr.
+     * This prevents UAF if HandleDeregister races with us. */
+    std::shared_ptr<HandleState> hs_sp;
+    HandleState* hs = handle_lookup(fh, &hs_sp);
+    if (!hs)
+        return make_error(UGDS_INVALID_VALUE);
 
-    if (!hs->batch_qp)
+    if (!hs->batch_qp) {
+        handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
+    }
 
     bool expected = false;
-    if (!hs->batch_active.compare_exchange_strong(expected, true))
+    if (!hs->batch_active.compare_exchange_strong(expected, true)) {
+        handle_release(hs);
         return make_error(UGDS_INVALID_VALUE);
+    }
 
     auto bs = new (std::nothrow) BatchState();
     if (!bs) {
         hs->batch_active.store(false);
+        handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
     }
 
     bs->capacity = nr;
     bs->hs = hs;
+    bs->hs_sp = std::move(hs_sp);  /* keep handle alive for batch lifetime */
     bs->entries.resize(nr);
     bs->cmd_map.resize(hs->batch_queue_depth);
 
@@ -119,6 +143,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
     if (posix_memalign(&pool.buf, 4096, pool_bytes) != 0) {
         delete bs;
         hs->batch_active.store(false);
+        handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
     }
     std::memset(pool.buf, 0, pool_bytes);
@@ -129,6 +154,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         pool.buf = nullptr;
         delete bs;
         hs->batch_active.store(false);
+        handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
     }
     pool.n_pages = UGDS_PRP_POOL_PAGES;
@@ -136,6 +162,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         ? ~0ULL : (1ULL << UGDS_PRP_POOL_PAGES) - 1;
 
     *batch = static_cast<uGDSBatchHandle_t>(bs);
+
     return UGDS_OK;
 }
 
@@ -147,6 +174,10 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
 
     BatchState* bs = static_cast<BatchState*>(batch);
     std::lock_guard<std::mutex> batch_lock(bs->lock);
+
+    if (bs->hs->wedged.load(std::memory_order_acquire) ||
+        bs->hs->closing.load(std::memory_order_acquire))
+        return make_error(UGDS_BUSY);
 
     if (bs->n_entries > 0 && bs->n_events_read == bs->n_entries) {
         bs->n_entries = 0;
@@ -195,8 +226,11 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         entry.n_cmds_done = 0;
         entry.event_returned = false;
 
-        size_t n_cmds = (p.size + max_xfer - 1) / max_xfer;
-        if (n_cmds == 0) n_cmds = 1;
+        /* Overflow-safe ceil division for n_cmds */
+        size_t n_cmds = (p.size - 1) / max_xfer + 1;
+        if (n_cmds > UINT16_MAX) {
+            return make_error(UGDS_INVALID_VALUE);
+        }
         entry.n_cmds = static_cast<uint16_t>(n_cmds);
     }
 
@@ -224,8 +258,13 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         {
             std::lock_guard<std::mutex> drv_lock(g_driver.lock);
             auto it = g_driver.buf_registry.find(entry.devPtr_base);
-            if (it != g_driver.buf_registry.end())
-                buf_dma = it->second;
+            if (it != g_driver.buf_registry.end()) {
+                buf_dma = it->second.dma;
+                /* Hold in-flight reference until batch completions are drained
+                 * or destroy finishes. Prevents Deregister from unmapping
+                 * while batch commands retain PRPs from this buffer. */
+                it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
+            }
         }
 
         if (buf_dma == nullptr) {
@@ -243,18 +282,21 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             entry.n_cmds = 0;
             entry.n_cmds_done = 0;
             bs->n_completed++;
+            async_release_inflight_batch(entry.devPtr_base);
             continue;
         }
         buf_page_start = static_cast<size_t>(entry.devPtr_offset) / page_size;
 
-        size_t total_pages_needed = buf_page_start +
-            (entry.size + page_size - 1) / page_size;
-        if (total_pages_needed > buf_dma->n_ioaddrs) {
+        /* Overflow-safe bounds check */
+        size_t batch_pages_needed = (entry.size - 1) / page_size + 1;
+        if (batch_pages_needed > buf_dma->n_ioaddrs ||
+            buf_page_start > buf_dma->n_ioaddrs - batch_pages_needed) {
             entry.status = UGDS_BATCH_FAILED;
             entry.error_code = -EINVAL;
             entry.n_cmds = 0;
             entry.n_cmds_done = 0;
             bs->n_completed++;
+            async_release_inflight_batch(entry.devPtr_base);
             continue;
         }
 
@@ -296,6 +338,20 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                     while ((pidx = prp_pool_alloc(&bs->prp_pool)) < 0) {
                         if (!drain_one_completion(qp, bs)) {
                             if (++spins > max_spins) {
+                                /* Release in_flight refs only for entries
+                                 * that are still WAITING (ref acquired but
+                                 * not yet submitted). PENDING entries have
+                                 * commands in the SQ -- keep ref until drain.
+                                 * COMPLETE entries were already released by
+                                 * drain_one_completion. FAILED already done. */
+                                for (unsigned i = 0; i < nr; ++i) {
+                                    BatchIOEntry& e = bs->entries[base + i];
+                                    if (e.status == UGDS_BATCH_WAITING) {
+                                        async_release_inflight_batch(e.devPtr_base);
+                                        e.status = UGDS_BATCH_FAILED;
+                                        e.n_cmds = 0;
+                                    }
+                                }
                                 bs->n_entries += nr;
                                 return make_error(UGDS_INTERNAL_ERROR);
                             }
@@ -323,6 +379,15 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                     } else if (++spins > max_spins) {
                         if (prp_idx != UINT16_MAX)
                             prp_pool_free(&bs->prp_pool, prp_idx);
+                        /* Release in_flight refs only for WAITING entries. */
+                        for (unsigned i = 0; i < nr; ++i) {
+                            BatchIOEntry& e = bs->entries[base + i];
+                            if (e.status == UGDS_BATCH_WAITING) {
+                                async_release_inflight_batch(e.devPtr_base);
+                                e.status = UGDS_BATCH_FAILED;
+                                e.n_cmds = 0;
+                            }
+                        }
                         bs->n_entries += nr;
                         return make_error(UGDS_INTERNAL_ERROR);
                     } else {
@@ -336,6 +401,15 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                 if (cmd == nullptr) {
                     if (prp_idx != UINT16_MAX)
                         prp_pool_free(&bs->prp_pool, prp_idx);
+                    /* Release in_flight refs only for WAITING entries. */
+                    for (unsigned i = 0; i < nr; ++i) {
+                        BatchIOEntry& e = bs->entries[base + i];
+                        if (e.status == UGDS_BATCH_WAITING) {
+                            async_release_inflight_batch(e.devPtr_base);
+                            e.status = UGDS_BATCH_FAILED;
+                            e.n_cmds = 0;
+                        }
+                    }
                     bs->n_entries += nr;
                     return make_error(UGDS_INTERNAL_ERROR);
                 }
@@ -478,7 +552,56 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
         }
     }
 
+    /* Best-effort: release in-flight references for entries that were
+     * submitted but never fully completed (e.g., submit phase-3 early
+     * return). Check n_cmds_done < n_cmds rather than status alone.
+     *
+     * IMPORTANT: do NOT release refs for entries that have commands
+     * still outstanding in the NVMe SQ (bs->in_flight > 0 after drain).
+     * Those commands may still DMA. Leaking the refs (blocking
+     * deregister) is strictly safer than freeing mappings while the
+     * device may still access them. The caller should reset the
+     * controller if truly stuck. */
+    if (bs->in_flight == 0) {
+        for (unsigned i = 0; i < bs->n_entries; ++i) {
+            BatchIOEntry& entry = bs->entries[i];
+            if (entry.n_cmds > 0 && entry.n_cmds_done < entry.n_cmds) {
+                async_release_inflight_batch(entry.devPtr_base);
+                entry.status = UGDS_BATCH_FAILED;
+            }
+        }
+    } else {
+        /* Commands still in flight after drain timeout.
+         * The NVMe device may still DMA through the PRP list and CQ,
+         * so we must NOT: free the PRP pool, release handle ref,
+         * delete the batch state, or clear batch_active.
+         *
+         * Keeping batch_active=true prevents a new BatchIOSetUp from
+         * reusing the same QP while old completions may still arrive.
+         * Keeping the handle ref prevents HandleDeregister from freeing
+         * the QP while DMA is in progress.
+         *
+         * This wedges the handle until the caller resets the controller.
+         * BatchIODestroy is void so the caller cannot detect this --
+         * the warning is the only signal. This is the safest option:
+         * a wedged handle is strictly better than DMA-after-unmap. */
+        fprintf(stderr, "uGDS: BatchIODestroy: %u commands still in "
+                "flight after drain timeout -- handle is now wedged "
+                "to prevent DMA-after-unmap. Controller reset required.\n",
+                bs->in_flight);
+        hs->wedged.store(true, std::memory_order_release);
+        return;
+    }
+
     cleanup_prp_pool(bs);
+
+    /* Mark batch inactive before releasing handle ref.
+     * HandleDeregister waits on handle_in_flight==0, so we must not
+     * touch hs after release. */
     hs->batch_active.store(false);
+
+    /* Release handle reference acquired in BatchIOSetUp */
+    handle_release(hs);
+
     delete bs;
 }
