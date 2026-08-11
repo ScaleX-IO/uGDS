@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <new>
+#include <cassert>
 
 /* RAII guard for a device DMA mapping.
  * Arms nvm_dma_unmap on construction (or explicit arm()); disarm() must
@@ -81,6 +82,16 @@ extern "C" uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, i
         MappedDmaGuard map_guard(dma);
         uGDSBackend_t backend =
             nvm_dma_is_hip_origin(dma) ? UGDS_BACKEND_HIP : UGDS_BACKEND_CUDA;
+
+        /* Post-map debug invariant: verify zero displacement so that
+         * dma->ioaddrs[0] corresponds to the exact registered base.
+         * A future mapping path that introduces displacement would
+         * silently corrupt PRP construction. */
+#ifndef NDEBUG
+        if (dma->n_ioaddrs > 0) {
+            assert((dma->ioaddrs[0] % mps) == 0);
+        }
+#endif
 
         /* try_emplace builds the BufEntry in place; if it throws bad_alloc
          * the mapping is still owned by map_guard and gets unmapped. */
