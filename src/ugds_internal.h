@@ -80,6 +80,20 @@ struct HandleState {
     std::unique_ptr<IOQueuePairHuge> batch_qp;
     uint16_t                    batch_queue_depth;
     std::atomic<bool>           batch_active{false};
+    /* Owning recovery link to the active batch.  Together with
+     * batch_active and batch_setting_up it forms one link-state machine
+     * whose every transition happens inside a g_driver.lock critical
+     * section.  Set by BatchIOSetUp publication; detached by exactly one
+     * of the successful-destroy link transaction or the force-deregister
+     * walk. */
+    std::shared_ptr<struct BatchState> active_batch;
+    /* True while a BatchIOSetUp that passed the setup gate (closing check
+     * + batch_active CAS, one g_driver.lock section) has not yet committed
+     * or rolled back.  Only the gate winner can set it; only that call
+     * clears it (at publication, or as the LAST rollback action).  Written
+     * only under g_driver.lock; read lock-free by force teardown, which
+     * drains it to false before freeing any host-side QP/controller. */
+    std::atomic<bool>           batch_setting_up{false};
     bool                        interrupt_mode = false;  /* UGDS_INTERRUPT_MODE */
     std::atomic<bool>           wedged{false};          /* batch timeout: handle poisoned, controller reset required */
     std::atomic<uint32_t>       handle_in_flight{0};  /* IO refcount for safe deregister */
@@ -210,6 +224,31 @@ struct BatchIOEntry {
     uint16_t            n_cmds        = 0;
     uint16_t            n_cmds_done   = 0;
     bool                event_returned = false;
+
+    /* SGL/lifecycle extensions */
+    uint8_t             kind          = 0;  /* BatchEntryKind: 0=PLAIN, 1=VECTORED */
+    uint32_t            seg_begin     = 0;  /* arena range start; valid iff VECTORED */
+    uint32_t            seg_count     = 0;  /* number of segments in this entry */
+    bool                refs_held     = false;  /* true while in-flight ref is held */
+    bool                release_queued = false; /* true iff index is in release_scratch */
+    uint16_t            n_cmds_submitted = 0;  /* successfully enqueued sub-commands */
+};
+
+/* Batch entry kind: plain (single buffer) or vectored (scatter-gather). */
+enum BatchEntryKind : uint8_t {
+    BATCH_ENTRY_PLAIN    = 0,
+    BATCH_ENTRY_VECTORED = 1,
+};
+
+/* Batch lifecycle states (under bs->lock).
+ * ACTIVE   -- normal operation; the public one-shot Destroy is available.
+ * WEDGED   -- Destroy could not drain; one-shot Destroy was consumed.
+ *             Force teardown drops self (no cycle retained).
+ * TORN_DOWN-- all resources released; any further API call is a no-op. */
+enum BatchLifecycle : uint8_t {
+    BATCH_LIFECYCLE_ACTIVE    = 0,
+    BATCH_LIFECYCLE_WEDGED    = 1,
+    BATCH_LIFECYCLE_TORN_DOWN = 2,
 };
 
 struct BatchState {
@@ -226,6 +265,23 @@ struct BatchState {
     HandleState* hs = nullptr;
     std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive for batch lifetime */
     std::mutex   lock;
+
+    /* Deferred-release scratch: entry indices whose registry refs must be
+     * dropped after qp.lock is released.  Fixed-size, resized to capacity
+     * at SetUp.  Written by index only under bs->lock; drained in one
+     * g_driver.lock hold after qp.lock drops.  release_queued on each
+     * BatchIOEntry is the authoritative membership bit. */
+    std::vector<uint32_t> release_scratch;
+    uint32_t              n_release_pending = 0;
+
+    BatchLifecycle       lifecycle = BATCH_LIFECYCLE_ACTIVE;
+
+    /* Public-handle ownership: the reference held on behalf of the user's
+     * uGDSBatchHandle_t.  Accessed only under bs->lock.  Moved out -- never
+     * reset in place -- at successful destroy, tombstone destroy, or
+     * WEDGED-force cleanup, via the pin rule.  The object is destroyed when
+     * the last reference (self, active_batch link, or transient pin) drops. */
+    std::shared_ptr<BatchState> self;
 };
 
 static inline uGDSError_t make_error(uGDSOpError err) {
