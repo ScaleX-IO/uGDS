@@ -140,8 +140,15 @@ void uGDSHandleDeregister(uGDSHandle_t fh);
  * timeout_sec == -1 means infinite wait (equivalent to uGDSHandleDeregister).
  * timeout_sec < -1 means after-reset teardown: release resources retained
  * by timed-out I/O, skip wedged/in-flight checks, and free all resources.
- * The caller must guarantee that no NVMe command is still executing (e.g.
- * after a controller reset). */
+ *
+ * Force contract (timeout_sec < -1): before calling this function the
+ * caller MUST quiesce ALL host API calls and callbacks associated with
+ * this handle -- not only NVMe commands, but every uGDSRead/uGDSWrite,
+ * uGDSReadv/uGDSWritev, batch, and async operation that has passed
+ * handle_lookup, plus every async callback already enqueued on a
+ * stream. No such call may execute or resume concurrently with force
+ * teardown. After force returns, the handle is fully invalid and no
+ * API may use it. The caller must have already reset the controller. */
 uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec);
 
 uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int flags);
