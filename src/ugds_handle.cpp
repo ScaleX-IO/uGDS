@@ -11,6 +11,9 @@
 #include <unistd.h>
 #include <time.h>
 
+/* Forward declaration: cleanup_prp_pool is defined in ugds_batch.cpp. */
+extern void cleanup_prp_pool(BatchState* bs);
+
 static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp, int dev_fd) {
     if (qp->sq_dma) {
         nvm_admin_sq_delete(aq_ref, &qp->sq, &qp->cq);
@@ -54,11 +57,14 @@ static void cleanup_timeout_resources(HandleState* hs) {
         IOQueuePair& qp = *qp_ptr;
         nvm_dma_t* timeout_dma = nullptr;
         SglRefOwner timeout_refs;
+        const void* timeout_registered_base = nullptr;
         {
             std::lock_guard<std::mutex> qp_lock(qp.lock);
             timeout_dma = qp.timeout_dma;
             timeout_refs = std::move(qp.timeout_refs);
+            timeout_registered_base = qp.timeout_registered_base;
             qp.timeout_dma = nullptr;
+            qp.timeout_registered_base = nullptr;
         }
 
         if (timeout_dma != nullptr)
@@ -66,6 +72,14 @@ static void cleanup_timeout_resources(HandleState* hs) {
 
         /* SglRefOwner destructor releases in_flight refs under
          * g_driver.lock; the move left timeout_refs non-empty. */
+
+        /* Legacy scalar registered-buffer ref parked on timeout. */
+        if (timeout_registered_base != nullptr) {
+            std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+            auto it = g_driver.buf_registry.find(timeout_registered_base);
+            if (it != g_driver.buf_registry.end())
+                it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        }
     }
 }
 
@@ -533,6 +547,65 @@ extern "C" uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec)
             hs->closing.store(false, std::memory_order_release);
             return make_error(UGDS_BUSY);
         }
+    }
+
+    if (force) {
+        while (hs->batch_setting_up.load(std::memory_order_acquire)) {
+            __builtin_ia32_pause();
+        }
+    }
+
+    /* Batch release walk: pin the owning recovery link under
+     * link under g_driver.lock, release it, then perform lifecycle-
+     * sensitive cleanup before destroying QPs/controller.
+     * batch_setting_up drain: spin-wait with no locks held until the
+     * past-gate setup either publishes (observes closing, rolls back)
+     * or fails. Bounded because setup does only host-side work. */
+    if (force) {
+        std::shared_ptr<BatchState> pin;
+        std::shared_ptr<BatchState> self_pin;
+        {
+            std::lock_guard<std::mutex> g(g_driver.lock);
+            pin = std::move(hs->active_batch);
+            /* batch_active is deliberately left true: closing blocks
+             * new setups and the handle is being destroyed. */
+        }
+        if (pin != nullptr) {
+            std::lock_guard<std::mutex> bl(pin->lock);
+            if (pin->lifecycle != BATCH_LIFECYCLE_TORN_DOWN) {
+                const bool destroy_consumed =
+                    (pin->lifecycle == BATCH_LIFECYCLE_WEDGED);
+
+                /* Release all in-flight refs for entries that still
+                 * hold them. */
+                for (unsigned i = 0; i < pin->n_entries; ++i) {
+                    BatchIOEntry& entry = pin->entries[i];
+                    if (entry.refs_held) {
+                        std::lock_guard<std::mutex> drv(g_driver.lock);
+                        auto it = g_driver.buf_registry.find(entry.devPtr_base);
+                        if (it != g_driver.buf_registry.end())
+                            it->second.in_flight.fetch_sub(1,
+                                std::memory_order_acq_rel);
+                        entry.refs_held = false;
+                        entry.release_queued = false;
+                    }
+                }
+                pin->n_release_pending = 0;
+
+                cleanup_prp_pool(pin.get());
+                pin->lifecycle = BATCH_LIFECYCLE_TORN_DOWN;
+                handle_release(hs);
+
+                if (destroy_consumed) {
+                    /* WEDGED: no public Destroy remains; transfer self
+                     * under lock, never reset in place (pin rule). */
+                    self_pin = std::move(pin->self);
+                }
+                /* ACTIVE: retain self as tombstone for the still-
+                 * available one-shot Destroy. */
+            }
+        }
+        /* bl and g unlock; pin/self_pin drop here. */
     }
 
     if (force)

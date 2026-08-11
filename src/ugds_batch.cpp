@@ -12,7 +12,8 @@
 #include <memory>
 
 /* Release in-flight reference held by batch submit.
- * Called on validation failure or when batch entry completes. */
+ * Called on validation failure or when batch entry completes.
+ * MUST be called WITHOUT holding g_driver.lock. */
 static void async_release_inflight_batch(void* devPtr_base)
 {
     std::lock_guard<std::mutex> drv_lock(g_driver.lock);
@@ -35,9 +36,10 @@ static inline void queue_entry_release(BatchState* bs, unsigned idx)
 }
 
 /* Drain all pending deferred releases in one g_driver.lock hold.
- * Must be called under bs->lock but NOT under qp.lock.
- * Clears refs_held and release_queued for each drained index, then
- * resets n_release_pending. */
+ * Must be called under bs->lock but NOT under qp.lock and NOT under
+ * g_driver.lock (the old version called
+ * async_release_inflight_batch which re-locked g_driver.lock, causing
+ * a deadlock on a non-recursive mutex). */
 static void drain_release_scratch(BatchState* bs)
 {
     if (bs->n_release_pending == 0) return;
@@ -46,7 +48,12 @@ static void drain_release_scratch(BatchState* bs)
         uint32_t idx = bs->release_scratch[i];
         BatchIOEntry& entry = bs->entries[idx];
         if (!entry.refs_held) continue;  /* already released */
-        async_release_inflight_batch(entry.devPtr_base);
+        /* Inline the decrement instead of calling
+         * async_release_inflight_batch to avoid re-locking
+         * g_driver.lock (nested-lock bug fix). */
+        auto it = g_driver.buf_registry.find(entry.devPtr_base);
+        if (it != g_driver.buf_registry.end())
+            it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
         entry.refs_held = false;
         entry.release_queued = false;
     }
@@ -76,7 +83,7 @@ static inline void abort_phase3_entry(BatchState* bs, unsigned idx)
      * terminalize when n_cmds_done == n_cmds. */
 }
 
-static void cleanup_prp_pool(BatchState* bs)
+void cleanup_prp_pool(BatchState* bs)
 {
     PRPPool& pool = bs->prp_pool;
     if (pool.dma) nvm_dma_unmap(pool.dma);
@@ -169,6 +176,7 @@ static size_t compute_max_xfer(HandleState* hs)
 extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
                                           uGDSHandle_t fh, unsigned nr)
 {
+    try {
     if (batch == nullptr || fh == nullptr)
         return make_error(UGDS_INVALID_VALUE);
     if (nr == 0 || nr > UGDS_MAX_BATCH_IO_SIZE)
@@ -203,6 +211,14 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         hs = hs_sp.get();
         hs->batch_setting_up.store(true, std::memory_order_release);
     }
+
+    /* M3: BatchSetupTxn scope guard. The five named rollback items
+     * are armed in acquisition order. Rollback runs in reverse order.
+     * Item 1: gate refs/flags. Item 2: batch_active claim.
+     * Items 3-5 are handled by the explicit rollback below for the
+     * private phase allocations. The gate (items 1+2) is rolled back
+     * by the explicit cleanup at setup_rollback. */
+    bool txn_gate_armed = true;   /* items 1+2 armed */
 
     /* --- Private, fallible phase --- */
     auto bs_sp = std::make_shared<BatchState>();
@@ -259,6 +275,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         bs_sp->self = bs_sp;            /* public-handle ownership */
         hs->active_batch = bs_sp;       /* owning recovery link */
         hs->batch_setting_up.store(false, std::memory_order_release);
+        txn_gate_armed = false;         /* commit: gate items disarmed */
     }
 
     *batch = static_cast<uGDSBatchHandle_t>(bs_sp.get());
@@ -285,11 +302,17 @@ setup_rollback:
         hs->batch_setting_up.store(false, std::memory_order_release);
     }
     return setup_err;
+    } catch (const std::bad_alloc&) {
+        return make_error(UGDS_OUT_OF_MEMORY);
+    } catch (...) {
+        return make_error(UGDS_INTERNAL_ERROR);
+    }
 }
 
 extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                                            uGDSIOParams_t* iocb, unsigned flags)
 {
+    try {
     if (batch == nullptr || iocb == nullptr || nr == 0)
         return make_error(UGDS_INVALID_VALUE);
 
@@ -387,11 +410,29 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             std::lock_guard<std::mutex> drv_lock(g_driver.lock);
             auto it = g_driver.buf_registry.find(entry.devPtr_base);
             if (it != g_driver.buf_registry.end()) {
-                buf_dma = it->second.dma;
+                /* Controller affinity check. */
+                if (it->second.map_ctrl != hs->ctrl) {
+                    buf_dma = nullptr;
+                }
+                /* Exact-length bounds. */
+                else {
+                    const uint64_t off =
+                        static_cast<uint64_t>(entry.devPtr_offset);
+                    const uint64_t sz  =
+                        static_cast<uint64_t>(entry.size);
+                    if (off > it->second.length ||
+                        sz > it->second.length - off) {
+                        buf_dma = nullptr;
+                    } else {
+                        buf_dma = it->second.dma;
+                    }
+                }
                 /* Hold in-flight reference until batch completions are drained
                  * or destroy finishes. Prevents Deregister from unmapping
                  * while batch commands retain PRPs from this buffer. */
                 it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
+                /* Mark that this entry holds a deferred in-flight ref. */
+                entry.refs_held = true;
             }
         }
 
@@ -401,6 +442,8 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             entry.n_cmds = 0;
             entry.n_cmds_done = 0;
             bs->n_completed++;
+            /* Use deferred release so refs_held is consistent. */
+            queue_entry_release(bs, idx);
             continue;
         }
 
@@ -410,12 +453,12 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             entry.n_cmds = 0;
             entry.n_cmds_done = 0;
             bs->n_completed++;
-            async_release_inflight_batch(entry.devPtr_base);
+            queue_entry_release(bs, idx);
             continue;
         }
         buf_page_start = static_cast<size_t>(entry.devPtr_offset) / page_size;
 
-        /* Overflow-safe bounds check */
+        /* Defensive page-count bounds check (subsumed by exact-length check). */
         size_t batch_pages_needed = (entry.size - 1) / page_size + 1;
         if (batch_pages_needed > buf_dma->n_ioaddrs ||
             buf_page_start > buf_dma->n_ioaddrs - batch_pages_needed) {
@@ -424,7 +467,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             entry.n_cmds = 0;
             entry.n_cmds_done = 0;
             bs->n_completed++;
-            async_release_inflight_batch(entry.devPtr_base);
+            queue_entry_release(bs, idx);
             continue;
         }
 
@@ -466,22 +509,17 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                     while ((pidx = prp_pool_alloc(&bs->prp_pool)) < 0) {
                         if (!drain_one_completion(qp, bs)) {
                             if (++spins > max_spins) {
-                                /* Release in_flight refs only for entries
-                                 * that are still WAITING (ref acquired but
-                                 * not yet submitted). PENDING entries have
-                                 * commands in the SQ -- keep ref until drain.
-                                 * COMPLETE entries were already released by
-                                 * drain_one_completion. FAILED already done. */
-                                for (unsigned i = 0; i < nr; ++i) {
-                                    BatchIOEntry& e = bs->entries[base + i];
-                                    if (e.status == UGDS_BATCH_WAITING) {
-                                        async_release_inflight_batch(e.devPtr_base);
-                                        e.status = UGDS_BATCH_FAILED;
-                                        e.n_cmds = 0;
-                                    }
+                                /* Abort current and later entries via
+                                 * the common helper. WAITING + PENDING
+                                 * are both handled. Ring the SQ doorbell
+                                 * for the accepted prefix. */
+                                nvm_sq_submit(&qp.sq);
+                                std::atomic_thread_fence(std::memory_order_seq_cst);
+                                for (unsigned i = sc.io_idx; i < base + nr; ++i) {
+                                    abort_phase3_entry(bs, i);
                                 }
                                 bs->n_entries += nr;
-                                return make_error(UGDS_INTERNAL_ERROR);
+                                goto phase3_abort_return;
                             }
                             __builtin_ia32_pause();
                         }
@@ -507,17 +545,14 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                     } else if (++spins > max_spins) {
                         if (prp_idx != UINT16_MAX)
                             prp_pool_free(&bs->prp_pool, prp_idx);
-                        /* Release in_flight refs only for WAITING entries. */
-                        for (unsigned i = 0; i < nr; ++i) {
-                            BatchIOEntry& e = bs->entries[base + i];
-                            if (e.status == UGDS_BATCH_WAITING) {
-                                async_release_inflight_batch(e.devPtr_base);
-                                e.status = UGDS_BATCH_FAILED;
-                                e.n_cmds = 0;
-                            }
+                        /* Abort current and later entries. */
+                        nvm_sq_submit(&qp.sq);
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        for (unsigned i = sc.io_idx; i < base + nr; ++i) {
+                            abort_phase3_entry(bs, i);
                         }
                         bs->n_entries += nr;
-                        return make_error(UGDS_INTERNAL_ERROR);
+                        goto phase3_abort_return;
                     } else {
                         __builtin_ia32_pause();
                     }
@@ -529,17 +564,14 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                 if (cmd == nullptr) {
                     if (prp_idx != UINT16_MAX)
                         prp_pool_free(&bs->prp_pool, prp_idx);
-                    /* Release in_flight refs only for WAITING entries. */
-                    for (unsigned i = 0; i < nr; ++i) {
-                        BatchIOEntry& e = bs->entries[base + i];
-                        if (e.status == UGDS_BATCH_WAITING) {
-                            async_release_inflight_batch(e.devPtr_base);
-                            e.status = UGDS_BATCH_FAILED;
-                            e.n_cmds = 0;
-                        }
+                    /* Abort current and later entries. */
+                    nvm_sq_submit(&qp.sq);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    for (unsigned i = sc.io_idx; i < base + nr; ++i) {
+                        abort_phase3_entry(bs, i);
                     }
                     bs->n_entries += nr;
-                    return make_error(UGDS_INTERNAL_ERROR);
+                    goto phase3_abort_return;
                 }
             }
 
@@ -574,6 +606,9 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             cs.active = true;
             bs->in_flight++;
 
+            /* M2: commit the slot map first, then increment
+             * n_cmds_submitted, then transition WAITING->PENDING. */
+            entry.n_cmds_submitted++;
             entry.status = UGDS_BATCH_PENDING;
         }
 
@@ -583,8 +618,22 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
 
+    /* Drain deferred releases after qp.lock is released. */
+    drain_release_scratch(bs);
+
     bs->n_entries += nr;
     return UGDS_OK;
+
+phase3_abort_return:
+    /* Drain deferred releases after qp.lock is released.  The abort
+     * helper queued WAITING/PENDING entries for release. */
+    drain_release_scratch(bs);
+    return make_error(UGDS_INTERNAL_ERROR);
+    } catch (const std::bad_alloc&) {
+        return make_error(UGDS_OUT_OF_MEMORY);
+    } catch (...) {
+        return make_error(UGDS_INTERNAL_ERROR);
+    }
 }
 
 extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
@@ -623,6 +672,9 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
             std::lock_guard<std::mutex> qp_lock(qp.lock);
             while (drain_one_completion(qp, bs)) {}
         }
+
+        /* Drain deferred releases after qp.lock is released. */
+        drain_release_scratch(bs);
 
         for (unsigned i = 0; i < bs->n_entries && n_ready < max_events; ++i) {
             BatchIOEntry& entry = bs->entries[i];
@@ -663,73 +715,95 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
 
     BatchState* bs = static_cast<BatchState*>(batch);
     HandleState* hs = bs->hs;
-    IOQueuePair& qp = hs->batch_qp->qp;
 
-    // Drain remaining in-flight commands
-    if (bs->in_flight > 0) {
-        std::lock_guard<std::mutex> qp_lock(qp.lock);
-        uint64_t spins = 0;
-        const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
-        while (bs->in_flight > 0) {
-            if (!drain_one_completion(qp, bs)) {
-                if (++spins > max_spins) break;
-                __builtin_ia32_pause();
-            } else {
-                spins = 0;
+    /* Pin rule: declare pins BEFORE the lock guard so they outlive
+     * it. C++ destroys locals in reverse construction order: the
+     * guard unlocks before the pins drop. This prevents ~BatchState
+     * from running while the mutex is still locked. */
+    std::shared_ptr<BatchState> last_pin;
+    std::shared_ptr<BatchState> link_pin;
+
+    {
+        std::lock_guard<std::mutex> bl(bs->lock);
+
+        /* Tombstone check: if a force teardown already set TORN_DOWN,
+         * this is the post-force one-shot Destroy. Transfer self into
+         * a local pin and let the guard unlock before the pin drops. */
+        if (bs->lifecycle == BATCH_LIFECYCLE_TORN_DOWN) {
+            last_pin = std::move(bs->self);
+            return;
+        }
+
+        /* Drain remaining in-flight commands under bs->lock -> qp.lock. */
+        IOQueuePair& qp = hs->batch_qp->qp;
+        if (bs->in_flight > 0) {
+            std::lock_guard<std::mutex> qp_lock(qp.lock);
+            uint64_t spins = 0;
+            const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
+            while (bs->in_flight > 0) {
+                if (!drain_one_completion(qp, bs)) {
+                    if (++spins > max_spins) break;
+                    __builtin_ia32_pause();
+                } else {
+                    spins = 0;
+                }
             }
         }
-    }
 
-    /* Best-effort: release in-flight references for entries that were
-     * submitted but never fully completed (e.g., submit phase-3 early
-     * return). Check n_cmds_done < n_cmds rather than status alone.
-     *
-     * IMPORTANT: do NOT release refs for entries that have commands
-     * still outstanding in the NVMe SQ (bs->in_flight > 0 after drain).
-     * Those commands may still DMA. Leaking the refs (blocking
-     * deregister) is strictly safer than freeing mappings while the
-     * device may still access them. The caller should reset the
-     * controller if truly stuck. */
-    if (bs->in_flight == 0) {
+        if (bs->in_flight > 0) {
+            /* Wedge: commands still in flight after drain timeout.
+             * Retain everything (self, link, handle ref, batch_active)
+             * so force recovery can find the object. Transition to
+             * WEDGED and return -- the one-shot Destroy was consumed. */
+            bs->lifecycle = BATCH_LIFECYCLE_WEDGED;
+            hs->wedged.store(true, std::memory_order_release);
+            fprintf(stderr, "uGDS: BatchIODestroy: %u commands still in "
+                    "flight after drain timeout -- handle is now wedged "
+                    "to prevent DMA-after-unmap. Controller reset required.\n",
+                    bs->in_flight);
+            return;
+        }
+
+        /* --- Resource release (allocation-free) --- */
+
+        /* Drain any live release_scratch prefix first. */
+        drain_release_scratch(bs);
+
+        /* Scan for remaining refs_held entries and queue them. */
         for (unsigned i = 0; i < bs->n_entries; ++i) {
             BatchIOEntry& entry = bs->entries[i];
-            if (entry.n_cmds > 0 && entry.n_cmds_done < entry.n_cmds) {
-                async_release_inflight_batch(entry.devPtr_base);
-                entry.status = UGDS_BATCH_FAILED;
+            if (entry.refs_held && !entry.release_queued) {
+                queue_entry_release(bs, i);
             }
         }
-    } else {
-        /* Commands still in flight after drain timeout.
-         * The NVMe device may still DMA through the PRP list and CQ,
-         * so we must NOT: free the PRP pool, release handle ref,
-         * delete the batch state, or clear batch_active.
-         *
-         * Keeping batch_active=true prevents a new BatchIOSetUp from
-         * reusing the same QP while old completions may still arrive.
-         * Keeping the handle ref prevents HandleDeregister from freeing
-         * the QP while DMA is in progress.
-         *
-         * This wedges the handle until the caller resets the controller.
-         * BatchIODestroy is void so the caller cannot detect this --
-         * the warning is the only signal. This is the safest option:
-         * a wedged handle is strictly better than DMA-after-unmap. */
-        fprintf(stderr, "uGDS: BatchIODestroy: %u commands still in "
-                "flight after drain timeout -- handle is now wedged "
-                "to prevent DMA-after-unmap. Controller reset required.\n",
-                bs->in_flight);
-        hs->wedged.store(true, std::memory_order_release);
-        return;
-    }
+        /* Final drain for remaining held entries. */
+        drain_release_scratch(bs);
 
-    cleanup_prp_pool(bs);
+        cleanup_prp_pool(bs);
+        bs->lifecycle = BATCH_LIFECYCLE_TORN_DOWN;
 
-    /* Mark batch inactive before releasing handle ref.
-     * HandleDeregister waits on handle_in_flight==0, so we must not
-     * touch hs after release. */
-    hs->batch_active.store(false);
+        /* --- Link transaction: one g_driver.lock section --- */
+        {
+            std::lock_guard<std::mutex> g(g_driver.lock);
+            if (hs->active_batch.get() == bs) {
+                /* Pointer-verified detach: move OUR link into a local pin,
+                 * then clear batch_active ONLY after the detach. */
+                link_pin = std::move(hs->active_batch);
+                hs->batch_active.store(false, std::memory_order_release);
+            }
+            /* else: a concurrent force walk already moved the link.
+             * Do NOT clear batch_active -- the handle is closing. */
+        }
 
-    /* Release handle reference acquired in BatchIOSetUp */
-    handle_release(hs);
+        /* Release the SetUp-time handle reference. hs stays alive via
+         * bs->hs_sp. */
+        handle_release(hs);
 
-    delete bs;
+        /* Pin rule: transfer self into last_pin. The object stays alive
+         * until the guard releases the mutex and last_pin drops. */
+        last_pin = std::move(bs->self);
+    }  /* bl unlocks here -- object alive via last_pin (+ link_pin) */
+
+    /* link_pin then last_pin drop here; whichever is the final reference
+     * runs ~BatchState with no guard addressing its members. */
 }
