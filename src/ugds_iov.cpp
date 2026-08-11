@@ -661,15 +661,9 @@ extern "C" ssize_t uGDSWritev(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
 /* Phase 2/3 stubs: declared in the public header so the API surface is
  * visible to consumers, but return UGDS_IO_NOT_SUPPORTED until their
  * implementations land.  This keeps the library linkable without
- * undefined-reference errors. */
-
-extern "C" uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t /*batch*/,
-                                            unsigned /*nr*/,
-                                            uGDSIOSegParams_t* /*iocb*/,
-                                            unsigned /*flags*/)
-{
-    return uGDSError_t{UGDS_IO_NOT_SUPPORTED, 0};
-}
+ * undefined-reference errors.
+ *
+ * uGDSBatchIOSubmitv is implemented in ugds_batch.cpp. */
 
 extern "C" uGDSError_t uGDSReadvAsync(uGDSHandle_t /*fh*/,
                                         uGDSIoSegment_t* /*segs*/,
