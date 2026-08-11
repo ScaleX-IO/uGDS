@@ -94,6 +94,13 @@ public:
     /* release(): decrement each stored occurrence under one g_driver.lock
      * hold and set size_ = 0.  Idempotent on empty. */
     void release() noexcept;
+
+    /* disarm(): set size_ = 0 so the destructor does not release.
+     * The acquired in_flight references remain in the registry; the
+     * caller becomes responsible for releasing them by other means
+     * (the batch owns the release via kind-aware
+     * drain_release_scratch). */
+    void disarm() noexcept { size_ = 0; }
 };
 
 static_assert(std::is_nothrow_move_constructible<SglRefOwner>::value);
@@ -478,6 +485,14 @@ struct SubCmdV {
     uint64_t  lba;           /* starting LBA for this window */
     CmdWindow window;        /* window geometry (bytes, n_pages, etc.) */
 };
+
+/* Kind-aware release of the in-flight reference(s) held by a batch
+ * entry.  Defined in ugds_batch.cpp.
+ * - BATCH_ENTRY_PLAIN: one ref at entry.devPtr_base.
+ * - BATCH_ENTRY_VECTORED: one ref per base in
+ *   bs->seg_arena[entry.seg_begin .. seg_begin + seg_count).
+ * Must be called WITHOUT holding g_driver.lock. */
+void release_entry_refs(BatchState* bs, BatchIOEntry& entry);
 
 static inline uGDSError_t make_error(uGDSOpError err) {
     uGDSError_t e;

@@ -39,27 +39,51 @@ static inline void queue_entry_release(BatchState* bs, unsigned idx)
     bs->release_scratch[bs->n_release_pending++] = idx;
 }
 
-/* Drain all pending deferred releases in one g_driver.lock hold.
+/* Release the in-flight reference(s) held by a batch entry.
+ * Kind-aware release.
+ * - BATCH_ENTRY_PLAIN: one ref at entry.devPtr_base (legacy path).
+ * - BATCH_ENTRY_VECTORED: one ref per base in
+ *   bs->seg_arena[entry.seg_begin .. seg_begin + seg_count).
+ *   Duplicate bases are released per occurrence, matching acquire().
+ * Must be called WITHOUT holding g_driver.lock. */
+void release_entry_refs(BatchState* bs, BatchIOEntry& entry)
+{
+    if (!entry.refs_held)
+        return;
+    std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+    if (entry.kind == BATCH_ENTRY_VECTORED) {
+        for (uint32_t k = 0; k < entry.seg_count; ++k) {
+            uint32_t ai = entry.seg_begin + k;
+            if (ai >= bs->seg_arena.size())
+                break;
+            const void* base = bs->seg_arena[ai].base;
+            auto it = g_driver.buf_registry.find(base);
+            if (it != g_driver.buf_registry.end())
+                it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } else {
+        auto it = g_driver.buf_registry.find(entry.devPtr_base);
+        if (it != g_driver.buf_registry.end())
+            it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    entry.refs_held = false;
+    entry.release_queued = false;
+}
+
+/* Drain all pending deferred releases in one pass.
  * Must be called under bs->lock but NOT under qp.lock and NOT under
- * g_driver.lock (the old version called
- * async_release_inflight_batch which re-locked g_driver.lock, causing
- * a deadlock on a non-recursive mutex). */
+ * g_driver.lock (the old version called async_release_inflight_batch
+ * which re-locked g_driver.lock, causing a deadlock on a non-recursive
+ * mutex). */
 static void drain_release_scratch(BatchState* bs)
 {
     if (bs->n_release_pending == 0) return;
-    std::lock_guard<std::mutex> drv_lock(g_driver.lock);
     for (uint32_t i = 0; i < bs->n_release_pending; ++i) {
         uint32_t idx = bs->release_scratch[i];
         BatchIOEntry& entry = bs->entries[idx];
         if (!entry.refs_held) continue;  /* already released */
-        /* Inline the decrement instead of calling
-         * async_release_inflight_batch to avoid re-locking
-         * g_driver.lock (nested-lock bug fix). */
-        auto it = g_driver.buf_registry.find(entry.devPtr_base);
-        if (it != g_driver.buf_registry.end())
-            it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
-        entry.refs_held = false;
-        entry.release_queued = false;
+        /* C1: release_entry_refs handles both PLAIN and VECTORED. */
+        release_entry_refs(bs, entry);
     }
     bs->n_release_pending = 0;
 }
@@ -1181,8 +1205,13 @@ extern "C" uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t batch, unsigned nr,
             continue;
         }
 
-        /* refs are now held by the arena; mark for deferred release. */
+        /* refs are now held by the batch (the in_flight counter was
+         * incremented by acquire).  Transfer ownership to the batch by
+         * disarming the local owner so its destructor does not release.
+         * drain_release_scratch will decrement each base in entry's
+         * arena range, selected by entry.kind. */
         entry.refs_held = true;
+        owner.disarm();
 
         /* Stream windows into the work array. */
         SglWindowCursor cursor;
