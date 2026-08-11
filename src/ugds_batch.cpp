@@ -911,6 +911,11 @@ static bool submitv_validate_entry(const uGDSIOSegParams_t& p,
     if (n_cmds == 0)
         return false;
 
+    /* BatchIOEntry::n_cmds is uint16_t.  Reject counts that would
+     * truncate before any allocation or commit-copy. */
+    if (n_cmds > UINT16_MAX)
+        return false;
+
     (void)SU;  /* window_cap already incorporates SU rounding */
     *out_n_cmds = n_cmds;
     return true;
