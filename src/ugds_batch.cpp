@@ -195,7 +195,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
 
     (void)flags;
 
-    // Phase 1: validate and populate entries
+    // Validate and populate entries
     unsigned base = bs->n_entries;
     for (unsigned i = 0; i < nr; ++i) {
         const uGDSIOParams_t& p = iocb[i];
@@ -234,7 +234,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         entry.n_cmds = static_cast<uint16_t>(n_cmds);
     }
 
-    // Phase 2: build sub-command list
+    // Build sub-command list
     struct SubCmd {
         unsigned io_idx;
         uint64_t lba;
@@ -318,7 +318,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         }
     }
 
-    // Phase 3: enqueue all NVMe commands to the single batch QP
+    // Enqueue all NVMe commands to the single batch QP
     {
         std::lock_guard<std::mutex> qp_lock(qp.lock);
 

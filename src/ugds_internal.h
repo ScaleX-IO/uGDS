@@ -104,6 +104,14 @@ struct DriverState {
         nvm_dma_t*           dma;
         uGDSBackend_t        backend;
         std::atomic<uint32_t> in_flight{0};
+        size_t               length;    /* exact bytes from uGDSBufRegister */
+        const nvm_ctrl_t*    map_ctrl;  /* controller at registration time */
+        BufEntry() noexcept
+            : dma(nullptr), backend(UGDS_BACKEND_DEFAULT),
+              in_flight(0), length(0), map_ctrl(nullptr) {}
+        BufEntry(nvm_dma_t* d, uGDSBackend_t b, size_t len,
+                 const nvm_ctrl_t* ctrl) noexcept
+            : dma(d), backend(b), in_flight(0), length(len), map_ctrl(ctrl) {}
     };
     std::unordered_map<const void*, BufEntry>     buf_registry;
 
