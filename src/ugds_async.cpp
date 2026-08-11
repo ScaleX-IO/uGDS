@@ -573,16 +573,32 @@ static uGDSError_t async_validate_v(uGDSHandle_t fh,
     if (!hs)
         return make_error(UGDS_INVALID_VALUE);
 
-    /* Controller affinity check + ref acquisition.  handle_lookup_locked succeeded,
-     * so hs is valid for the lifetime of *hs_sp_out. */
+    /* RAII: ensure handle_release runs even if acquire_identity_only
+     * throws (e.g., from its internal mutex acquisition). */
+    struct HandleReleaseGuard {
+        HandleState* hs;
+        std::shared_ptr<HandleState>* sp;
+        bool armed;
+        ~HandleReleaseGuard() {
+            if (armed) {
+                handle_release(hs);
+                sp->reset();
+            }
+        }
+    } hguard{hs, hs_sp_out, true};
+
+    /* Controller affinity check + ref acquisition.  handle_lookup_locked
+     * succeeded, so hs is valid for the lifetime of *hs_sp_out. */
     int rc = owner->acquire_identity_only(
         segs, static_cast<uint32_t>(nr_segs),
         hs->ctrl, resolved);
     if (rc != 0) {
-        handle_release(hs);
-        hs_sp_out->reset();
+        /* hguard releases handle ref */
         return make_error(UGDS_INVALID_VALUE);
     }
+
+    /* Success: disarm the guard. Caller owns the handle ref now. */
+    hguard.armed = false;
 
     /* Snapshot segment backends from resolved[] (read under no lock; the
      * registry entries are pinned by owner for the lifetime of this
