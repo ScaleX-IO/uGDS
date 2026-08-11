@@ -11,6 +11,10 @@
 #include <new>
 #include <memory>
 
+#ifndef SSIZE_MAX
+#define SSIZE_MAX ((ssize_t)(((size_t)1 << (sizeof(ssize_t) * 8 - 1)) - 1))
+#endif
+
 /* Release in-flight reference held by batch submit.
  * Called on validation failure or when batch entry completes.
  * MUST be called WITHOUT holding g_driver.lock. */
@@ -350,6 +354,13 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         bs->n_entries = 0;
         bs->n_completed = 0;
         bs->n_events_read = 0;
+        /* Reset the segment arena allocation point.
+         * seg_arena.size()/capacity are never touched here; only the
+         * allocation cursor resets so the next Submitv rewrites from
+         * index 0.  Plain-only batches never resized the arena and
+         * this store is a harmless no-op on the zero-initialized
+         * value. */
+        bs->arena_used = 0;
     }
 
     if (bs->n_entries + nr > bs->capacity)
