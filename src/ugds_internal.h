@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <cstdint>
 #include <cstddef>
+#include <type_traits>
 
 #define UGDS_DEFAULT_NUM_QPS     16
 #define UGDS_DEFAULT_QUEUE_DEPTH 64
@@ -36,6 +37,169 @@
 /* SCT+SC (11-bit) from an NVMe completion: 0 = success. See NVMe Base Spec section 4.6.1. */
 #define UGDS_CPL_SCT_SC(cpl)     (((cpl)->dword[3] >> 17) & 0x7FF)
 
+/* Forward declarations: HandleOpGuard and SglRefOwner reference HandleState
+ * and handle_release, which are fully defined later in this header. */
+struct HandleState;
+static inline void handle_release(HandleState* hs);
+
+/* --- Per-IO resolved segment ------------------------------------------- */
+/* A segment resolved against the buffer registry under one g_driver.lock
+ * hold.  Identity fields (dma, base, registered_length, backend) are
+ * immutable snapshots valid as long as the owning SglRefOwner holds its
+ * reference; geometry fields (page_start, size) are filled at resolve time
+ * (sync/batch) or in the async callback (late binding). */
+struct SegView {
+    nvm_dma_t*     dma;
+    const void*    base;               /* registry key, for release/park */
+    size_t         registered_length;  /* snapshot of BufEntry::length */
+    uGDSBackend_t  backend;            /* snapshot, for async dispatch */
+    size_t         page_start;         /* offset / MPS (offset MPS-aligned) */
+    size_t         size;               /* bytes */
+};
+
+/* --- Reference ownership ----------------------------------------------- */
+/* Owns one in_flight reference per SGL occurrence.  Duplicate bases are
+ * intentionally repeated.  The representation has capacity for the public
+ * maximum and never allocates; this is ~8 KiB on LP64 and is stored in
+ * request/QP objects, not copied into a std::vector on timeout. */
+class SglRefOwner {
+    std::array<const void*, UGDS_IOV_MAX> bases_{};
+    uint16_t size_ = 0;                 /* UGDS_IOV_MAX == 1024 */
+public:
+    SglRefOwner() noexcept = default;
+    SglRefOwner(const SglRefOwner&) = delete;
+    SglRefOwner& operator=(const SglRefOwner&) = delete;
+    SglRefOwner(SglRefOwner&& other) noexcept;
+    SglRefOwner& operator=(SglRefOwner&& other) noexcept;
+    ~SglRefOwner() noexcept;            /* release() if still non-empty */
+
+    bool empty() const noexcept { return size_ == 0; }
+    uint16_t size() const noexcept { return size_; }
+    const void* base_at(uint16_t i) const noexcept { return bases_[i]; }
+
+    /* acquire(segs, nr): nr was already checked <= UGDS_IOV_MAX.  Under one
+     * g_driver.lock hold, validate registration, exact length, and affinity,
+     * then increment each counter and append its base.  All-or-nothing: a
+     * failure rolls back 0..k-1 inside the same hold.  Returns 0 on success
+     * or -EINVAL.  No reserve/growth/allocation exists.
+     *
+     * hs_ctrl is the submitting handle's controller (for affinity check).
+     * page_size is MPS for the offset-alignment and page-index math.
+     * seg_views_out (optional): if non-null, resolved SegView[] filled. */
+    int acquire(const uGDSIoSegment_t* segs, uint32_t nr,
+                const nvm_ctrl_t* hs_ctrl,
+                size_t page_size,
+                SegView* seg_views_out = nullptr);
+
+    /* release(): decrement each stored occurrence under one g_driver.lock
+     * hold and set size_ = 0.  Idempotent on empty. */
+    void release() noexcept;
+};
+
+static_assert(std::is_nothrow_move_constructible<SglRefOwner>::value);
+static_assert(std::is_nothrow_move_assignable<SglRefOwner>::value);
+static_assert(UGDS_IOV_MAX <= UINT16_MAX);
+
+/* --- Sync handle-operation ownership ----------------------------------- */
+/* handle_lookup() increments the bare HandleState::handle_in_flight counter
+ * independently of the returned shared_ptr.  This non-allocating guard is
+ * constructed immediately after a successful lookup and must be declared
+ * after the local hs_sp, so hs_sp outlives the guard.  Every early return
+ * and exception therefore calls handle_release() exactly once.  The normal
+ * path calls release() only after do_iov_engine returns; release() performs
+ * handle_release() and then disarms the destructor. */
+class HandleOpGuard {
+    HandleState* hs_ = nullptr;
+    bool         armed_ = false;
+public:
+    HandleOpGuard() noexcept = default;
+    explicit HandleOpGuard(HandleState* hs) noexcept
+        : hs_(hs), armed_(true) {}
+    HandleOpGuard(const HandleOpGuard&) = delete;
+    HandleOpGuard& operator=(const HandleOpGuard&) = delete;
+    HandleOpGuard(HandleOpGuard&&) = delete;
+    HandleOpGuard& operator=(HandleOpGuard&&) = delete;
+    ~HandleOpGuard() noexcept { if (armed_) handle_release(hs_); }
+
+    void arm(HandleState* hs) noexcept { hs_ = hs; armed_ = true; }
+    void release() noexcept {
+        if (armed_) { handle_release(hs_); armed_ = false; }
+    }
+};
+
+static_assert(std::is_nothrow_destructible<HandleOpGuard>::value);
+
+/* --- Engine result ------------------------------------------------------ */
+/* An integer alone cannot drive cleanup: the caller must know whether the
+ * engine consumed (parked) the resource owners. */
+struct IovEngineResult {
+    ssize_t ret;        /* bytes transferred or -errno */
+    bool    timed_out;  /* true <=> handle wedged AND the engine moved the
+                           owner (registered) or the transient dma
+                           (on-the-fly) into QP timeout parking; the
+                           caller's owner is empty / dma pointer stolen */
+};
+
+/* --- Command window ---------------------------------------------------- */
+struct CmdWindow {
+    uint32_t     first_seg;          /* index into SegView[] */
+    uint32_t     n_segs;             /* slices spanned by this command */
+    size_t       first_seg_page_off; /* pages already consumed from first_seg
+                                        by earlier windows (mid-segment split) */
+    size_t       bytes;              /* command length; block-multiple by construction */
+    size_t       n_pages;            /* ceil-sum of slice pages; <= MPS/8 + 1 */
+};
+
+/* --- SglWindowCursor --------------------------------------------------- */
+/* Stateful, allocation-free forward generator.  next() emits at most one
+ * window and advances (seg_idx, bytes_in_seg, open-window state).  It never
+ * owns or materializes an array of CmdWindow objects. */
+struct SglWindowCursor {
+    const SegView* segs;
+    uint32_t       nr_segs;
+    uint32_t       seg_idx;
+    size_t         bytes_in_seg;     /* consumed so far in segs[seg_idx] */
+    size_t         window_cap;
+    size_t         page_size;        /* MPS */
+    size_t         block_size;
+    size_t         split_unit;       /* lcm(MPS, block_size) */
+};
+
+/* Initialize a cursor.  Returns false if window_cap == 0 (reject). */
+bool sgl_cursor_init(SglWindowCursor& c, const SegView* segs, uint32_t nr_segs,
+                     size_t window_cap, size_t page_size, size_t block_size);
+
+/* Emit at most one window into out.  Returns true if a window was produced,
+ * false when the SGL is exhausted. */
+bool sgl_cursor_next(SglWindowCursor& c, CmdWindow& out) noexcept;
+
+/* O(nr_segs) analytic count.  Produces the same count as the cursor. */
+bool sgl_count_windows_analytic(const uGDSIoSegment_t* segs,
+                                uint32_t nr_segs,
+                                size_t window_cap, size_t page_size,
+                                size_t block_size,
+                                uint32_t* out) noexcept;
+
+/* --- SglPageCursor ----------------------------------------------------- */
+/* Forward iterator over the MPS page addresses of a window.  Replaces
+ * buf_dma->ioaddrs[current_page + i] in the PRP builders.  Tracks position
+ * across segment boundaries. */
+struct SglPageCursor {
+    const SegView* segs;
+    uint32_t       seg_count;        /* n_segs from CmdWindow */
+    uint32_t       seg_idx;          /* current segment index (relative to window) */
+    size_t         page_in_seg;      /* absolute index into dma->ioaddrs */
+    size_t         seg_pages_left;   /* pages remaining in current segment slice */
+};
+
+void sgl_page_cursor_init(SglPageCursor& c, const SegView* segs,
+                          uint32_t first_seg, size_t first_seg_page_off,
+                          uint32_t n_segs, size_t n_pages) noexcept;
+
+/* Returns current ioaddr, advances across segment boundaries.  Total calls
+ * bounded by CmdWindow::n_pages. */
+uint64_t sgl_page_cursor_next(SglPageCursor& c) noexcept;
+
 struct IOQueuePair {
     nvm_queue_t    sq{};
     nvm_queue_t    cq{};
@@ -48,9 +212,12 @@ struct IOQueuePair {
     int            irq_efd = -1;   /* eventfd for interrupt mode; -1 = poll */
     uint16_t       irq_vec = 0;    /* MSI-X vector bound to this CQ */
     /* Timeout resources remain owned by the QP until controller recovery.
-     * At most one synchronous operation can hold this QP lock. */
+     * At most one synchronous operation can hold this QP lock.
+     * timeout_dma: on-the-fly (1-buf) mapping parked by the scalar engine.
+     * timeout_refs: fixed-capacity registered-ref owner parked by the SGL
+     *               engine (also used by the refactored scalar path). */
     nvm_dma_t*     timeout_dma = nullptr;           /* on-the-fly mapping */
-    const void*    timeout_registered_buf = nullptr; /* registered ref */
+    SglRefOwner    timeout_refs;                    /* registered refs */
     std::mutex     lock;
 };
 
@@ -295,6 +462,38 @@ static inline uGDSError_t make_error(uGDSOpError err) {
 
 ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                        off_t file_offset, off_t bufPtr_offset, uint8_t opcode);
+
+/* --- SGL engine -------------------------------------------------------- */
+
+/* Publish PRP list stores before the doorbell/data pointer.  Centralizes the
+ * platform DMA-publish contract: on x86-64 the seq_cst fence is sufficient
+ * because PRP lists live in cache-coherent host memory and normal stores
+ * are ordered before the subsequent MMIO doorbell write.  Porting to a
+ * weaker platform changes this one helper. */
+static inline void sgl_publish_prp() noexcept {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+/* Wait for one completion on a sync QP.  Returns nullptr on timeout.
+ * Defined in ugds_io.cpp; shared with ugds_iov.cpp. */
+nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp);
+
+/* Streaming windowed IO engine shared by scalar and vectored sync paths.
+ *
+ * hs: submitting handle state (must already be lookup-acquired).
+ * segs: resolved segment views (identity + geometry complete).
+ * nr_segs: number of entries in segs (>= 1).
+ * file_offset: starting byte offset in the namespace (block-aligned).
+ * opcode: NVM_IO_READ or NVM_IO_WRITE.
+ * owner: holds in-flight buffer refs (may be empty if on_the_fly).
+ * transient: on-the-fly DMA mapping, or nullptr for registered buffers.
+ *
+ * Returns {bytes, false} on success, {-errno, false} on device/validation
+ * failure, or {-errno, true} on timeout with owner/transient moved into
+ * qp.timeout_refs / qp.timeout_dma. */
+IovEngineResult do_iov_engine(HandleState* hs, SegView* segs, uint32_t nr_segs,
+                              off_t file_offset, uint8_t opcode,
+                              SglRefOwner* owner, nvm_dma_t* transient);
 
 struct AsyncRequest {
     uGDSHandle_t    fh;
