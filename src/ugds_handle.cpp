@@ -577,18 +577,13 @@ extern "C" uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec)
                     (pin->lifecycle == BATCH_LIFECYCLE_WEDGED);
 
                 /* Release all in-flight refs for entries that still
-                 * hold them. */
+                 * hold them.  Use kind-aware release so VECTORED entries decrement
+                 * every base in their arena range, not the (nullptr)
+                 * devPtr_base. */
                 for (unsigned i = 0; i < pin->n_entries; ++i) {
                     BatchIOEntry& entry = pin->entries[i];
-                    if (entry.refs_held) {
-                        std::lock_guard<std::mutex> drv(g_driver.lock);
-                        auto it = g_driver.buf_registry.find(entry.devPtr_base);
-                        if (it != g_driver.buf_registry.end())
-                            it->second.in_flight.fetch_sub(1,
-                                std::memory_order_acq_rel);
-                        entry.refs_held = false;
-                        entry.release_queued = false;
-                    }
+                    if (entry.refs_held)
+                        release_entry_refs(pin.get(), entry);
                 }
                 pin->n_release_pending = 0;
 
