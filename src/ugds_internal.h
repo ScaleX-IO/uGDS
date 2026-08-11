@@ -219,9 +219,13 @@ struct IOQueuePair {
     /* Timeout resources remain owned by the QP until controller recovery.
      * At most one synchronous operation can hold this QP lock.
      * timeout_dma: on-the-fly (1-buf) mapping parked by the scalar engine.
+     * timeout_registered_base: a registered-buffer base whose in_flight
+     *   ref was parked by the legacy scalar path.  The ref
+     *   is released by cleanup_timeout_resources.
      * timeout_refs: fixed-capacity registered-ref owner parked by the SGL
      *               engine (also used by the refactored scalar path). */
     nvm_dma_t*     timeout_dma = nullptr;           /* on-the-fly mapping */
+    const void*    timeout_registered_base = nullptr; /* legacy scalar ref */
     SglRefOwner    timeout_refs;                    /* registered refs */
     std::mutex     lock;
 };

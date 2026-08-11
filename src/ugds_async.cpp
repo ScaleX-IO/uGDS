@@ -70,6 +70,11 @@ static uGDSError_t async_validate(uGDSHandle_t fh, void* bufPtr_base,
     if (it == g_driver.buf_registry.end())
         return make_error(UGDS_INVALID_VALUE);
 
+    /* Controller affinity check: validate against the submitting
+     * handle's controller. */
+    if (it->second.map_ctrl == nullptr)
+        return make_error(UGDS_INVALID_VALUE);
+
     /* Hold in-flight reference from enqueue until callback completes.
      * This prevents uGDSBufDeregister from unmapping the buffer
      * while the async request is queued but not yet executed. */
@@ -83,6 +88,15 @@ static uGDSError_t async_validate(uGDSHandle_t fh, void* bufPtr_base,
     if (!hs) {
         /* Roll back buffer in_flight ref on handle acquire failure */
         it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        return make_error(UGDS_INVALID_VALUE);
+    }
+
+    /* Controller affinity check: controller at registration must match
+     * the submitting handle's controller. */
+    if (it->second.map_ctrl != hs->ctrl) {
+        it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        handle_release(hs);
+        hs_sp_out->reset();
         return make_error(UGDS_INVALID_VALUE);
     }
 

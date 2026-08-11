@@ -108,13 +108,30 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
     nvm_dma_t* buf_dma = nullptr;
     bool on_the_fly = false;
     size_t buf_page_start = 0;
+    /* owner tracks the registered-buffer in-flight ref so it can be
+     * parked into qp.timeout_refs on timeout. */
+    bool ref_held = false;
 
     {
         std::lock_guard<std::mutex> drv_lock(g_driver.lock);
         auto it = g_driver.buf_registry.find(bufPtr_base);
         if (it != g_driver.buf_registry.end()) {
+            /* Controller affinity: mapping controller must
+             * match the submitting handle's controller. */
+            if (it->second.map_ctrl != hs->ctrl) {
+                return -EINVAL;
+            }
+            /* Exact-length bounds in
+             * subtraction form. bufPtr_offset was checked >= 0 above. */
+            const uint64_t off = static_cast<uint64_t>(bufPtr_offset);
+            const uint64_t sz  = static_cast<uint64_t>(size);
+            if (off > it->second.length ||
+                sz > it->second.length - off) {
+                return -EINVAL;
+            }
             buf_dma = it->second.dma;
             it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
+            ref_held = true;
         }
     }
 
@@ -124,12 +141,11 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             auto it = g_driver.buf_registry.find(bufPtr_base);
             if (it != g_driver.buf_registry.end())
                 it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            ref_held = false;
             return -EINVAL;
         }
         buf_page_start = static_cast<size_t>(bufPtr_offset) / page_size;
-        /* Overflow-safe bounds check: compute pages_needed separately,
-         * then verify buf_page_start + pages_needed <= n_ioaddrs
-         * without risking wrap. */
+        /* Defensive page-count check. */
         size_t pages_needed = (size - 1) / page_size + 1;
         if (pages_needed > buf_dma->n_ioaddrs ||
             buf_page_start > buf_dma->n_ioaddrs - pages_needed) {
@@ -137,6 +153,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             auto it = g_driver.buf_registry.find(bufPtr_base);
             if (it != g_driver.buf_registry.end())
                 it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            ref_held = false;
             return -EINVAL;
         }
     } else {
@@ -210,9 +227,18 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 if (drain == nullptr) {
                     result = -EIO;
                     /* An older submitted command may still DMA. Treat this
-                     * exactly like a post-submit completion timeout. */
+                     * exactly like a post-submit completion timeout.
+                     * Park the resource while qp.lock is held:
+                     * the post-lock parking block below is bypassed by this
+                     * goto, so we must park here. */
                     timed_out = true;
                     hs->wedged.store(true, std::memory_order_release);
+                    if (on_the_fly) {
+                        qp.timeout_dma = buf_dma;
+                        buf_dma = nullptr;
+                    } else if (ref_held) {
+                        qp.timeout_registered_base = bufPtr_base;
+                    }
                     goto out;
                 }
                 uint16_t st = UGDS_CPL_SCT_SC(drain);
@@ -258,8 +284,16 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 result = -EIO;
                 timed_out = true;
                 /* Mark wedged while still holding qp.lock to prevent
-                 * QP reuse before the flag is visible. */
+                 * QP reuse before the flag is visible.
+                 * Park the resource at the timeout site:
+                 * the post-lock block below is skipped by this goto. */
                 hs->wedged.store(true, std::memory_order_release);
+                if (on_the_fly) {
+                    qp.timeout_dma = buf_dma;
+                    buf_dma = nullptr;
+                } else if (ref_held) {
+                    qp.timeout_registered_base = bufPtr_base;
+                }
                 goto out;
             }
 
@@ -281,28 +315,17 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 
         result = static_cast<ssize_t>(bytes_done);
 
-        /* Transfer timeout resources to the QP while we still hold
-         * qp.lock.  A concurrent force teardown also acquires qp.lock
-         * in cleanup_timeout_resources(), so this prevents the race
-         * where teardown destroys the QP before we store the mapping. */
-        if (timed_out) {
-            if (on_the_fly) {
-                qp.timeout_dma = buf_dma;
-            }
-            /* Registered buffer refs are parked via SglRefOwner move
-             * into qp.timeout_refs by the caller (do_iov_engine or
-             * do_io_internal when refactored). For the legacy scalar
-             * path the ref remains held until the explicit release
-             * below is skipped on timeout. */
-            buf_dma = nullptr;
-        }
+        /* Parking was already done at each timeout site while qp.lock
+         * was held. The old post-lock block below was
+         * unreachable on the timeout path due to the goto. */
 
     out:;
     }
 
     if (timed_out) {
         /* NVMe command may still be executing. wedged was set
-         * under qp.lock. Resources were transferred to the QP above. */
+         * under qp.lock. Resources were parked to the QP at the
+         * timeout site. */
         fprintf(stderr, "uGDS: I/O timeout -- handle wedged. "
                 "Controller reset required.\n");
     } else if (on_the_fly && buf_dma != nullptr) {
