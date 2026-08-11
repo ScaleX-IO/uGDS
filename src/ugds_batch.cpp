@@ -850,3 +850,470 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
          * ref counts prevent double-free. */
     }
 }
+
+/* ======================================================================== */
+/* uGDSBatchIOSubmitv: vectored batch submit                              */
+/* ======================================================================== */
+
+/* Registry preflight result: a stack record filled under g_driver.lock
+ * without taking refs.  Classifies each entry so the caller can size
+ * the work array before any ref acquisition or allocation. */
+struct PreflightResult {
+    bool        valid;
+};
+
+/* Pure value validation for one vectored entry.
+ * Performs the value-matrix checks and computes the analytic window
+ * count via sgl_count_windows_analytic.  Writes nothing to bs.
+ * Returns true on success (out_n_cmds set), false on value error. */
+static bool submitv_validate_entry(const uGDSIOSegParams_t& p,
+                                   size_t page_size, size_t block_size,
+                                   size_t window_cap, size_t SU,
+                                   uint32_t* out_n_cmds)
+{
+    if (p.segs == nullptr || p.nr_segs == 0)
+        return false;
+    if (p.nr_segs > UGDS_BATCH_IOV_MAX)
+        return false;
+    if (p.file_offset < 0)
+        return false;
+    if ((static_cast<size_t>(p.file_offset) % block_size) != 0)
+        return false;
+
+    /* opcode check */
+    if (p.opcode != UGDS_READ && p.opcode != UGDS_WRITE)
+        return false;
+
+    uint64_t total_size = 0;
+    for (unsigned k = 0; k < p.nr_segs; ++k) {
+        if (p.segs[k].base == nullptr || p.segs[k].size == 0)
+            return false;
+        if (p.segs[k].offset < 0)
+            return false;
+        if ((static_cast<size_t>(p.segs[k].offset) % page_size) != 0)
+            return false;
+        if ((p.segs[k].size % block_size) != 0)
+            return false;
+
+        uint64_t seg_size = static_cast<uint64_t>(p.segs[k].size);
+        if (seg_size > static_cast<uint64_t>(SSIZE_MAX) - total_size)
+            return false;  /* total overflow */
+        total_size += seg_size;
+    }
+
+    /* Analytic window count over the segment array.  O(nr_segs). */
+    uint32_t n_cmds = 0;
+    if (!sgl_count_windows_analytic(p.segs, p.nr_segs,
+                                    window_cap, page_size, block_size,
+                                    &n_cmds))
+        return false;
+
+    if (n_cmds == 0)
+        return false;
+
+    (void)SU;  /* window_cap already incorporates SU rounding */
+    *out_n_cmds = n_cmds;
+    return true;
+}
+
+extern "C" uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t batch, unsigned nr,
+                                            uGDSIOSegParams_t* iocb,
+                                            unsigned flags)
+{
+    try {
+    /* ==================================================================
+     * Basic call/batch checks (no state mutation)
+     * ================================================================== */
+    if (batch == nullptr || iocb == nullptr || nr == 0)
+        return make_error(UGDS_INVALID_VALUE);
+
+    BatchState* bs = static_cast<BatchState*>(batch);
+    std::lock_guard<std::mutex> batch_lock(bs->lock);
+
+    if (bs->hs->wedged.load(std::memory_order_acquire) ||
+        bs->hs->closing.load(std::memory_order_acquire))
+        return make_error(UGDS_BUSY);
+
+    if (bs->lifecycle != BATCH_LIFECYCLE_ACTIVE)
+        return make_error(UGDS_INVALID_VALUE);
+
+    if (bs->n_entries + nr > bs->capacity)
+        return make_error(UGDS_BATCH_CAPACITY_EXCEEDED);
+
+    (void)flags;
+
+    /* recycle: same path as plain submit, plus arena_used reset. */
+    if (bs->n_entries > 0 && bs->n_events_read == bs->n_entries) {
+        bs->n_entries = 0;
+        bs->n_completed = 0;
+        bs->n_events_read = 0;
+        bs->arena_used = 0;
+    }
+
+    HandleState* hs = bs->hs;
+    IOQueuePair& qp = hs->batch_qp->qp;
+    const size_t page_size  = hs->ctrl->page_size;
+    const size_t block_size = hs->block_size;
+    const size_t max_xfer   = compute_max_xfer(hs);
+
+    /* Compute SU and window_cap (parity with sync vectored path). */
+    const size_t SU = (page_size > block_size &&
+                       (page_size & (page_size - 1)) == 0 &&
+                       (block_size & (block_size - 1)) == 0)
+                      ? std::max(page_size, block_size)
+                      : [&]() {
+                          size_t a = page_size, b = block_size;
+                          while (b != 0) { size_t t = a % b; a = b; b = t; }
+                          return (page_size / a) * block_size;
+                      }();
+    size_t window_cap = (max_xfer / SU) * SU;
+    if (window_cap == 0)
+        return make_error(UGDS_INVALID_VALUE);
+
+    /* ==================================================================
+     * Validate -> preflight -> allocate -> commit-copy
+     * ================================================================== */
+
+    /* --- Step 1: Pure value validation (all entries, no state write) --- */
+    unsigned base = bs->n_entries;
+
+    uint32_t per_entry_n_cmds[UGDS_MAX_BATCH_IO_SIZE];
+    uint64_t total_cmds = 0;
+    for (unsigned i = 0; i < nr; ++i) {
+        uint32_t n_cmds_i = 0;
+        if (!submitv_validate_entry(iocb[i], page_size, block_size,
+                                    window_cap, SU, &n_cmds_i))
+            return make_error(UGDS_INVALID_VALUE);
+
+        /* checked addition for total_cmds */
+        if (total_cmds > UINT64_MAX - n_cmds_i)
+            return make_error(UGDS_INVALID_VALUE);
+        total_cmds += n_cmds_i;
+        per_entry_n_cmds[i] = n_cmds_i;
+    }
+
+    if (total_cmds > UINT32_MAX)
+        return make_error(UGDS_INVALID_VALUE);
+
+    /* --- Step 2: Registry preflight (read-only, no refs) ---
+     * Classifies each entry; failures become terminal FAILED -EINVAL
+     * and contribute zero to alloc_cmds. */
+    PreflightResult preflight[UGDS_MAX_BATCH_IO_SIZE];
+    uint64_t alloc_cmds = 0;
+    {
+        std::lock_guard<std::mutex> drv_lock(g_driver.lock);
+        for (unsigned i = 0; i < nr; ++i) {
+            const uGDSIOSegParams_t& p = iocb[i];
+            bool ok = true;
+
+            /* Check every segment: registration, exact-length, affinity. */
+            for (unsigned k = 0; k < p.nr_segs && ok; ++k) {
+                auto it = g_driver.buf_registry.find(p.segs[k].base);
+                if (it == g_driver.buf_registry.end()) {
+                    ok = false;
+                    break;
+                }
+                DriverState::BufEntry& be = it->second;
+                /* Controller affinity check */
+                if (be.map_ctrl != hs->ctrl) { ok = false; break; }
+                /* Exact-length bounds */
+                const uint64_t off = static_cast<uint64_t>(p.segs[k].offset);
+                const uint64_t sz  = static_cast<uint64_t>(p.segs[k].size);
+                if (off > be.length || sz > be.length - off) {
+                    ok = false;
+                    break;
+                }
+            }
+
+            preflight[i].valid = ok;
+            if (ok) {
+                alloc_cmds += per_entry_n_cmds[i];
+            }
+        }
+    }
+
+    /* --- Step 3: Allocate (fallible, still no entry/watermark mutation) ---
+     * First the local work array, then the one-time arena resize.
+     * The arena resize is the final fallible operation before commit. */
+    std::vector<SubCmdV> work;
+    if (alloc_cmds > 0)
+        work.resize(static_cast<size_t>(alloc_cmds));
+
+    if (bs->seg_arena.empty()) {
+        /* One lifetime allocation: capacity * UGDS_BATCH_IOV_MAX.
+         * capacity <= 128, UGDS_BATCH_IOV_MAX = 128, so <= 16384
+         * SegView elements (~48 B each = ~768 KiB). */
+        size_t arena_elems = static_cast<size_t>(bs->capacity) *
+                             static_cast<size_t>(UGDS_BATCH_IOV_MAX);
+        bs->seg_arena.resize(arena_elems);
+    }
+
+    /* --- Step 4: Commit-copy (infallible) ---
+     * From here, no allocation or throw is possible.  Capture the
+     * watermark for rollback safety; populate entries and arena.
+     * The watermark is the 8.4 rollback anchor: it is never restored
+     * in this path because no operation after this point can fail, but
+     * it documents the invariant and serves as the audit point for the
+     * fixed-size arena model. */
+    const uint32_t watermark = bs->arena_used;
+    (void)watermark;  /* documented rollback anchor; no post-commit failure */
+    uint32_t work_used = 0;
+
+    for (unsigned i = 0; i < nr; ++i) {
+        unsigned idx = base + i;
+        BatchIOEntry& entry = bs->entries[idx];
+        const uGDSIOSegParams_t& p = iocb[i];
+
+        /* Clear entry fields for both success and failure paths. */
+        entry.cookie = p.cookie;
+        entry.devPtr_base = nullptr;   /* not used for vectored */
+        entry.file_offset = p.file_offset;
+        entry.devPtr_offset = 0;
+        entry.size = 0;
+        entry.opcode = (p.opcode == UGDS_READ) ? NVM_IO_READ : NVM_IO_WRITE;
+        entry.status = UGDS_BATCH_WAITING;
+        entry.bytes_done = 0;
+        entry.error_code = 0;
+        entry.n_cmds_done = 0;
+        entry.event_returned = false;
+        entry.refs_held = false;
+        entry.release_queued = false;
+        entry.n_cmds_submitted = 0;
+
+        if (!preflight[i].valid) {
+            /* Preflight failure: terminal FAILED -EINVAL, n_cmds = 0. */
+            entry.kind = BATCH_ENTRY_VECTORED;
+            entry.seg_begin = 0;
+            entry.seg_count = 0;
+            entry.n_cmds = 0;
+            entry.status = UGDS_BATCH_FAILED;
+            entry.error_code = -EINVAL;
+            bs->n_completed++;
+            continue;
+        }
+
+        /* Preflight-valid entry: copy segments into the arena. */
+        assert(bs->arena_used + p.nr_segs <= bs->seg_arena.size());
+        entry.kind = BATCH_ENTRY_VECTORED;
+        entry.seg_begin = bs->arena_used;
+        entry.seg_count = static_cast<uint32_t>(p.nr_segs);
+        entry.n_cmds = static_cast<uint16_t>(per_entry_n_cmds[i]);
+
+        for (unsigned k = 0; k < p.nr_segs; ++k) {
+            bs->seg_arena[bs->arena_used + k] = SegView{};
+        }
+        bs->arena_used += static_cast<uint32_t>(p.nr_segs);
+    }
+
+    /* ==================================================================
+     * Acquiring resolve / build
+     * ==================================================================
+     * For each preflight-valid entry, acquire refs (all-or-nothing per
+     * entry via SglRefOwner), resolve SegView geometry into the arena,
+     * and stream windows into the work array via SglWindowCursor. */
+
+    for (unsigned i = 0; i < nr; ++i) {
+        unsigned idx = base + i;
+        BatchIOEntry& entry = bs->entries[idx];
+
+        /* Skip entries already terminalized in commit-copy. */
+        if (entry.status == UGDS_BATCH_FAILED)
+            continue;
+
+        const uGDSIOSegParams_t& p = iocb[i];
+        SegView* seg_views = bs->seg_arena.data() + entry.seg_begin;
+
+        /* Acquire in-flight refs and resolve geometry (all-or-nothing). */
+        SglRefOwner owner;
+        int rc = owner.acquire(p.segs, static_cast<uint32_t>(p.nr_segs),
+                               hs->ctrl, page_size, seg_views);
+        if (rc != 0) {
+            /* Resolve failure: entry-local.  No work items emitted. */
+            entry.status = UGDS_BATCH_FAILED;
+            entry.error_code = -EINVAL;
+            entry.n_cmds = 0;
+            entry.n_cmds_done = 0;
+            entry.n_cmds_submitted = 0;
+            bs->n_completed++;
+            /* owner is empty (all-or-nothing), nothing to release. */
+            continue;
+        }
+
+        /* refs are now held by the arena; mark for deferred release. */
+        entry.refs_held = true;
+
+        /* Stream windows into the work array. */
+        SglWindowCursor cursor;
+        sgl_cursor_init(cursor, seg_views, static_cast<uint32_t>(p.nr_segs),
+                        window_cap, page_size, block_size);
+
+        uint64_t current_lba =
+            static_cast<uint64_t>(p.file_offset) / block_size;
+
+        CmdWindow win;
+        while (sgl_cursor_next(cursor, win)) {
+            assert(work_used < work.size());
+            work[work_used].io_idx = idx;
+            work[work_used].lba    = current_lba;
+            work[work_used].window = win;
+            work_used++;
+
+            current_lba += win.bytes / block_size;
+        }
+    }
+
+    /* ==================================================================
+     * Enqueue (mirrors the plain submit)
+     * ================================================================== */
+    {
+        std::lock_guard<std::mutex> qp_lock(qp.lock);
+
+        for (uint32_t wi = 0; wi < work_used; ++wi) {
+            SubCmdV& sc = work[wi];
+            BatchIOEntry& entry = bs->entries[sc.io_idx];
+
+            const size_t n_pages = sc.window.n_pages;
+            SegView* seg_views = bs->seg_arena.data() + entry.seg_begin;
+
+            /* PRP pool page for windows needing a list (> 2 pages). */
+            uint16_t prp_idx = UINT16_MAX;
+            if (n_pages > 2) {
+                int pidx = prp_pool_alloc(&bs->prp_pool);
+                if (pidx < 0) {
+                    /* Pool exhaustion: submit ring, then drain loop. */
+                    nvm_sq_submit(&qp.sq);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    uint64_t spins = 0;
+                    const uint64_t max_spins =
+                        (uint64_t)hs->ctrl->timeout * 1000000ULL;
+                    while ((pidx = prp_pool_alloc(&bs->prp_pool)) < 0) {
+                        if (!drain_one_completion(qp, bs)) {
+                            if (++spins > max_spins) {
+                                nvm_sq_submit(&qp.sq);
+                                std::atomic_thread_fence(
+                                    std::memory_order_seq_cst);
+                                for (unsigned i = sc.io_idx;
+                                     i < base + nr; ++i)
+                                    abort_phase3_entry(bs, i);
+                                bs->n_entries += nr;
+                                goto phase3v_abort_return;
+                            }
+                            __builtin_ia32_pause();
+                        }
+                    }
+                }
+                prp_idx = static_cast<uint16_t>(pidx);
+            }
+
+            uint16_t slot = static_cast<uint16_t>(
+                qp.sq.tail.load(std::memory_order_relaxed) % qp.sq.qs);
+            nvm_cmd_t* cmd = nvm_sq_enqueue(&qp.sq);
+
+            if (cmd == nullptr) {
+                /* SQ full: submit ring, drain, retry. */
+                nvm_sq_submit(&qp.sq);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+
+                uint64_t spins = 0;
+                const uint64_t max_spins =
+                    (uint64_t)hs->ctrl->timeout * 1000000ULL;
+                bool drained = false;
+                while (!drained) {
+                    if (drain_one_completion(qp, bs)) {
+                        drained = true;
+                    } else if (++spins > max_spins) {
+                        if (prp_idx != UINT16_MAX)
+                            prp_pool_free(&bs->prp_pool, prp_idx);
+                        nvm_sq_submit(&qp.sq);
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        for (unsigned i = sc.io_idx; i < base + nr; ++i)
+                            abort_phase3_entry(bs, i);
+                        bs->n_entries += nr;
+                        goto phase3v_abort_return;
+                    } else {
+                        __builtin_ia32_pause();
+                    }
+                }
+
+                slot = static_cast<uint16_t>(
+                    qp.sq.tail.load(std::memory_order_relaxed) % qp.sq.qs);
+                cmd = nvm_sq_enqueue(&qp.sq);
+                if (cmd == nullptr) {
+                    if (prp_idx != UINT16_MAX)
+                        prp_pool_free(&bs->prp_pool, prp_idx);
+                    nvm_sq_submit(&qp.sq);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    for (unsigned i = sc.io_idx; i < base + nr; ++i)
+                        abort_phase3_entry(bs, i);
+                    bs->n_entries += nr;
+                    goto phase3v_abort_return;
+                }
+            }
+
+            memset(cmd, 0, sizeof(nvm_cmd_t));
+            nvm_cmd_header(cmd, slot, entry.opcode, hs->ns_id);
+
+            /* Build PRP via SglPageCursor. */
+            SglPageCursor pc;
+            sgl_page_cursor_init(pc, seg_views,
+                                 sc.window.first_seg,
+                                 sc.window.first_seg_page_off,
+                                 sc.window.n_segs, sc.window.n_pages);
+
+            if (n_pages == 1) {
+                uint64_t prp1 = sgl_page_cursor_next(pc);
+                nvm_cmd_data_ptr(cmd, prp1, 0);
+            } else if (n_pages == 2) {
+                uint64_t prp1 = sgl_page_cursor_next(pc);
+                uint64_t prp2 = sgl_page_cursor_next(pc);
+                nvm_cmd_data_ptr(cmd, prp1, prp2);
+            } else {
+                volatile uint64_t* prp_list =
+                    reinterpret_cast<volatile uint64_t*>(
+                        static_cast<uint8_t*>(bs->prp_pool.buf) +
+                        prp_idx * page_size);
+                uint64_t prp1 = sgl_page_cursor_next(pc);
+                for (size_t p = 1; p < n_pages; ++p)
+                    prp_list[p - 1] = sgl_page_cursor_next(pc);
+                sgl_publish_prp();
+                nvm_cmd_data_ptr(cmd, prp1,
+                                 bs->prp_pool.dma->ioaddrs[prp_idx]);
+            }
+
+            size_t n_blocks = sc.window.bytes / block_size;
+            nvm_cmd_rw_blks(cmd, sc.lba, static_cast<uint16_t>(n_blocks));
+
+            CmdSlot& cs = bs->cmd_map[slot];
+            cs.io_idx = static_cast<uint16_t>(sc.io_idx);
+            cs.chunk_bytes = sc.window.bytes;
+            cs.prp_page_idx = prp_idx;
+            cs.active = true;
+            bs->in_flight++;
+
+            /* Commit slot map, then n_cmds_submitted, then WAITING->PENDING. */
+            entry.n_cmds_submitted++;
+            entry.status = UGDS_BATCH_PENDING;
+        }
+
+        /* Single doorbell for all enqueued commands. */
+        sgl_publish_prp();
+        nvm_sq_submit(&qp.sq);
+        sgl_publish_prp();
+    }
+
+    /* Drain deferred releases after qp.lock is released. */
+    drain_release_scratch(bs);
+
+    bs->n_entries += nr;
+    return UGDS_OK;
+
+phase3v_abort_return:
+    /* Abort path: the abort helper queued entries for deferred release. */
+    drain_release_scratch(bs);
+    return make_error(UGDS_INTERNAL_ERROR);
+    } catch (const std::bad_alloc&) {
+        return make_error(UGDS_OUT_OF_MEMORY);
+    } catch (...) {
+        return make_error(UGDS_INTERNAL_ERROR);
+    }
+}
