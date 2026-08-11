@@ -830,17 +830,24 @@ static uGDSError_t do_readv_writev_async(uGDSHandle_t fh,
     }
 
     /* async_validate_v acquires in-flight refs + handle ref, fills
-     * resolved (identity-only), and snapshots list backend + mixed. */
+     * resolved (identity-only), and snapshots list backend + mixed.
+     * The handle ref guard ensures handle_release is called on
+     * exception between validation and successful launch. */
     uGDSBackend_t list_backend = UGDS_BACKEND_DEFAULT;
     bool mixed = false;
     uGDSError_t st = async_validate_v(fh, segs, nr_segs, req->resolved,
                                       &req->owner, &req->hs_sp,
                                       &list_backend, &mixed);
     if (st.err != UGDS_SUCCESS) {
-        /* No refs acquired, no handle ref held. req_guard frees req +
-         * heap resolved[] via destructor. */
         return st;
     }
+
+    /* RAII: release handle ref if we leave scope without launching. */
+    struct HandleRefGuard {
+        HandleState* hs;
+        bool armed;
+        ~HandleRefGuard() { if (armed && hs) handle_release(hs); }
+    } hguard{req->hs_sp.get(), true};
 
     /* Compute launch_backend ONCE from the snapshot list_backend and
      * a single read of the stream backend. */
@@ -851,7 +858,7 @@ static uGDSError_t do_readv_writev_async(uGDSHandle_t fh,
                                                     &launch_backend);
     if (lberr.err != UGDS_SUCCESS) {
         req->owner.release();
-        handle_release(req->hs_sp.get());
+        /* hguard releases handle ref */
         return lberr;
     }
     req->launch_backend = launch_backend;
@@ -862,11 +869,12 @@ static uGDSError_t do_readv_writev_async(uGDSHandle_t fh,
     uGDSError_t lc = iov_launch_host_func(stream, req);
     if (lc.err != UGDS_SUCCESS) {
         req->owner.release();
-        handle_release(req->hs_sp.get());
+        /* hguard releases handle ref */
         return lc;
     }
 
-    /* Launch succeeded: release ownership to the callback. */
+    /* Launch succeeded: disarm guards, release ownership to callback. */
+    hguard.armed = false;
     (void)req_guard.release();
     return UGDS_OK;
 }
