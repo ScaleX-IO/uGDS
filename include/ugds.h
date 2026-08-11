@@ -259,6 +259,73 @@ uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch, unsigned min_nr,
 
 void uGDSBatchIODestroy(uGDSBatchHandle_t batch);
 
+/* -- Vectored (scatter-gather) IO -- */
+
+/* One scatter-gather segment. 'base' must be a pointer previously
+ * registered via uGDSBufRegister/uGDSBufRegisterEx (exact value).
+ * 'offset' is a byte offset inside that registration and must be a
+ * multiple of the controller page size (MPS).  'size' must be a
+ * multiple of the namespace block size and non-zero.  offset + size
+ * must not exceed the length passed at registration (the exact byte
+ * length, not a page-rounded value). */
+typedef struct uGDSIoSegment {
+    void*   base;
+    off_t   offset;
+    size_t  size;
+} uGDSIoSegment_t;
+
+#define UGDS_IOV_MAX        1024   /* sync/async: POSIX IOV_MAX parity */
+#define UGDS_BATCH_IOV_MAX  128    /* per batch entry (bounds arena) */
+
+/* Vectored read/write.  Segments are consumed in array order:
+ * segs[0] maps to [file_offset, file_offset + segs[0].size), etc.
+ * Returns total bytes transferred, or -errno (same convention as
+ * uGDSRead/uGDSWrite).  The segment array is fully consumed during
+ * the call (synchronous); the caller may free/reuse it on return.
+ * (Implementation in Phase 1.) */
+ssize_t uGDSReadv(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
+                    unsigned nr_segs, off_t file_offset);
+
+ssize_t uGDSWritev(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
+                     unsigned nr_segs, off_t file_offset);
+
+/* Vectored batch IO.  Because uGDSIOParams_t has no mode/union/reserved
+ * field, SGL batch entries use this new params struct and submit function;
+ * setup/status/destroy are shared with the existing batch object.
+ * 'segs' is copied at submit, so the caller may free iocb and the arrays
+ * on return -- parity with uGDSBatchIOSubmit.
+ * (Implementation in Phase 2.) */
+typedef struct uGDSIOSegParams {
+    const uGDSIoSegment_t* segs;      /* copied at submit */
+    unsigned               nr_segs;   /* <= UGDS_BATCH_IOV_MAX */
+    off_t                  file_offset;
+    uGDSOpcode_t           opcode;
+    void*                  cookie;
+} uGDSIOSegParams_t;
+
+/* Same semantics as uGDSBatchIOSubmit: entries join the batch created
+ * by uGDSBatchIOSetUp; completions are reaped via uGDSBatchIOGetStatus.
+ * Plain and vectored submits may be mixed on the same batch handle. */
+uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t batch, unsigned nr,
+                                 uGDSIOSegParams_t* iocb, unsigned flags);
+
+/* Vectored async IO on a CUDA/HIP stream.
+ * Binding contract (mirrors uGDSReadAsync late binding):
+ *   - segs (the array pointer) and nr_segs are fixed at enqueue.
+ *   - segs[i].base is read at enqueue (validation + in-flight refs)
+ *     and MUST NOT change afterwards.
+ *   - segs[i].offset, segs[i].size and *file_offset_p are read in the
+ *     stream callback (late binding).  The segs array must remain
+ *     valid until the callback runs.
+ * (Implementation in Phase 3.) */
+uGDSError_t uGDSReadvAsync(uGDSHandle_t fh, uGDSIoSegment_t* segs,
+                             unsigned nr_segs, off_t* file_offset_p,
+                             ssize_t* bytes_read_p, void* stream);
+
+uGDSError_t uGDSWritevAsync(uGDSHandle_t fh, uGDSIoSegment_t* segs,
+                              unsigned nr_segs, off_t* file_offset_p,
+                              ssize_t* bytes_written_p, void* stream);
+
 /* -- Async Stream IO --
  * Pointer params (size_p, file_offset_p, etc.) must be host-accessible.
  * Use cudaHostAlloc/hipHostMalloc for GPU-writable pinned memory (late binding).
