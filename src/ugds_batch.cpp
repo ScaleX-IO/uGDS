@@ -82,28 +82,39 @@ static void drain_release_scratch(BatchState* bs)
         uint32_t idx = bs->release_scratch[i];
         BatchIOEntry& entry = bs->entries[idx];
         if (!entry.refs_held) continue;  /* already released */
-        /* C1: release_entry_refs handles both PLAIN and VECTORED. */
+        /* release_entry_refs handles both PLAIN and VECTORED. */
         release_entry_refs(bs, entry);
     }
     bs->n_release_pending = 0;
 }
 
-/* Abort a Phase-3 entry that is WAITING, PENDING, or FAILED.
+/* Abort an entry that is WAITING or PENDING (not yet terminal).
+ *
  * Truncates n_cmds to the submitted prefix (n_cmds_submitted), records
  * -ECANCELED, and queues the entry for deferred release if all its
- * submitted commands have already completed.  Must be called
- * under bs->lock + qp.lock; does NOT touch g_driver.lock (R2 MINOR-1).
+ * submitted commands have already completed.  Must be called under
+ * bs->lock + qp.lock; does NOT touch g_driver.lock.
  *
- * C4 (review R1): abort also accepts the FAILED state so a device
- * error latched by drain_one_completion is not stranded: the submitted
- * prefix still drains exactly once and refs are released.  A COMPLETE
- * or TORN_DOWN entry is left untouched. */
+ * Entries already terminalized by drain_one_completion (device error
+ * latched as FAILED while the submitted prefix continues to drain)
+ * are still eligible: their remaining commands will drain, and the
+ * ECANCELED precedence in drain ensures consistent terminalization.
+ *
+ * Entries that were never submitted (preflight/resolve failures with
+ * n_cmds == 0 and n_completed already incremented) must be skipped to
+ * avoid double-counting.  We detect this with n_cmds == 0: such
+ * entries have no command-level lifecycle to abort. */
 static inline void abort_phase3_entry(BatchState* bs, unsigned idx)
 {
     BatchIOEntry& entry = bs->entries[idx];
     if (entry.status != UGDS_BATCH_WAITING &&
         entry.status != UGDS_BATCH_PENDING &&
         entry.status != UGDS_BATCH_FAILED)
+        return;
+    /* Skip entries that were terminalized before any submission
+     * (preflight or resolve failure).  These already incremented
+     * n_completed and have no command lifecycle to abort. */
+    if (entry.n_cmds == 0)
         return;
     entry.error_code = -ECANCELED;
     entry.n_cmds = entry.n_cmds_submitted;  /* discard unsubmitted suffix */
