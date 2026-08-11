@@ -641,13 +641,21 @@ static ssize_t do_readv_writev(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
 extern "C" ssize_t uGDSReadv(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
                                unsigned nr_segs, off_t file_offset)
 {
-    return do_readv_writev(fh, segs, nr_segs, file_offset, NVM_IO_READ);
+    try {
+        return do_readv_writev(fh, segs, nr_segs, file_offset, NVM_IO_READ);
+    } catch (...) {
+        return -UGDS_INTERNAL_ERROR;
+    }
 }
 
 extern "C" ssize_t uGDSWritev(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
                                 unsigned nr_segs, off_t file_offset)
 {
-    return do_readv_writev(fh, segs, nr_segs, file_offset, NVM_IO_WRITE);
+    try {
+        return do_readv_writev(fh, segs, nr_segs, file_offset, NVM_IO_WRITE);
+    } catch (...) {
+        return -UGDS_INTERNAL_ERROR;
+    }
 }
 
 /* Phase 2/3 stubs: declared in the public header so the API surface is

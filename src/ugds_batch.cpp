@@ -212,13 +212,25 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         hs->batch_setting_up.store(true, std::memory_order_release);
     }
 
-    /* M3: BatchSetupTxn scope guard. The five named rollback items
-     * are armed in acquisition order. Rollback runs in reverse order.
-     * Item 1: gate refs/flags. Item 2: batch_active claim.
-     * Items 3-5 are handled by the explicit rollback below for the
-     * private phase allocations. The gate (items 1+2) is rolled back
-     * by the explicit cleanup at setup_rollback. */
-    bool txn_gate_armed = true;   /* items 1+2 armed */
+    /* M3: BatchSetupTxn - RAII scope guard that rolls back gate state
+     * if the function exits via exception or early return before commit.
+     * Five items (acquired in order, rolled back in reverse):
+     *   1. handle_in_flight reference
+     *   2. batch_active claim
+     *   3. batch_setting_up flag (cleared LAST, under g_driver.lock)
+     * Items 4-5 (pool DMA, pool buf) are handled by the explicit
+     * setup_rollback label for non-throwing failures. */
+    struct BatchSetupTxn {
+        HandleState* hs;
+        bool armed;
+        ~BatchSetupTxn() {
+            if (!armed) return;
+            std::lock_guard<std::mutex> g(g_driver.lock);
+            hs->batch_active.store(false, std::memory_order_release);
+            handle_release(hs);
+            hs->batch_setting_up.store(false, std::memory_order_release);
+        }
+    } txn{hs, true};
 
     /* --- Private, fallible phase --- */
     auto bs_sp = std::make_shared<BatchState>();
@@ -275,7 +287,7 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         bs_sp->self = bs_sp;            /* public-handle ownership */
         hs->active_batch = bs_sp;       /* owning recovery link */
         hs->batch_setting_up.store(false, std::memory_order_release);
-        txn_gate_armed = false;         /* commit: gate items disarmed */
+        txn.armed = false;           /* commit: gate items disarmed */
     }
 
     *batch = static_cast<uGDSBatchHandle_t>(bs_sp.get());
@@ -301,6 +313,7 @@ setup_rollback:
          * DMA unmap, which needs hs->ctrl alive) has been undone. */
         hs->batch_setting_up.store(false, std::memory_order_release);
     }
+    txn.armed = false;  /* explicit rollback done; prevent double-run */
     return setup_err;
     } catch (const std::bad_alloc&) {
         return make_error(UGDS_OUT_OF_MEMORY);
