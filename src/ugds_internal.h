@@ -450,6 +450,14 @@ struct BatchState {
     std::vector<uint32_t> release_scratch;
     uint32_t              n_release_pending = 0;
 
+    /* SGL segment arena for vectored batch entries.
+     * Fixed-size, lazily resized to capacity * UGDS_BATCH_IOV_MAX at the
+     * first Submitv call; never resized again.  recycle resets
+     * arena_used to 0 but never touches size()/capacity.  Each vectored
+     * entry copies its segments into [seg_begin, seg_begin+seg_count). */
+    std::vector<SegView> seg_arena;
+    uint32_t             arena_used = 0;
+
     BatchLifecycle       lifecycle = BATCH_LIFECYCLE_ACTIVE;
 
     /* Public-handle ownership: the reference held on behalf of the user's
@@ -458,6 +466,17 @@ struct BatchState {
      * WEDGED-force cleanup, via the pin rule.  The object is destroyed when
      * the last reference (self, active_batch link, or transient pin) drops. */
     std::shared_ptr<BatchState> self;
+};
+
+/* SubCmdV: one windowed sub-command for vectored batch submit.
+ * The work array is sized to the analytic total_cmds, then filled by
+ * SglWindowCursor.  The enqueue loop iterates [0, work_used) and
+ * enqueues one NVMe command per element.  window references segments in
+ * bs->seg_arena[entry.seg_begin .. entry.seg_begin+seg_count). */
+struct SubCmdV {
+    unsigned  io_idx;        /* index into bs->entries */
+    uint64_t  lba;           /* starting LBA for this window */
+    CmdWindow window;        /* window geometry (bytes, n_pages, etc.) */
 };
 
 static inline uGDSError_t make_error(uGDSOpError err) {
