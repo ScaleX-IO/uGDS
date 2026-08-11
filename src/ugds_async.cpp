@@ -1,3 +1,34 @@
+/* ugds_async.cpp -- Asynchronous vectored IO on CUDA/HIP streams.
+ *
+ * Public APIs implemented here:
+ *   - uGDSReadvAsync  / uGDSWritevAsync   (vectored async IO)
+ *
+ * Internal functions:
+ *   - async_validate_v       (handle lookup + identity-only ref acquisition)
+ *   - do_readv_writev_async   (request allocation, validation, launch)
+ *   - async_iov_execute       (callback body: late binding + engine dispatch)
+ *   - async_iov_callback      (noexcept exception boundary around execute)
+ *
+ * Late binding contract:
+ *   - segs[i].base is read at enqueue (validation + in-flight refs) and
+ *     MUST NOT change afterwards.
+ *   - segs[i].offset, segs[i].size, and *file_offset_p are read in the
+ *     stream callback (late binding).  The segs array must remain valid
+ *     until the callback runs.
+ *
+ * Callback lifecycle:
+ *   1. Enqueue: uGDSReadvAsync/uGDSWritevAsync allocates AsyncRequest,
+ *      acquires identity-only refs + handle ref under g_driver.lock,
+ *      computes launch_backend, and launches async_iov_callback on the
+ *      stream.  unique_ptr owns the request until successful launch;
+ *      HandleRefGuard owns the handle ref from validation through launch.
+ *   2. Callback: async_iov_callback (noexcept) wraps async_iov_execute
+ *      in try/catch(...).  On success, writes bytes_done_p and releases
+ *      refs.  On exception, writes -EIO to bytes_done_p and releases.
+ *   3. Cleanup: ~AsyncRequest frees heap resolved[] (if owned); owner
+ *      releases in-flight buffer refs; handle_release decrements
+ *      handle_in_flight.
+ */
 #include "ugds_internal.h"
 #if defined(_CUDA) && defined(__HIP_PLATFORM_AMD__)
 /* Dual-backend: avoid both cuda_runtime.h and hip_runtime.h in this TU
