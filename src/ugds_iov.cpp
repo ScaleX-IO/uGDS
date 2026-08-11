@@ -133,6 +133,56 @@ int SglRefOwner::acquire(const uGDSIoSegment_t* segs, uint32_t nr,
     return 0;
 }
 
+/* Identity-only acquire for the async path: skips the exact-length bound
+ * because offset/size are late-bound and not yet observable at enqueue.
+ * Fills only dma/base/registered_length/backend in seg_views_out; geometry
+ * is completed by the callback. */
+int SglRefOwner::acquire_identity_only(const uGDSIoSegment_t* segs, uint32_t nr,
+                                       const nvm_ctrl_t* hs_ctrl,
+                                       SegView* seg_views_out)
+{
+    std::lock_guard<std::mutex> g(g_driver.lock);
+
+    for (uint32_t k = 0; k < nr; ++k) {
+        const void* base = segs[k].base;
+        auto it = g_driver.buf_registry.find(base);
+        if (it == g_driver.buf_registry.end()) {
+            for (uint32_t j = 0; j < k; ++j)
+                g_driver.buf_registry.find(bases_[j])->second.in_flight
+                    .fetch_sub(1, std::memory_order_acq_rel);
+            return -EINVAL;
+        }
+
+        DriverState::BufEntry& entry = it->second;
+
+        /* Controller affinity check. */
+        if (entry.map_ctrl != hs_ctrl) {
+            for (uint32_t j = 0; j < k; ++j)
+                g_driver.buf_registry.find(bases_[j])->second.in_flight
+                    .fetch_sub(1, std::memory_order_acq_rel);
+            return -EINVAL;
+        }
+
+        /* Acquire the reference and record the base. */
+        entry.in_flight.fetch_add(1, std::memory_order_acq_rel);
+        bases_[k] = base;
+
+        /* Identity-only SegView: geometry (page_start/size) left zero for
+         * the callback to fill after late binding. */
+        if (seg_views_out != nullptr) {
+            SegView& sv = seg_views_out[k];
+            sv.dma               = entry.dma;
+            sv.base              = base;
+            sv.registered_length = entry.length;
+            sv.backend           = entry.backend;
+            sv.page_start        = 0;
+            sv.size              = 0;
+        }
+    }
+    size_ = static_cast<uint16_t>(nr);
+    return 0;
+}
+
 /* ========================================================================
  * SglWindowCursor
  * ======================================================================== */
@@ -658,29 +708,5 @@ extern "C" ssize_t uGDSWritev(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
     }
 }
 
-/* Phase 2/3 stubs: declared in the public header so the API surface is
- * visible to consumers, but return UGDS_IO_NOT_SUPPORTED until their
- * implementations land.  This keeps the library linkable without
- * undefined-reference errors.
- *
- * uGDSBatchIOSubmitv is implemented in ugds_batch.cpp. */
-
-extern "C" uGDSError_t uGDSReadvAsync(uGDSHandle_t /*fh*/,
-                                        uGDSIoSegment_t* /*segs*/,
-                                        unsigned /*nr_segs*/,
-                                        off_t* /*file_offset_p*/,
-                                        ssize_t* /*bytes_read_p*/,
-                                        void* /*stream*/)
-{
-    return uGDSError_t{UGDS_IO_NOT_SUPPORTED, 0};
-}
-
-extern "C" uGDSError_t uGDSWritevAsync(uGDSHandle_t /*fh*/,
-                                         uGDSIoSegment_t* /*segs*/,
-                                         unsigned /*nr_segs*/,
-                                         off_t* /*file_offset_p*/,
-                                         ssize_t* /*bytes_written_p*/,
-                                         void* /*stream*/)
-{
-    return uGDSError_t{UGDS_IO_NOT_SUPPORTED, 0};
-}
+/* The async vectored entry points (uGDSReadvAsync / uGDSWritevAsync) are
+ * implemented in ugds_async.cpp. */
