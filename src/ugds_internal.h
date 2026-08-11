@@ -577,18 +577,34 @@ struct AsyncRequest {
      *
      * Because SglRefOwner is noexcept move-only and not copyable, AsyncRequest
      * itself becomes move-only; the public async path only heap-allocates it
-     * via new and deletes it from the callback, so no copy is required. */
+     * via new and deletes it from the callback, so no copy is required.
+     *
+     * resolved[] is owned by the request.  resolved_owns_heap records
+     * whether it points at a heap allocation (nr_segs > 4); the
+     * destructor releases it so every callback path frees it via a
+     * single `delete req`. */
     uGDSIoSegment_t* user_segs = nullptr;
     unsigned         nr_segs = 0;
     SegView*         resolved = nullptr;  /* resolved segments (inline/heap) */
+    bool             resolved_owns_heap = false; /* iff resolved is heap[] */
     SglRefOwner      owner;               /* in-flight refs (single-owner handoff) */
     uGDSBackend_t    launch_backend = UGDS_BACKEND_DEFAULT;
 
     /* Inline SegView storage for the common nr <= 4 case (no heap at
-     * callback time, section 6.3).  resolved points here when nr_segs
-     * is in [1, 4]; otherwise it points at the heap allocation performed
-     * at enqueue. */
+     * callback time).  resolved points here when nr_segs is in [1, 4];
+     * otherwise it points at the heap allocation performed at enqueue. */
     SegView          inline_resolved[4];
+
+    /* Owning destructor.  When the callback (or any early-return path)
+     * does `delete req`, the heap resolved[] is freed exactly once.
+     * inline_resolved is not heap-allocated, so it is left alone. */
+    ~AsyncRequest() noexcept {
+        if (resolved_owns_heap) {
+            delete[] resolved;
+            resolved = nullptr;
+            resolved_owns_heap = false;
+        }
+    }
 };
 
 /* Internal stream type -- void* for backend neutrality */
