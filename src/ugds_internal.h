@@ -183,13 +183,18 @@ bool sgl_count_windows_analytic(const uGDSIoSegment_t* segs,
 /* --- SglPageCursor ----------------------------------------------------- */
 /* Forward iterator over the MPS page addresses of a window.  Replaces
  * buf_dma->ioaddrs[current_page + i] in the PRP builders.  Tracks position
- * across segment boundaries. */
+ * across segment boundaries.
+ *
+ * Usage contract: the caller initializes the cursor for a CmdWindow, then
+ * calls sgl_page_cursor_next() exactly CmdWindow::n_pages times.  The
+ * cursor walks the segment slices in order, emitting MPS-granular bus
+ * addresses from each segment's dma->ioaddrs[]. */
 struct SglPageCursor {
-    const SegView* segs;
-    uint32_t       seg_count;        /* n_segs from CmdWindow */
-    uint32_t       seg_idx;          /* current segment index (relative to window) */
-    size_t         page_in_seg;      /* absolute index into dma->ioaddrs */
-    size_t         seg_pages_left;   /* pages remaining in current segment slice */
+    const SegView* segs;        /* pointer to segs[0] (absolute base) */
+    uint32_t       abs_seg;     /* absolute segment index into segs[] */
+    uint32_t       end_seg;     /* one-past-last absolute segment index */
+    size_t         page_in_seg; /* absolute ioaddr index within current seg */
+    size_t         slice_pages_left; /* pages left in current segment slice */
 };
 
 void sgl_page_cursor_init(SglPageCursor& c, const SegView* segs,

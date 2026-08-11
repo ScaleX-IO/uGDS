@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include <time.h>
 
-static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
+nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
 {
     if (qp.irq_efd < 0) {
         nvm_cpl_t* cpl = nullptr;
@@ -288,9 +288,12 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         if (timed_out) {
             if (on_the_fly) {
                 qp.timeout_dma = buf_dma;
-            } else {
-                qp.timeout_registered_buf = bufPtr_base;
             }
+            /* Registered buffer refs are parked via SglRefOwner move
+             * into qp.timeout_refs by the caller (do_iov_engine or
+             * do_io_internal when refactored). For the legacy scalar
+             * path the ref remains held until the explicit release
+             * below is skipped on timeout. */
             buf_dma = nullptr;
         }
 
