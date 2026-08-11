@@ -588,6 +588,12 @@ extern "C" uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec)
                 pin->n_release_pending = 0;
 
                 cleanup_prp_pool(pin.get());
+                /* Release arena capacity during force teardown so the
+                 * tombstone state retained for an ACTIVE batch does not
+                 * hold ~768 KiB. swap-with-empty releases the
+                 * allocation immediately. */
+                std::vector<SegView>().swap(pin->seg_arena);
+                pin->arena_used = 0;
                 pin->lifecycle = BATCH_LIFECYCLE_TORN_DOWN;
                 handle_release(hs);
 
