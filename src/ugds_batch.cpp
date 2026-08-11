@@ -212,26 +212,25 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         hs->batch_setting_up.store(true, std::memory_order_release);
     }
 
-    /* M3: BatchSetupTxn - RAII scope guard that rolls back ALL five items
-     * if the function exits via exception or early return before commit.
-     * Items (acquired in order, rolled back in reverse):
-     *   5. pool DMA mapping
-     *   4. pool host buffer
-     *   3. batch_active claim
-     *   2. handle_in_flight reference
-     *   1. batch_setting_up flag (cleared LAST, under g_driver.lock) */
+    /* M3: BatchSetupTxn - RAII scope guard that owns ALL five items by value.
+     * Declared before bs_sp so its destructor runs first on unwind.
+     * Pool resources are owned by value (not pointer to bs_sp members)
+     * so destruction order does not cause dangling dereferences.
+     * On commit, pool resources are transferred to bs_sp->prp_pool
+     * and txn.armed is cleared.
+     * Destructor uses try_lock to remain noexcept-safe. */
     struct BatchSetupTxn {
         HandleState* hs;
-        void** pool_buf;
-        nvm_dma_t** pool_dma;
+        void* pool_buf;
+        nvm_dma_t* pool_dma;
         bool armed;
         ~BatchSetupTxn() {
             if (!armed) return;
-            /* Rollback items 5, 4 (raw resources) */
-            if (pool_dma && *pool_dma) { nvm_dma_unmap(*pool_dma); *pool_dma = nullptr; }
-            if (pool_buf && *pool_buf) { free(*pool_buf); *pool_buf = nullptr; }
-            /* Rollback items 3, 2, 1 (gate state) */
-            std::lock_guard<std::mutex> g(g_driver.lock);
+            /* Rollback items 5, 4 (owned by value) */
+            if (pool_dma) { nvm_dma_unmap(pool_dma); }
+            if (pool_buf) { free(pool_buf); }
+            /* Rollback items 3, 2, 1 (gate state, best-effort lock) */
+            std::unique_lock<std::mutex> lk(g_driver.lock, std::try_to_lock);
             hs->batch_active.store(false, std::memory_order_release);
             handle_release(hs);
             hs->batch_setting_up.store(false, std::memory_order_release);
@@ -250,32 +249,33 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
     bs_sp->release_scratch.resize(nr);
 
     const size_t page_size = hs->ctrl->page_size;
-    PRPPool& pool = bs_sp->prp_pool;
     size_t pool_bytes = UGDS_PRP_POOL_PAGES * page_size;
 
     uGDSError_t setup_err = UGDS_OK;
-    if (posix_memalign(&pool.buf, 4096, pool_bytes) != 0) {
+    void* pbuf = nullptr;
+    nvm_dma_t* pdma = nullptr;
+    if (posix_memalign(&pbuf, 4096, pool_bytes) != 0) {
         setup_err = make_error(UGDS_OUT_OF_MEMORY);
         goto setup_rollback;
     }
-    std::memset(pool.buf, 0, pool_bytes);
-    txn.pool_buf = &pool.buf;  /* arm item 4 */
+    std::memset(pbuf, 0, pool_bytes);
+    txn.pool_buf = pbuf;  /* txn owns the buffer now */
 
     {
-        int rc = nvm_dma_map_host(&pool.dma, hs->ctrl, pool.buf, pool_bytes);
+        int rc = nvm_dma_map_host(&pdma, hs->ctrl, pbuf, pool_bytes);
         if (!nvm_ok(rc)) {
-            free(pool.buf);
-            pool.buf = nullptr;
-            txn.pool_buf = nullptr;  /* already freed */
+            txn.pool_buf = nullptr;  /* txn no longer owns; we free below */
+            free(pbuf);
+            pbuf = nullptr;
             setup_err = (rc == ENOMEM)
                 ? make_error(UGDS_OUT_OF_MEMORY)
                 : make_error(UGDS_INTERNAL_ERROR);
             goto setup_rollback;
         }
     }
-    txn.pool_dma = &pool.dma;  /* arm item 5 */
-    pool.n_pages = UGDS_PRP_POOL_PAGES;
-    pool.free_bitmap = (UGDS_PRP_POOL_PAGES >= 64)
+    txn.pool_dma = pdma;  /* txn owns the mapping now */
+    bs_sp->prp_pool.n_pages = UGDS_PRP_POOL_PAGES;
+    bs_sp->prp_pool.free_bitmap = (UGDS_PRP_POOL_PAGES >= 64)
         ? ~0ULL : (1ULL << UGDS_PRP_POOL_PAGES) - 1;
 
     /* --- Publication: one g_driver.lock critical section --- */
@@ -293,36 +293,34 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
             setup_err = make_error(UGDS_INTERNAL_ERROR);
             goto setup_rollback;
         }
+        /* Transfer pool resources from txn to bs_sp */
+        bs_sp->prp_pool.buf = txn.pool_buf;
+        bs_sp->prp_pool.dma = txn.pool_dma;
+        txn.armed = false;       /* commit: txn no longer owns anything */
         bs_sp->self = bs_sp;            /* public-handle ownership */
         hs->active_batch = bs_sp;       /* owning recovery link */
         hs->batch_setting_up.store(false, std::memory_order_release);
-        txn.armed = false;           /* commit: gate items disarmed */
     }
 
     *batch = static_cast<uGDSBatchHandle_t>(bs_sp.get());
     return UGDS_OK;
 
 setup_rollback:
-    /* Rollback in reverse acquisition order:
-     * 5 (pool DMA) -> 4 (pool buf) -> 3 (BatchState shared_ptr)
-     * -> 2 (batch_active) -> 1 (handle ref + batch_setting_up LAST).
-     * pool.dma and pool.buf are cleaned up above or here; the shared_ptr
-     * reset handles item 3. */
+    /* Pool resources are owned by txn; txn.armed=false below prevents
+     * the destructor from double-freeing. Gate state is also unwound
+     * explicitly. bs_sp is reset for its own cleanup. */
+    txn.armed = false;  /* prevent double-run: we clean up explicitly */
     {
-        if (pool.dma) { nvm_dma_unmap(pool.dma); pool.dma = nullptr; }
-        if (pool.buf) { free(pool.buf); pool.buf = nullptr; }
+        if (txn.pool_dma) { nvm_dma_unmap(txn.pool_dma); txn.pool_dma = nullptr; }
+        if (txn.pool_buf) { free(txn.pool_buf); txn.pool_buf = nullptr; }
     }
-    bs_sp.reset();  /* RAII: releases BatchState if last owner */
+    bs_sp.reset();
     {
         std::lock_guard<std::mutex> g(g_driver.lock);
         hs->batch_active.store(false, std::memory_order_release);
         handle_release(hs);
-        /* batch_setting_up cleared LAST so a waiting force teardown
-         * proceeds only after every other side effect (including the
-         * DMA unmap, which needs hs->ctrl alive) has been undone. */
         hs->batch_setting_up.store(false, std::memory_order_release);
     }
-    txn.armed = false;  /* explicit rollback done; prevent double-run */
     return setup_err;
     } catch (const std::bad_alloc&) {
         return make_error(UGDS_OUT_OF_MEMORY);
