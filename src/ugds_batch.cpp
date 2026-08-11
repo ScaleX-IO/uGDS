@@ -363,7 +363,13 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         bs->arena_used = 0;
     }
 
-    if (bs->n_entries + nr > bs->capacity)
+    /* Overflow-safe capacity check.  The old n_entries + nr >
+     * capacity used unsigned addition that wraps for large nr.
+     * Reject nr > capacity outright, then check the post-recycle
+     * base.  At this point n_entries is already recycled if the
+     * round was fully consumed, so n_entries is the effective base. */
+    if (nr > bs->capacity ||
+        bs->n_entries > bs->capacity - nr)
         return make_error(UGDS_BATCH_CAPACITY_EXCEEDED);
 
     HandleState* hs = bs->hs;
@@ -942,18 +948,23 @@ extern "C" uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t batch, unsigned nr,
     if (bs->lifecycle != BATCH_LIFECYCLE_ACTIVE)
         return make_error(UGDS_INVALID_VALUE);
 
-    if (bs->n_entries + nr > bs->capacity)
+    /* Overflow-safe capacity check with an effective base that accounts
+     * for a fully consumed recyclable round, WITHOUT mutating any
+     * state.  The old code computed n_entries + nr using unsigned
+     * addition (wraps for large nr) and ran recycle before this check,
+     * so a full-capacity batch rejected any new submit and a later
+     * value error violated consume-none.  We compute the effective base
+     * here and defer the actual recycle reset to the commit step after
+     * all validation, preflight, and allocation succeed. */
+    unsigned effective_base = bs->n_entries;
+    if (effective_base > 0 && bs->n_events_read == effective_base)
+        effective_base = 0;  /* round is fully consumed; would recycle */
+
+    if (nr > bs->capacity ||
+        effective_base > bs->capacity - nr)
         return make_error(UGDS_BATCH_CAPACITY_EXCEEDED);
 
     (void)flags;
-
-    /* recycle: same path as plain submit, plus arena_used reset. */
-    if (bs->n_entries > 0 && bs->n_events_read == bs->n_entries) {
-        bs->n_entries = 0;
-        bs->n_completed = 0;
-        bs->n_events_read = 0;
-        bs->arena_used = 0;
-    }
 
     HandleState* hs = bs->hs;
     IOQueuePair& qp = hs->batch_qp->qp;
@@ -980,7 +991,11 @@ extern "C" uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t batch, unsigned nr,
      * ================================================================== */
 
     /* --- Step 1: Pure value validation (all entries, no state write) --- */
-    unsigned base = bs->n_entries;
+    /* Use effective_base, which accounts for a recyclable round
+     * without mutating bs state.  The actual recycle reset is applied
+     * as part of the infallible commit (Step 4) after all validation,
+     * preflight, and allocation succeed. */
+    unsigned base = effective_base;
 
     uint32_t per_entry_n_cmds[UGDS_MAX_BATCH_IO_SIZE];
     uint64_t total_cmds = 0;
@@ -1056,10 +1071,22 @@ extern "C" uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t batch, unsigned nr,
     /* --- Step 4: Commit-copy (infallible) ---
      * From here, no allocation or throw is possible.  Capture the
      * watermark for rollback safety; populate entries and arena.
-     * The watermark is the 8.4 rollback anchor: it is never restored
-     * in this path because no operation after this point can fail, but
-     * it documents the invariant and serves as the audit point for the
-     * fixed-size arena model. */
+     * The watermark is the rollback anchor: it is never restored in
+     * this path because no operation after this point can fail, but it
+     * documents the invariant and serves as the audit point for the
+     * fixed-size arena model.
+     *
+     * Apply the recycle reset here as the first infallible commit
+     * action.  effective_base was 0 iff the current round was fully
+     * consumed.  This is the consume-none guarantee: a value error
+     * returns without touching n_entries, n_completed, n_events_read,
+     * or arena_used. */
+    if (effective_base == 0 && bs->n_entries > 0) {
+        bs->n_entries = 0;
+        bs->n_completed = 0;
+        bs->n_events_read = 0;
+        bs->arena_used = 0;
+    }
     const uint32_t watermark = bs->arena_used;
     (void)watermark;  /* documented rollback anchor; no post-commit failure */
     uint32_t work_used = 0;
