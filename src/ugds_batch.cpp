@@ -212,13 +212,15 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         hs->batch_setting_up.store(true, std::memory_order_release);
     }
 
-    /* M3: BatchSetupTxn - RAII scope guard that owns ALL five items by value.
-     * Declared before bs_sp so its destructor runs first on unwind.
+    /* BatchSetupTxn - RAII scope guard that owns ALL five items by value.
      * Pool resources are owned by value (not pointer to bs_sp members)
      * so destruction order does not cause dangling dereferences.
      * On commit, pool resources are transferred to bs_sp->prp_pool
      * and txn.armed is cleared.
-     * Destructor uses try_lock to remain noexcept-safe. */
+     * Destructor uses a blocking lock_guard because gate-state transitions
+     * must be atomic under g_driver.lock. If the lock throws (system_error),
+     * std::terminate is the correct outcome: the process state is
+     * unrecoverable. try_to_lock would silently skip the mutex and race. */
     struct BatchSetupTxn {
         HandleState* hs;
         void* pool_buf;
@@ -229,8 +231,8 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
             /* Rollback items 5, 4 (owned by value) */
             if (pool_dma) { nvm_dma_unmap(pool_dma); }
             if (pool_buf) { free(pool_buf); }
-            /* Rollback items 3, 2, 1 (gate state, best-effort lock) */
-            std::unique_lock<std::mutex> lk(g_driver.lock, std::try_to_lock);
+            /* Rollback items 3, 2, 1 (gate state under g_driver.lock) */
+            std::lock_guard<std::mutex> g(g_driver.lock);
             hs->batch_active.store(false, std::memory_order_release);
             handle_release(hs);
             hs->batch_setting_up.store(false, std::memory_order_release);
@@ -306,10 +308,10 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
     return UGDS_OK;
 
 setup_rollback:
-    /* Pool resources are owned by txn; txn.armed=false below prevents
-     * the destructor from double-freeing. Gate state is also unwound
-     * explicitly. bs_sp is reset for its own cleanup. */
-    txn.armed = false;  /* prevent double-run: we clean up explicitly */
+    /* Clean up pool resources first, then gate state. txn stays armed
+     * so its destructor handles gate rollback if the lock_guard below
+     * throws (the destructor will block on the same lock, which is fine
+     * since the throwing lock_guard's exception unwinds this frame). */
     {
         if (txn.pool_dma) { nvm_dma_unmap(txn.pool_dma); txn.pool_dma = nullptr; }
         if (txn.pool_buf) { free(txn.pool_buf); txn.pool_buf = nullptr; }
@@ -321,6 +323,7 @@ setup_rollback:
         handle_release(hs);
         hs->batch_setting_up.store(false, std::memory_order_release);
     }
+    txn.armed = false;  /* gate cleanup done; disarm to prevent double-run */
     return setup_err;
     } catch (const std::bad_alloc&) {
         return make_error(UGDS_OUT_OF_MEMORY);
