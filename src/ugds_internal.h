@@ -556,13 +556,17 @@ IovEngineResult do_iov_engine(HandleState* hs, SegView* segs, uint32_t nr_segs,
                               SglRefOwner* owner, nvm_dma_t* transient);
 
 struct AsyncRequest {
-    uGDSHandle_t    fh;
-    void*           bufPtr_base;
-    size_t*         size_p;
-    off_t*          file_offset_p;
-    off_t*          bufPtr_offset_p;
-    ssize_t*        bytes_done_p;
-    uint8_t         opcode;
+    /* Scalar async fields (used by uGDSReadAsync/uGDSWriteAsync).
+     * Pointer parameters are caller-owned host-accessible storage
+     * read in the stream callback (late binding).  The caller MUST
+     * keep them valid until the callback runs. */
+    uGDSHandle_t    fh;             /* submitting handle (for do_io_internal) */
+    void*           bufPtr_base;    /* registered buffer base */
+    size_t*         size_p;         /* late-bound transfer size (bytes) */
+    off_t*          file_offset_p;  /* late-bound namespace offset */
+    off_t*          bufPtr_offset_p;/* late-bound offset inside bufPtr_base */
+    ssize_t*        bytes_done_p;   /* result sink (bytes or -errno) */
+    uint8_t         opcode;         /* NVM_IO_READ or NVM_IO_WRITE */
     std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive until callback */
 
     /* Vectored async fields (valid when nr_segs > 0).
