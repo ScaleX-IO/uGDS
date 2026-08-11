@@ -85,11 +85,28 @@ public:
      *
      * hs_ctrl is the submitting handle's controller (for affinity check).
      * page_size is MPS for the offset-alignment and page-index math.
-     * seg_views_out (optional): if non-null, resolved SegView[] filled. */
+     * seg_views_out (optional): if non-null, resolved SegView[] filled
+     * (identity + geometry; page_start uses segs[k].offset). */
     int acquire(const uGDSIoSegment_t* segs, uint32_t nr,
                 const nvm_ctrl_t* hs_ctrl,
                 size_t page_size,
                 SegView* seg_views_out = nullptr);
+
+    /* acquire_identity_only(segs, nr): like acquire() but performs only the
+     * registration + controller affinity checks and the in_flight
+     * reference acquisition.  The registered-range bound on
+     * offset/size is deliberately skipped because the async path
+     * defers offset/size validation to the stream callback
+     * (late binding).
+     *
+     * seg_views_out (optional): if non-null, identity-only SegView[] is
+     * filled -- dma, base, registered_length, and backend are snapshotted;
+     * page_start and size are left zero and completed by the caller once
+     * the late-bound offset/size are observed.  Returns 0 on success or
+     * -EINVAL. */
+    int acquire_identity_only(const uGDSIoSegment_t* segs, uint32_t nr,
+                              const nvm_ctrl_t* hs_ctrl,
+                              SegView* seg_views_out = nullptr);
 
     /* release(): decrement each stored occurrence under one g_driver.lock
      * hold and set size_ = 0.  Idempotent on empty. */
@@ -547,6 +564,31 @@ struct AsyncRequest {
     ssize_t*        bytes_done_p;
     uint8_t         opcode;
     std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive until callback */
+
+    /* Vectored async fields (valid when nr_segs > 0).
+     *
+     * user_segs points to the caller's array (held until the callback runs);
+     * the identity fields of resolved[i] (dma, base, registered_length,
+     * backend) were snapshotted under g_driver.lock at enqueue, and the
+     * per-segment in_flight references live in owner.  Geometry
+     * (page_start/size) is filled in the callback from user_segs[i] after
+     * late binding.  launch_backend was computed once at enqueue from the
+     * segment-backend and stream-backend snapshots and is never re-read.
+     *
+     * Because SglRefOwner is noexcept move-only and not copyable, AsyncRequest
+     * itself becomes move-only; the public async path only heap-allocates it
+     * via new and deletes it from the callback, so no copy is required. */
+    uGDSIoSegment_t* user_segs = nullptr;
+    unsigned         nr_segs = 0;
+    SegView*         resolved = nullptr;  /* resolved segments (inline/heap) */
+    SglRefOwner      owner;               /* in-flight refs (single-owner handoff) */
+    uGDSBackend_t    launch_backend = UGDS_BACKEND_DEFAULT;
+
+    /* Inline SegView storage for the common nr <= 4 case (no heap at
+     * callback time, section 6.3).  resolved points here when nr_segs
+     * is in [1, 4]; otherwise it points at the heap allocation performed
+     * at enqueue. */
+    SegView          inline_resolved[4];
 };
 
 /* Internal stream type -- void* for backend neutrality */
