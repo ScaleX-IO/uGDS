@@ -64,16 +64,22 @@ static void drain_release_scratch(BatchState* bs)
     bs->n_release_pending = 0;
 }
 
-/* Abort a Phase-3 entry that is WAITING or PENDING.
+/* Abort a Phase-3 entry that is WAITING, PENDING, or FAILED.
  * Truncates n_cmds to the submitted prefix (n_cmds_submitted), records
  * -ECANCELED, and queues the entry for deferred release if all its
  * submitted commands have already completed.  Must be called
- * under bs->lock + qp.lock; does NOT touch g_driver.lock (R2 MINOR-1). */
+ * under bs->lock + qp.lock; does NOT touch g_driver.lock (R2 MINOR-1).
+ *
+ * C4 (review R1): abort also accepts the FAILED state so a device
+ * error latched by drain_one_completion is not stranded: the submitted
+ * prefix still drains exactly once and refs are released.  A COMPLETE
+ * or TORN_DOWN entry is left untouched. */
 static inline void abort_phase3_entry(BatchState* bs, unsigned idx)
 {
     BatchIOEntry& entry = bs->entries[idx];
     if (entry.status != UGDS_BATCH_WAITING &&
-        entry.status != UGDS_BATCH_PENDING)
+        entry.status != UGDS_BATCH_PENDING &&
+        entry.status != UGDS_BATCH_FAILED)
         return;
     entry.error_code = -ECANCELED;
     entry.n_cmds = entry.n_cmds_submitted;  /* discard unsubmitted suffix */
@@ -646,10 +652,14 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             cs.active = true;
             bs->in_flight++;
 
-            /* M2: commit the slot map first, then increment
-             * n_cmds_submitted, then transition WAITING->PENDING. */
+            /* Commit the slot map first, then increment
+             * n_cmds_submitted, then transition WAITING->PENDING.
+             * Only WAITING -> PENDING is allowed; do not overwrite a
+             * latched FAILED state from an earlier
+             * drain_one_completion during backpressure. */
             entry.n_cmds_submitted++;
-            entry.status = UGDS_BATCH_PENDING;
+            if (entry.status == UGDS_BATCH_WAITING)
+                entry.status = UGDS_BATCH_PENDING;
         }
 
         // Single doorbell for all commands
@@ -1322,9 +1332,13 @@ extern "C" uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t batch, unsigned nr,
             cs.active = true;
             bs->in_flight++;
 
-            /* Commit slot map, then n_cmds_submitted, then WAITING->PENDING. */
+            /* Commit slot map, then n_cmds_submitted, then WAITING->PENDING.
+             * Only WAITING -> PENDING is allowed; a latched FAILED from
+             * an earlier drain_one_completion during backpressure must
+             * persist. */
             entry.n_cmds_submitted++;
-            entry.status = UGDS_BATCH_PENDING;
+            if (entry.status == UGDS_BATCH_WAITING)
+                entry.status = UGDS_BATCH_PENDING;
         }
 
         /* Single doorbell for all enqueued commands. */
