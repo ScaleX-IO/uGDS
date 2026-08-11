@@ -212,25 +212,31 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         hs->batch_setting_up.store(true, std::memory_order_release);
     }
 
-    /* M3: BatchSetupTxn - RAII scope guard that rolls back gate state
+    /* M3: BatchSetupTxn - RAII scope guard that rolls back ALL five items
      * if the function exits via exception or early return before commit.
-     * Five items (acquired in order, rolled back in reverse):
-     *   1. handle_in_flight reference
-     *   2. batch_active claim
-     *   3. batch_setting_up flag (cleared LAST, under g_driver.lock)
-     * Items 4-5 (pool DMA, pool buf) are handled by the explicit
-     * setup_rollback label for non-throwing failures. */
+     * Items (acquired in order, rolled back in reverse):
+     *   5. pool DMA mapping
+     *   4. pool host buffer
+     *   3. batch_active claim
+     *   2. handle_in_flight reference
+     *   1. batch_setting_up flag (cleared LAST, under g_driver.lock) */
     struct BatchSetupTxn {
         HandleState* hs;
+        void** pool_buf;
+        nvm_dma_t** pool_dma;
         bool armed;
         ~BatchSetupTxn() {
             if (!armed) return;
+            /* Rollback items 5, 4 (raw resources) */
+            if (pool_dma && *pool_dma) { nvm_dma_unmap(*pool_dma); *pool_dma = nullptr; }
+            if (pool_buf && *pool_buf) { free(*pool_buf); *pool_buf = nullptr; }
+            /* Rollback items 3, 2, 1 (gate state) */
             std::lock_guard<std::mutex> g(g_driver.lock);
             hs->batch_active.store(false, std::memory_order_release);
             handle_release(hs);
             hs->batch_setting_up.store(false, std::memory_order_release);
         }
-    } txn{hs, true};
+    } txn{hs, nullptr, nullptr, true};
 
     /* --- Private, fallible phase --- */
     auto bs_sp = std::make_shared<BatchState>();
@@ -253,18 +259,21 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         goto setup_rollback;
     }
     std::memset(pool.buf, 0, pool_bytes);
+    txn.pool_buf = &pool.buf;  /* arm item 4 */
 
     {
         int rc = nvm_dma_map_host(&pool.dma, hs->ctrl, pool.buf, pool_bytes);
         if (!nvm_ok(rc)) {
             free(pool.buf);
             pool.buf = nullptr;
+            txn.pool_buf = nullptr;  /* already freed */
             setup_err = (rc == ENOMEM)
                 ? make_error(UGDS_OUT_OF_MEMORY)
                 : make_error(UGDS_INTERNAL_ERROR);
             goto setup_rollback;
         }
     }
+    txn.pool_dma = &pool.dma;  /* arm item 5 */
     pool.n_pages = UGDS_PRP_POOL_PAGES;
     pool.free_bitmap = (UGDS_PRP_POOL_PAGES >= 64)
         ? ~0ULL : (1ULL << UGDS_PRP_POOL_PAGES) - 1;
@@ -654,6 +663,7 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
                                               uGDSIOEvents_t* events,
                                               struct timespec* timeout)
 {
+    try {
     if (batch == nullptr || nr == nullptr || events == nullptr)
         return make_error(UGDS_INVALID_VALUE);
 
@@ -720,12 +730,15 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
 
         __builtin_ia32_pause();
     }
+    } catch (...) {
+        return make_error(UGDS_INTERNAL_ERROR);
+    }
 }
 
 extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
 {
     if (batch == nullptr) return;
-
+    try {
     BatchState* bs = static_cast<BatchState*>(batch);
     HandleState* hs = bs->hs;
 
@@ -819,4 +832,9 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
 
     /* link_pin then last_pin drop here; whichever is the final reference
      * runs ~BatchState with no guard addressing its members. */
+    } catch (...) {
+        /* Destroy is void; swallow to prevent crossing C ABI.
+         * The BatchState may be partially cleaned up but shared_ptr
+         * ref counts prevent double-free. */
+    }
 }
