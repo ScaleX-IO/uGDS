@@ -354,39 +354,30 @@ extern "C" uGDSError_t uGDSBufRegisterDmabuf(const void* bufPtr_base,
             return make_error(UGDS_INVALID_VALUE);
         }
 
-        /* Lock the driver to check for duplicate registration,
-         * validate MPS alignment, and capture the controller reference.
-         * The controller pointer is stable for the lifetime of the
-         * driver session (held by handle_registry shared_ptrs), so it
-         * is safe to use after releasing the lock for the ioctl. */
-        {
-            std::lock_guard<std::mutex> guard(g_driver.lock);
+        /* Hold g_driver.lock across the entire mapping + registration,
+         * matching the lifetime model of uGDSBufRegister(). This prevents
+         * concurrent HandleDeregister from clearing default_ctrl while
+         * the ioctl is in progress. The ioctl sleeps (dma_buf_pin, fence
+         * wait) but the mutex is sleepable. */
+        std::lock_guard<std::mutex> guard(g_driver.lock);
 
-            if (g_driver.buf_registry.find(bufPtr_base) != g_driver.buf_registry.end()) {
-                return make_error(UGDS_MEMORY_ALREADY_REGISTERED);
-            }
-
-            if (g_driver.default_ctrl == nullptr) {
-                return make_error(UGDS_DRIVER_NOT_INITIALIZED);
-            }
-
-            /* MPS alignment (same check as uGDSBufRegister) */
-            const size_t mps = g_driver.default_ctrl->page_size;
-            if (mps > 0 && (reinterpret_cast<uintptr_t>(bufPtr_base) % mps) != 0) {
-                return make_error(UGDS_INVALID_VALUE);
-            }
+        if (g_driver.buf_registry.find(bufPtr_base) != g_driver.buf_registry.end()) {
+            return make_error(UGDS_MEMORY_ALREADY_REGISTERED);
         }
 
-        /* The kernel ioctl is executed without holding g_driver.lock.
-         * After the ioctl, we reacquire the lock and commit only if
-         * the driver is still open and the key is still absent. */
+        if (g_driver.default_ctrl == nullptr) {
+            return make_error(UGDS_DRIVER_NOT_INITIALIZED);
+        }
 
-        /* Always use the V2 ioctl for external registrations.
-         * When REQUIRE_P2P is set, the kernel rejects non-peer-BAR
-         * mappings. Without it, the mapping succeeds but the caller
-         * can inspect the classification via uGDSQueryDmabufSupport.
-         * This ensures all external mappings go through pin accounting
-         * and produce a mapping class result. */
+        /* MPS alignment (same check as uGDSBufRegister) */
+        const size_t mps = g_driver.default_ctrl->page_size;
+        if (mps > 0 && (reinterpret_cast<uintptr_t>(bufPtr_base) % mps) != 0) {
+            return make_error(UGDS_INVALID_VALUE);
+        }
+
+        /* V2 ioctl for external registrations: always uses V2 for pin
+         * accounting and mapping classification. REQUIRE_P2P rejects
+         * non-peer-BAR mappings. */
         nvm_dma_t* dma = nullptr;
         struct nvm_ioctl_dmabuf_v2 v2result;
         memset(&v2result, 0, sizeof(v2result));
@@ -413,25 +404,12 @@ extern "C" uGDSError_t uGDSBufRegisterDmabuf(const void* bufPtr_base,
          * unmaps it instead of leaking. */
         MappedDmaGuard map_guard(dma);
 
-        /* Reacquire lock and commit */
-        {
-            std::lock_guard<std::mutex> guard(g_driver.lock);
-
-            /* Re-check driver state and duplicate key */
-            if (!g_driver.initialized) {
-                return make_error(UGDS_DRIVER_CLOSING);
-            }
-            if (g_driver.buf_registry.find(bufPtr_base) != g_driver.buf_registry.end()) {
-                return make_error(UGDS_MEMORY_ALREADY_REGISTERED);
-            }
-
-            auto [it, inserted] = g_driver.buf_registry.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(bufPtr_base),
-                std::forward_as_tuple(dma, UGDS_BACKEND_EXTERNAL, length,
-                                      g_driver.default_ctrl));
-            (void)it; (void)inserted;
-        }
+        auto [it, inserted] = g_driver.buf_registry.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(bufPtr_base),
+            std::forward_as_tuple(dma, UGDS_BACKEND_EXTERNAL, length,
+                                  g_driver.default_ctrl));
+        (void)it; (void)inserted;
 
         map_guard.disarm();
         return UGDS_OK;
