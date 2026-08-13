@@ -68,6 +68,17 @@ typedef enum uGDSOpError {
     UGDS_RDMA_MR_STILL_ACTIVE        = UGDS_BASE_ERR + 41,
     UGDS_BUSY                        = UGDS_BASE_ERR + 42,
     UGDS_OUT_OF_MEMORY               = UGDS_BASE_ERR + 43,
+    UGDS_BAD_FILE_DESCRIPTOR         = UGDS_BASE_ERR + 44,
+    UGDS_DMABUF_INVALID_FD           = UGDS_BASE_ERR + 45,
+    UGDS_DMABUF_NOT_P2P              = UGDS_BASE_ERR + 46,
+    UGDS_FD_LIMIT_REACHED            = UGDS_BASE_ERR + 47,
+    UGDS_INTERRUPTED                 = UGDS_BASE_ERR + 48,
+    UGDS_DEVICE_LOST                 = UGDS_BASE_ERR + 49,
+    UGDS_INVALID_USER_ADDRESS        = UGDS_BASE_ERR + 50,
+    UGDS_ASYNC_QUEUE_FULL            = UGDS_BASE_ERR + 51,
+    UGDS_PIN_LIMIT_EXCEEDED          = UGDS_BASE_ERR + 53,
+    UGDS_TIMED_OUT                   = UGDS_BASE_ERR + 54,
+    UGDS_STRUCT_VERSION_MISMATCH     = UGDS_BASE_ERR + 55,
 } uGDSOpError;
 
 static inline const char* uGDS_status_error(uGDSOpError status) {
@@ -93,6 +104,17 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
     case UGDS_BUSY:                        return "resource busy, retry";
     case UGDS_RDMA_MR_STILL_ACTIVE:       return "RDMA MR still active";
     case UGDS_OUT_OF_MEMORY:               return "out of memory";
+    case UGDS_BAD_FILE_DESCRIPTOR:         return "bad file descriptor";
+    case UGDS_DMABUF_INVALID_FD:           return "invalid dma-buf file descriptor";
+    case UGDS_DMABUF_NOT_P2P:              return "dma-buf is not PCIe peer BAR";
+    case UGDS_FD_LIMIT_REACHED:            return "file descriptor limit reached";
+    case UGDS_INTERRUPTED:                 return "operation interrupted";
+    case UGDS_DEVICE_LOST:                 return "device lost";
+    case UGDS_INVALID_USER_ADDRESS:        return "invalid user address";
+    case UGDS_ASYNC_QUEUE_FULL:            return "async queue full";
+    case UGDS_PIN_LIMIT_EXCEEDED:          return "pin limit exceeded";
+    case UGDS_TIMED_OUT:                   return "operation timed out";
+    case UGDS_STRUCT_VERSION_MISMATCH:     return "struct version mismatch";
     default:                                  return "unknown uGDS error";
     }
 }
@@ -189,6 +211,7 @@ typedef enum uGDSBackend {
     UGDS_BACKEND_DEFAULT = 0,
     UGDS_BACKEND_CUDA    = 1,
     UGDS_BACKEND_HIP     = 2,
+    UGDS_BACKEND_EXTERNAL = 3,
 } uGDSBackend_t;
 
 /* Extended buffer registration with backend selection and export flag */
@@ -243,6 +266,55 @@ uGDSError_t uGDSRDMARegister(const void* bufPtr_base,
 
 uGDSError_t uGDSRDMAUnregister(const void* bufPtr_base,
                                 uGDSRDMARegion_t* region);
+
+/* --- External dma-buf registration ----------------------------------- */
+
+/* Versioned parameter structure for external dma-buf registration.
+ * All reserved fields must be zero. */
+#define UGDS_DMABUF_REG_PARAMS_VERSION_1 1u
+#define UGDS_DMABUF_REQUIRE_P2P          (1u << 0)
+
+typedef struct uGDSDmabufRegParams {
+    uint32_t struct_size;       /* sizeof(uGDSDmabufRegParams_t) */
+    uint16_t version;           /* UGDS_DMABUF_REG_PARAMS_VERSION_1 */
+    uint16_t reserved0;         /* must be zero */
+    int32_t  dmabuf_fd;         /* application-owned dma-buf fd */
+    uint32_t flags;             /* UGDS_DMABUF_* */
+    uint64_t dmabuf_offset;     /* buffer VA - allocation base */
+    uint64_t reserved[4];       /* must be zero */
+} uGDSDmabufRegParams_t;
+
+/* Register an externally exported dma-buf fd for direct NVMe P2P DMA.
+ *
+ * The caller exports GPU memory as a dma-buf fd (e.g. via Intel Level
+ * Zero zeMemGetAllocProperties) and passes it here.  uGDS duplicates
+ * the fd (F_DUPFD_CLOEXEC) so the caller may close the original fd
+ * after this call returns.
+ *
+ * With UGDS_DMABUF_REQUIRE_P2P, the kernel verifies that every mapped
+ * page falls within a single PCI peer device's memory BAR; failure
+ * returns UGDS_DMABUF_NOT_P2P.
+ *
+ * The buffer is tagged UGDS_BACKEND_EXTERNAL: it has no implicit
+ * stream launch backend.  Async stream I/O on an external buffer
+ * requires a stream explicitly registered as CUDA or HIP.
+ *
+ * bufPtr_base is the GPU virtual address of the allocation base.
+ * length is the exact byte count (not page-rounded). */
+uGDSError_t uGDSBufRegisterDmabuf(const void* bufPtr_base, size_t length,
+                                    const uGDSDmabufRegParams_t* params);
+
+/* Capability query for dma-buf support.  Combines compile-time library
+ * support with kernel-side V2/strict-P2P/pin-accounting capabilities.
+ * Zero-initialize the struct before calling. */
+typedef struct uGDSDmabufCaps {
+    bool lib_dmabuf;            /* UGDS_HAVE_DMABUF compiled in */
+    bool kmod_dmabuf_v2;        /* kernel supports V2 ioctl */
+    bool kmod_require_p2p;      /* kernel supports UGDS_DMABUF_REQUIRE_P2P */
+    bool kmod_pin_accounting;   /* kernel enforces pin limits */
+} uGDSDmabufCaps_t;
+
+uGDSError_t uGDSQueryDmabufSupport(uGDSDmabufCaps_t* caps);
 
 /* Synchronous read from the namespace into a registered device buffer.
  * 'bufPtr_base' must have been registered via uGDSBufRegister/

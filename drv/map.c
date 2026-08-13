@@ -583,6 +583,7 @@ struct dmabuf_region
     struct dma_buf*            dmabuf;
     struct dma_buf_attachment* attachment;
     struct sg_table*           sgt;
+    struct pci_dev*            peer_pdev;  /* matched peer device, or NULL */
 };
 
 
@@ -640,6 +641,8 @@ void release_dmabuf_memory(struct map* map)
             dma_buf_detach(dr->dmabuf, dr->attachment);
         if (dr->dmabuf != NULL)
             dma_buf_put(dr->dmabuf);
+        if (dr->peer_pdev != NULL)
+            pci_dev_put(dr->peer_pdev);
         kfree(dr);
         map->data = NULL;
     }
@@ -922,3 +925,343 @@ struct map* map_dmabuf(const struct ctrl* ctrl,
     return md;
 }
 #endif
+
+
+/* --- V2: P2P BAR verification and strict mapping ------------------- */
+
+#if defined(UGDS_HAVE_DMABUF)
+
+/*
+ * Check whether a DMA address range falls within a specific PCI BAR
+ * of the given device. The addresses returned by dma_buf_map_attachment
+ * are in the NVMe importer's bus DMA domain, which on direct-mapped
+ * platforms equals the PCI bus address space.
+ *
+ * Returns true if [addr, addr+len) is entirely within the BAR window.
+ */
+static bool ugds_range_in_bar(struct pci_dev* pdev, int bar,
+                               u64 addr, u64 len)
+{
+    u64 bar_start;
+    u64 bar_len;
+    u64 range_end;
+
+    if (!(pci_resource_flags(pdev, bar) & IORESOURCE_MEM))
+        return false;
+
+    bar_len = pci_resource_len(pdev, bar);
+    if (bar_len == 0 || len == 0)
+        return false;
+
+    /* Guard against overflow in addr + len */
+    if (check_add_overflow(addr, len - 1, &range_end))
+        return false;
+
+    bar_start = pci_bus_address(pdev, bar);
+
+    return addr >= bar_start && (range_end - bar_start) < bar_len;
+}
+
+/*
+ * Scan all PCI devices in the same domain as the importer (NVMe),
+ * skipping the importer itself, and find the one whose memory BAR
+ * contains the given address range. Returns a pci_dev reference
+ * (held) or NULL.
+ */
+static struct pci_dev* ugds_find_peer_bar_owner(struct pci_dev* importer,
+                                                  u64 addr, u64 len,
+                                                  int* matched_bar)
+{
+    struct pci_dev* peer = NULL;
+    int bar;
+
+    for_each_pci_dev(peer) {
+        if (peer == importer)
+            continue;
+        if (pci_domain_nr(peer->bus) != pci_domain_nr(importer->bus))
+            continue;
+
+        for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+            if (ugds_range_in_bar(peer, bar, addr, len)) {
+                *matched_bar = bar;
+                return peer;  /* for_each_pci_dev holds a reference */
+            }
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Classify the flattened DMA address list against peer PCI BAR windows.
+ *
+ * Identifies whether all pages belong to a single peer device's memory
+ * BAR (PEER_BAR) or not (SYSTEM). When strict P2P is required, a
+ * non-PEER_BAR result causes the mapping to fail with -EOPNOTSUPP.
+ *
+ * On success (PEER_BAR), info->peer_pdev holds a referenced pci_dev
+ * that the caller transfers to dmabuf_region.
+ */
+static int ugds_classify_peer_bar(struct map* map,
+                                   unsigned long expected_pages,
+                                   struct ugds_dmabuf_map_info* info)
+{
+    struct pci_dev* peer;
+    unsigned long i;
+    int first_bar;
+
+    if (expected_pages == 0 || map->n_addrs == 0) {
+        info->mapping_class = NVM_DMABUF_MAPPING_SYSTEM;
+        info->failure_reason = NVM_DMABUF_FAIL_NOT_PEER_BAR;
+        return -EOPNOTSUPP;
+    }
+
+    /* Find the peer device that owns the first page */
+    peer = ugds_find_peer_bar_owner(map->pdev, map->addrs[0],
+                                     map->page_size, &first_bar);
+    if (peer == NULL)
+        goto not_peer;
+
+    /* Verify every subsequent page is in a BAR of the SAME device */
+    for (i = 1; i < expected_pages; i++) {
+        bool found = false;
+        int bar;
+
+        for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+            if (ugds_range_in_bar(peer, bar, map->addrs[i],
+                                   map->page_size)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            pci_dev_put(peer);
+            goto not_peer;
+        }
+    }
+
+    info->mapping_class = NVM_DMABUF_MAPPING_PEER_BAR;
+    info->failure_reason = NVM_DMABUF_FAIL_NONE;
+    info->peer_domain = pci_domain_nr(peer->bus);
+    info->peer_bus = peer->bus->number;
+    info->peer_devfn = peer->devfn;
+    info->peer_bar = first_bar;
+    info->peer_bar_start = pci_bus_address(peer, first_bar);
+    info->peer_bar_length = pci_resource_len(peer, first_bar);
+    info->peer_pdev = peer;
+    return 0;
+
+not_peer:
+    info->mapping_class = NVM_DMABUF_MAPPING_SYSTEM;
+    info->failure_reason = NVM_DMABUF_FAIL_NOT_PEER_BAR;
+    return -EOPNOTSUPP;
+}
+
+/*
+ * V2 map_dmabuf_memory: extends the V1 sequence with classification
+ * and strict P2P enforcement. The attach/pin/fence/map/flatten
+ * sequence is identical to V1; the new logic is purely post-flatten.
+ *
+ * Returns 0 on success with info populated. On failure, info contains
+ * the best-effort failure_reason and no addresses reach userspace.
+ */
+static int map_dmabuf_memory_v2(struct map* map, int dmabuf_fd,
+                                  u64 dmabuf_offset, unsigned long expected_pages,
+                                  size_t ioaddrs_capacity,
+                                  u16 map_flags,
+                                  struct ugds_dmabuf_map_info* info)
+{
+    struct dmabuf_region* dr;
+    unsigned long ctrl_page_size = PAGE_SIZE;
+    int err;
+    long fence_ret;
+
+    info->mapping_class = NVM_DMABUF_MAPPING_UNKNOWN;
+    info->failure_reason = NVM_DMABUF_FAIL_NONE;
+    info->peer_pdev = NULL;
+
+    if (expected_pages > ioaddrs_capacity) {
+        info->failure_reason = NVM_DMABUF_FAIL_RANGE;
+        return -EOVERFLOW;
+    }
+
+    dr = kmalloc(sizeof(struct dmabuf_region), GFP_KERNEL);
+    if (dr == NULL) {
+        printk(KERN_CRIT "uGDS: failed to allocate dmabuf region\n");
+        return -ENOMEM;
+    }
+    dr->dmabuf = NULL;
+    dr->attachment = NULL;
+    dr->sgt = NULL;
+    dr->peer_pdev = NULL;
+
+    dr->dmabuf = dma_buf_get(dmabuf_fd);
+    if (IS_ERR(dr->dmabuf)) {
+        err = PTR_ERR(dr->dmabuf);
+        if (err == -EBADF)
+            info->failure_reason = NVM_DMABUF_FAIL_BAD_FD;
+        else
+            info->failure_reason = NVM_DMABUF_FAIL_NOT_DMABUF;
+        kfree(dr);
+        return err;
+    }
+
+    /* Range check */
+    if (expected_pages > dr->dmabuf->size / ctrl_page_size ||
+        dmabuf_offset > dr->dmabuf->size - expected_pages * ctrl_page_size) {
+        printk(KERN_ERR "uGDS: requested range (%llu + %lu pages) "
+               "exceeds dma-buf size %zu\n",
+               (unsigned long long)dmabuf_offset, expected_pages,
+               dr->dmabuf->size);
+        info->failure_reason = NVM_DMABUF_FAIL_RANGE;
+        dma_buf_put(dr->dmabuf);
+        kfree(dr);
+        return -EINVAL;
+    }
+
+    /* Attach with peer2peer enabled */
+    dr->attachment = dma_buf_dynamic_attach(dr->dmabuf, &map->pdev->dev,
+                                             &ugds_dmabuf_attach_ops, map);
+    if (IS_ERR(dr->attachment)) {
+        err = PTR_ERR(dr->attachment);
+        info->failure_reason = NVM_DMABUF_FAIL_MAP;
+        dma_buf_put(dr->dmabuf);
+        kfree(dr);
+        return err;
+    }
+
+    /* Pin */
+    dma_resv_lock(dr->dmabuf->resv, NULL);
+    err = dma_buf_pin(dr->attachment);
+    if (!err) {
+        atomic_set(&map->invalid, 0);
+    }
+    dma_resv_unlock(dr->dmabuf->resv);
+    if (err) {
+        printk(KERN_ERR "uGDS: dma_buf_pin failed: %d\n", err);
+        info->failure_reason = NVM_DMABUF_FAIL_PIN;
+        dma_buf_detach(dr->dmabuf, dr->attachment);
+        dma_buf_put(dr->dmabuf);
+        kfree(dr);
+        return err;
+    }
+
+    /* Wait for write fences, then map for DMA */
+    dma_resv_lock(dr->dmabuf->resv, NULL);
+    fence_ret = dma_resv_wait_timeout(dr->dmabuf->resv,
+                                       DMA_RESV_USAGE_WRITE, true,
+                                       msecs_to_jiffies(10000));
+    if (fence_ret == 0)
+        fence_ret = -ETIMEDOUT;
+    if (fence_ret < 0) {
+        dma_resv_unlock(dr->dmabuf->resv);
+        printk(KERN_ERR "uGDS: dma_resv_wait_timeout failed: %ld\n",
+               fence_ret);
+        info->failure_reason = NVM_DMABUF_FAIL_FENCE;
+        dma_resv_lock(dr->dmabuf->resv, NULL);
+        dma_buf_unpin(dr->attachment);
+        dma_resv_unlock(dr->dmabuf->resv);
+        dma_buf_detach(dr->dmabuf, dr->attachment);
+        dma_buf_put(dr->dmabuf);
+        kfree(dr);
+        return fence_ret;
+    }
+    dr->sgt = dma_buf_map_attachment(dr->attachment, DMA_BIDIRECTIONAL);
+    dma_resv_unlock(dr->dmabuf->resv);
+    if (IS_ERR(dr->sgt)) {
+        err = PTR_ERR(dr->sgt);
+        info->failure_reason = NVM_DMABUF_FAIL_MAP;
+        dma_resv_lock(dr->dmabuf->resv, NULL);
+        dma_buf_unpin(dr->attachment);
+        dma_resv_unlock(dr->dmabuf->resv);
+        dma_buf_detach(dr->dmabuf, dr->attachment);
+        dma_buf_put(dr->dmabuf);
+        kfree(dr);
+        return err;
+    }
+
+    map->page_size = ctrl_page_size;
+    map->data = dr;
+    map->release = release_dmabuf_memory;
+
+    /* Flatten SG table */
+    err = sg_flatten_to_addrs(dr->sgt, map->addrs, expected_pages,
+                               ctrl_page_size, dmabuf_offset);
+    if (err) {
+        info->failure_reason = NVM_DMABUF_FAIL_SG_LAYOUT;
+        goto fail;
+    }
+
+    /* Classify: are these addresses peer-BAR or system memory? */
+    err = ugds_classify_peer_bar(map, expected_pages, info);
+    if (err && (map_flags & UGDS_DMABUF_REQUIRE_P2P)) {
+        /* Strict mode: reject non-P2P mappings */
+        printk(KERN_INFO "uGDS: strict P2P required but mapping "
+               "classified as %u (reason %u)\n",
+               info->mapping_class, info->failure_reason);
+        goto fail;
+    }
+
+    /* Transfer peer device reference to dmabuf_region */
+    if (info->peer_pdev) {
+        dr->peer_pdev = info->peer_pdev;
+        info->peer_pdev = NULL;
+    }
+
+    return 0;
+
+fail:
+    dma_resv_lock(dr->dmabuf->resv, NULL);
+    dma_buf_unmap_attachment(dr->attachment, dr->sgt, DMA_BIDIRECTIONAL);
+    dma_buf_unpin(dr->attachment);
+    dma_resv_unlock(dr->dmabuf->resv);
+    dma_buf_detach(dr->dmabuf, dr->attachment);
+    dma_buf_put(dr->dmabuf);
+    if (info->peer_pdev) {
+        pci_dev_put(info->peer_pdev);
+        info->peer_pdev = NULL;
+    }
+    kfree(dr);
+    map->data = NULL;
+    return err;
+}
+
+struct map* map_dmabuf_v2(const struct ctrl* ctrl,
+                           u64 gpu_ptr, int dmabuf_fd,
+                           u64 dmabuf_offset, unsigned long n_pages,
+                           size_t ioaddrs_capacity,
+                           u16 map_flags,
+                           struct ugds_dmabuf_map_info* info)
+{
+    int err;
+    struct map* md;
+
+    if (n_pages < 1) {
+        info->mapping_class = NVM_DMABUF_MAPPING_UNKNOWN;
+        info->failure_reason = NVM_DMABUF_FAIL_RANGE;
+        return ERR_PTR(-EINVAL);
+    }
+
+    md = create_descriptor(ctrl, gpu_ptr, n_pages);
+    if (IS_ERR(md)) {
+        info->mapping_class = NVM_DMABUF_MAPPING_UNKNOWN;
+        info->failure_reason = NVM_DMABUF_FAIL_NONE;
+        return md;
+    }
+
+    md->page_size = PAGE_SIZE;
+    err = map_dmabuf_memory_v2(md, dmabuf_fd, dmabuf_offset, n_pages,
+                                ioaddrs_capacity, map_flags, info);
+    if (err != 0) {
+        unmap_and_release(md);
+        return ERR_PTR(err);
+    }
+
+    printk(KERN_DEBUG "uGDS: V2 mapped %lu dmabuf pages at %llx "
+           "(class=%u, peer=%u:%u:%u.%u bar=%u)\n",
+           md->n_addrs, md->vaddr, info->mapping_class,
+           info->peer_domain, info->peer_bus,
+           PCI_SLOT(info->peer_devfn), PCI_FUNC(info->peer_devfn),
+           info->peer_bar);
+    return md;
+}
+#endif /* UGDS_HAVE_DMABUF */

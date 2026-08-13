@@ -72,7 +72,7 @@ struct map* map_device_memory(const struct ctrl* ctrl, u64 vaddr, unsigned long 
 #if defined(UGDS_HAVE_DMABUF)
 /*
  * Map GPU memory via standard Linux DMA-buf framework.
- * Used by AMD HIP/ROCm backend.
+ * Used by AMD HIP/ROCm backend and external dma-buf import.
  */
 struct map* map_dmabuf(const struct ctrl* ctrl,
                         u64 gpu_ptr, int dmabuf_fd,
@@ -94,6 +94,51 @@ int sg_flatten_to_addrs(struct sg_table* sgt, u64* addrs,
                         unsigned long expected_pages,
                         unsigned long ctrl_page_size,
                         u64 hsa_offset);
+#endif
+
+
+
+/* --- V2 dma-buf mapping with P2P verification ---------------------- */
+
+#include "ioctl.h"
+
+/*
+ * Result of a dma-buf mapping attempt. The kernel fills this before
+ * returning addresses to userspace. pci.c copies the relevant fields
+ * into the V2 ioctl output.
+ */
+struct ugds_dmabuf_map_info {
+    u32     mapping_class;      /* enum nvm_dmabuf_mapping_class */
+    u32     failure_reason;     /* enum nvm_dmabuf_failure_reason */
+    u16     peer_domain;
+    u8      peer_bus;
+    u8      peer_devfn;
+    u32     peer_bar;
+    u64     peer_bar_start;
+    u64     peer_bar_length;
+    struct pci_dev* peer_pdev;  /* referenced device, or NULL */
+};
+
+
+#if defined(UGDS_HAVE_DMABUF)
+/*
+ * Map a dma-buf with optional strict P2P enforcement.
+ *
+ * When map_flags has UGDS_DMABUF_REQUIRE_P2P set, every flattened
+ * DMA address must fall within a memory BAR of a single peer PCI
+ * device (other than the NVMe importer). If any address is in
+ * system memory or matches a different device, the function fails
+ * with -EOPNOTSUPP and no addresses are exposed.
+ *
+ * info is always populated with mapping_class and failure_reason
+ * so callers can report diagnostics even on failure.
+ */
+struct map* map_dmabuf_v2(const struct ctrl* ctrl,
+                           u64 gpu_ptr, int dmabuf_fd,
+                           u64 dmabuf_offset, unsigned long n_pages,
+                           size_t ioaddrs_capacity,
+                           u16 map_flags,
+                           struct ugds_dmabuf_map_info* info);
 #endif
 
 

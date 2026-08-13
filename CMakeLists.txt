@@ -184,10 +184,17 @@ if(UGDS_BACKEND_HIP)
     endif()
 endif()
 
-# UGDS_HAVE_DMABUF: unified dmabuf guard (HIP or CUDA-dmabuf)
+# UGDS_HAVE_DMABUF: unified dmabuf guard (HIP, CUDA-dmabuf, or external import)
 # Use PUBLIC so test targets linking against ugds also see the definition.
-if(UGDS_BACKEND_HIP OR (UGDS_BACKEND_CUDA AND HAVE_CUDA_DMABUF))
+option(UGDS_ENABLE_DMABUF_IMPORT "Enable uGDSBufRegisterDmabuf (external fd)" ON)
+
+if(UGDS_BACKEND_HIP OR (UGDS_BACKEND_CUDA AND HAVE_CUDA_DMABUF)
+   OR UGDS_ENABLE_DMABUF_IMPORT)
     target_compile_definitions(ugds PUBLIC UGDS_HAVE_DMABUF)
+endif()
+
+if(UGDS_ENABLE_DMABUF_IMPORT)
+    target_compile_definitions(ugds PRIVATE UGDS_ENABLE_DMABUF_IMPORT=1)
 endif()
 
 # RDMA support

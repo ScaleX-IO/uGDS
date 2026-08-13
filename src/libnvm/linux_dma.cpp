@@ -88,6 +88,8 @@ static int create_mapping_descriptor(struct ioctl_mapping** handle, size_t page_
     md->dmabuf_offset = 0;
     md->retain_fd = false;
     md->close_fn = NULL;
+    md->v2_flags = 0;
+    md->v2_result = NULL;
 
     *handle = md;
     return 0;
@@ -651,3 +653,244 @@ int nvm_dma_map_device(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devptr,
 {
     return nvm_dma_map_device_ex(handle, ctrl, devptr, size, 0);
 }
+
+
+#if defined(UGDS_HAVE_DMABUF)
+/*
+ * Map an external application-exported dma-buf fd for the controller.
+ *
+ * The caller passes a dma-buf fd obtained from a GPU runtime export
+ * (e.g. Intel Level Zero zeMemGetAllocProperties, or any producer that
+ * exposes dma_buf).  This function duplicates the fd with
+ * F_DUPFD_CLOEXEC so that uGDS owns the duplicate independently of the
+ * caller's fd lifetime.  The mapping descriptor retains the fd and
+ * closes it via posix_close_adapter at teardown.
+ *
+ * Parameters:
+ *   handle        - output DMA handle
+ *   ctrl          - controller handle
+ *   devptr        - the GPU virtual address (base of the export)
+ *   size          - buffer size in bytes
+ *   dmabuf_fd     - application-owned dma-buf fd (not consumed; uGDS dups it)
+ *   dmabuf_offset - offset within the dma-buf allocation
+ *
+ * Returns 0 on success, or a positive errno on failure.
+ */
+int nvm_dma_map_dmabuf_fd(nvm_dma_t** handle, const nvm_ctrl_t* ctrl,
+                           void* devptr, size_t size,
+                           int dmabuf_fd, uint64_t dmabuf_offset)
+{
+    struct ioctl_mapping* md = NULL;
+    *handle = NULL;
+
+    if (_nvm_ctrl_type(ctrl) != DEVICE_TYPE_IOCTL)
+    {
+        return EBADF;
+    }
+
+    /* Validate arguments */
+    if (size == 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_fd: size must be non-zero\n");
+        return EINVAL;
+    }
+    if (dmabuf_fd < 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_fd: invalid dmabuf_fd %d\n", dmabuf_fd);
+        return EBADF;
+    }
+
+    /* Use host page size for alignment validation and mapping */
+    long hps = sysconf(_SC_PAGESIZE);
+    if (hps <= 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_fd: sysconf(_SC_PAGESIZE) failed\n");
+        return EINVAL;
+    }
+
+    /* Validate page alignment of devptr */
+    if (((uintptr_t)devptr % (size_t)hps) != 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_fd: devptr %p not page-aligned (%ld)\n",
+                devptr, hps);
+        return EINVAL;
+    }
+
+    /* Validate page alignment of dmabuf_offset */
+    if ((dmabuf_offset % (uint64_t)hps) != 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_fd: dmabuf_offset %llu not page-aligned\n",
+                (unsigned long long)dmabuf_offset);
+        return EINVAL;
+    }
+
+    /* Duplicate the fd so uGDS owns it independently of the caller.
+     * F_DUPFD_CLOEXEC prevents the duplicate from leaking across exec. */
+    int dup_fd = fcntl(dmabuf_fd, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_fd: F_DUPFD_CLOEXEC failed: %s\n",
+                strerror(errno));
+        return errno;
+    }
+
+    /* Create the external dmabuf mapping descriptor.
+     * The fd is retained and closed via posix_close_adapter at teardown. */
+    int err = create_mapping_descriptor(&md, (size_t)hps,
+                                         MAP_TYPE_DMABUF_EXT, devptr, size);
+    if (err != 0)
+    {
+        close(dup_fd);
+        return err;
+    }
+
+    md->dmabuf_fd = dup_fd;
+    md->dmabuf_offset = dmabuf_offset;
+    md->retain_fd = true;
+    md->close_fn = posix_close_adapter;
+
+    /* Initialize the DMA handle via the standard path.
+     * This calls map_range -> ioctl_map which issues the V1
+     * NVM_MAP_DMABUF_MEMORY ioctl. */
+    err = _nvm_dma_init(handle, ctrl, &md->range, &release_mapping_descriptor);
+    if (err != 0)
+    {
+        /* _nvm_dma_init failure: remove_mapping_descriptor will close
+         * the retained dup_fd via posix_close_adapter. */
+        remove_mapping_descriptor(md);
+        return err;
+    }
+
+    /* Tag as external origin for dual-backend dispatch */
+    _nvm_dma_set_origin(*handle, NVM_DMABUF_ORIGIN_EXTERNAL);
+
+    /* Set dmabuf metadata for re-export (RDMA path) */
+    _nvm_dma_set_dmabuf_info(*handle, dup_fd, dmabuf_offset, size);
+
+    return 0;
+}
+
+
+/*
+ * Map an external dma-buf fd using the V2 ioctl with classification.
+ *
+ * This variant issues NVM_MAP_DMABUF_MEMORY_V2 (cmd 9) instead of the
+ * V1 ioctl (cmd 4).  The V2 ioctl accepts a flags field (currently
+ * UGDS_DMABUF_REQUIRE_P2P for strict PCIe peer-BAR verification) and
+ * returns mapping classification output in *result.
+ *
+ * The strict no-fallback rule: when UGDS_DMABUF_REQUIRE_P2P is set and
+ * the kernel reports that the mapping is not a peer BAR, this function
+ * fails and does not fall back to V1.
+ *
+ * Parameters:
+ *   handle        - output DMA handle
+ *   ctrl          - controller handle
+ *   devptr        - the GPU virtual address (base of the export)
+ *   size          - buffer size in bytes
+ *   dmabuf_fd     - application-owned dma-buf fd (uGDS dups it)
+ *   dmabuf_offset - offset within the dma-buf allocation
+ *   flags         - V2 flags (e.g. UGDS_DMABUF_REQUIRE_P2P)
+ *   result        - output: kernel classification (mapping_class,
+ *                   failure_reason, peer BAR info)
+ *
+ * Returns 0 on success, or a positive errno on failure.
+ */
+int nvm_dma_map_dmabuf_v2(nvm_dma_t** handle, const nvm_ctrl_t* ctrl,
+                           void* devptr, size_t size,
+                           int dmabuf_fd, uint64_t dmabuf_offset,
+                           uint16_t flags,
+                           struct nvm_ioctl_dmabuf_v2* result)
+{
+    struct ioctl_mapping* md = NULL;
+    *handle = NULL;
+
+    if (_nvm_ctrl_type(ctrl) != DEVICE_TYPE_IOCTL)
+    {
+        return EBADF;
+    }
+
+    if (size == 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_v2: size must be non-zero\n");
+        return EINVAL;
+    }
+    if (dmabuf_fd < 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_v2: invalid dmabuf_fd %d\n", dmabuf_fd);
+        return EBADF;
+    }
+    if (result == NULL)
+    {
+        return EINVAL;
+    }
+
+    long hps = sysconf(_SC_PAGESIZE);
+    if (hps <= 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_v2: sysconf(_SC_PAGESIZE) failed\n");
+        return EINVAL;
+    }
+
+    if (((uintptr_t)devptr % (size_t)hps) != 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_v2: devptr %p not page-aligned\n", devptr);
+        return EINVAL;
+    }
+    if ((dmabuf_offset % (uint64_t)hps) != 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_v2: dmabuf_offset not page-aligned\n");
+        return EINVAL;
+    }
+
+    /* Duplicate the fd so uGDS owns it independently of the caller. */
+    int dup_fd = fcntl(dmabuf_fd, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0)
+    {
+        dprintf("nvm_dma_map_dmabuf_v2: F_DUPFD_CLOEXEC failed: %s\n",
+                strerror(errno));
+        return errno;
+    }
+
+    /* Create the external dmabuf mapping descriptor with V2 flags.
+     * The map_range callback (ioctl_map) checks v2_flags and issues
+     * NVM_MAP_DMABUF_MEMORY_V2 instead of V1 when flags are set.
+     * The v2_result pointer lets ioctl_map copy classification output
+     * back to the caller. */
+    int err = create_mapping_descriptor(&md, (size_t)hps,
+                                         MAP_TYPE_DMABUF_EXT, devptr, size);
+    if (err != 0)
+    {
+        close(dup_fd);
+        return err;
+    }
+
+    md->dmabuf_fd = dup_fd;
+    md->dmabuf_offset = dmabuf_offset;
+    md->retain_fd = true;
+    md->close_fn = posix_close_adapter;
+    md->v2_flags = flags;
+    md->v2_result = result;
+
+    /* Initialize via the standard path.  _nvm_dma_init calls map_range
+     * -> ioctl_map, which detects v2_flags and issues the V2 ioctl.
+     * On failure the kernel mapping is never created, and
+     * remove_mapping_descriptor closes the retained dup_fd.
+     * On success the unmap callback is set, so teardown calls
+     * NVM_UNMAP_MEMORY correctly. */
+    err = _nvm_dma_init(handle, ctrl, &md->range, &release_mapping_descriptor);
+    if (err != 0)
+    {
+        remove_mapping_descriptor(md);
+        return err;
+    }
+
+    /* Tag as external origin for dual-backend dispatch */
+    _nvm_dma_set_origin(*handle, NVM_DMABUF_ORIGIN_EXTERNAL);
+
+    /* Set dmabuf metadata for re-export (RDMA path) */
+    _nvm_dma_set_dmabuf_info(*handle, dup_fd, dmabuf_offset, size);
+
+    return 0;
+}
+#endif /* UGDS_HAVE_DMABUF */
