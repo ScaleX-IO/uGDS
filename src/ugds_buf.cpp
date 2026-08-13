@@ -354,14 +354,11 @@ extern "C" uGDSError_t uGDSBufRegisterDmabuf(const void* bufPtr_base,
             return make_error(UGDS_INVALID_VALUE);
         }
 
-        /* MPS alignment (same check as uGDSBufRegister) */
-        const size_t mps = g_driver.default_ctrl ? g_driver.default_ctrl->page_size : 0;
-        if (mps > 0 && (reinterpret_cast<uintptr_t>(bufPtr_base) % mps) != 0) {
-            return make_error(UGDS_INVALID_VALUE);
-        }
-
-        /* Lock the driver to check for duplicate registration and
-         * capture the controller reference. */
+        /* Lock the driver to check for duplicate registration,
+         * validate MPS alignment, and capture the controller reference.
+         * The controller pointer is stable for the lifetime of the
+         * driver session (held by handle_registry shared_ptrs), so it
+         * is safe to use after releasing the lock for the ioctl. */
         {
             std::lock_guard<std::mutex> guard(g_driver.lock);
 
@@ -372,41 +369,40 @@ extern "C" uGDSError_t uGDSBufRegisterDmabuf(const void* bufPtr_base,
             if (g_driver.default_ctrl == nullptr) {
                 return make_error(UGDS_DRIVER_NOT_INITIALIZED);
             }
+
+            /* MPS alignment (same check as uGDSBufRegister) */
+            const size_t mps = g_driver.default_ctrl->page_size;
+            if (mps > 0 && (reinterpret_cast<uintptr_t>(bufPtr_base) % mps) != 0) {
+                return make_error(UGDS_INVALID_VALUE);
+            }
         }
 
         /* The kernel ioctl is executed without holding g_driver.lock.
          * After the ioctl, we reacquire the lock and commit only if
          * the driver is still open and the key is still absent. */
 
+        /* Always use the V2 ioctl for external registrations.
+         * When REQUIRE_P2P is set, the kernel rejects non-peer-BAR
+         * mappings. Without it, the mapping succeeds but the caller
+         * can inspect the classification via uGDSQueryDmabufSupport.
+         * This ensures all external mappings go through pin accounting
+         * and produce a mapping class result. */
         nvm_dma_t* dma = nullptr;
-        int status;
+        struct nvm_ioctl_dmabuf_v2 v2result;
+        memset(&v2result, 0, sizeof(v2result));
 
-        if (params->flags & UGDS_DMABUF_REQUIRE_P2P) {
-            /* V2 path with strict P2P classification */
-            struct nvm_ioctl_dmabuf_v2 v2result;
-            memset(&v2result, 0, sizeof(v2result));
-
-            status = nvm_dma_map_dmabuf_v2(&dma, g_driver.default_ctrl,
+        int status = nvm_dma_map_dmabuf_v2(&dma, g_driver.default_ctrl,
                                             const_cast<void*>(bufPtr_base),
                                             length,
                                             params->dmabuf_fd,
                                             params->dmabuf_offset,
-                                            UGDS_DMABUF_REQUIRE_P2P,
+                                            params->flags,
                                             &v2result);
 
-            /* Strict no-fallback: if REQUIRE_P2P was requested and the
-             * kernel classified the mapping as not peer-BAR, do not
-             * fall back to V1. */
-            if (status == EOPNOTSUPP) {
-                return make_error(UGDS_DMABUF_NOT_P2P);
-            }
-        } else {
-            /* V1 path (no strict P2P requirement) */
-            status = nvm_dma_map_dmabuf_fd(&dma, g_driver.default_ctrl,
-                                            const_cast<void*>(bufPtr_base),
-                                            length,
-                                            params->dmabuf_fd,
-                                            params->dmabuf_offset);
+        /* Strict no-fallback: if REQUIRE_P2P was requested and the
+         * kernel classified the mapping as not peer-BAR, return error. */
+        if (status == EOPNOTSUPP && (params->flags & UGDS_DMABUF_REQUIRE_P2P)) {
+            return make_error(UGDS_DMABUF_NOT_P2P);
         }
 
         if (status != 0 || dma == nullptr) {

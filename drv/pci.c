@@ -91,14 +91,14 @@ static DEFINE_IDA(ctrl_ida);
 /* --- Pin accounting (V2 dma-buf) ----------------------------------- */
 static atomic64_t dmabuf_pinned_global = ATOMIC64_INIT(0);
 static int dmabuf_pin_limit_per_file_mb = 16384; /* 16 GiB default */
-module_param(dmabuf_pin_limit_per_file_mb, int, 0644);
+module_param(dmabuf_pin_limit_per_file_mb, int, 0444);
 MODULE_PARM_DESC(dmabuf_pin_limit_per_file_mb,
-    "Per-file dma-buf pin limit in MiB (0 = unlimited)");
+    "Per-file dma-buf pin limit in MiB (0 = unlimited, read-only after load)");
 
 static int dmabuf_pin_limit_global_mb = 65536; /* 64 GiB default */
-module_param(dmabuf_pin_limit_global_mb, int, 0644);
+module_param(dmabuf_pin_limit_global_mb, int, 0444);
 MODULE_PARM_DESC(dmabuf_pin_limit_global_mb,
-    "Global dma-buf pin limit in MiB (0 = unlimited)");
+    "Global dma-buf pin limit in MiB (0 = unlimited, read-only after load)");
 
 
 enum handle_type
@@ -774,6 +774,18 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             {
                 return -EINVAL;
             }
+            /* Reject nonzero reserved fields */
+            if (dreq.reserved0 != 0)
+            {
+                return -EINVAL;
+            }
+            {
+                int ri;
+                for (ri = 0; ri < 4; ri++) {
+                    if (dreq.reserved[ri] != 0)
+                        return -EINVAL;
+                }
+            }
 
             n_pages = dreq.size / PAGE_SIZE;
             if (n_pages > 1024 * 1024)
@@ -855,16 +867,6 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
                 return -ENOMEM;
             }
 
-            if (copy_to_user((void __user*)(uintptr_t) dreq.ioaddrs,
-                              map->addrs, map->n_addrs * sizeof(uint64_t)))
-            {
-                kfree(handle);
-                unmap_and_release(map);
-                ctx->dmabuf_pinned_bytes -= pin_charge;
-                atomic64_sub(pin_charge, &dmabuf_pinned_global);
-                return -EFAULT;
-            }
-
             if (map_is_dead(HANDLE_DMABUF, map))
             {
                 kfree(handle);
@@ -913,12 +915,29 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             handle->n_pages = n_pages;
             handle->dmabuf_fd = dreq.dmabuf_fd;
             handle->dmabuf_offset = dreq.dmabuf_offset;
-            handle->count = 1;
             handle->pinned_bytes = pin_charge;
+
+            /* Copy addresses to user BEFORE committing to the ledger.
+             * If this fails we can still fully unwind. */
+            if (copy_to_user((void __user*)(uintptr_t) dreq.ioaddrs,
+                              map->addrs, map->n_addrs * sizeof(uint64_t)))
+            {
+                mutex_unlock(&ctx->lock);
+                kfree(handle);
+                unmap_and_release(map);
+                ctx->dmabuf_pinned_bytes -= pin_charge;
+                atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                return -EFAULT;
+            }
+
             list_add(&handle->node, &ctx->handles);
             mutex_unlock(&ctx->lock);
 
-            /* Copy classification result to user */
+            /* Copy classification result to user after the mapping is
+             * committed. At this point the mapping is live; if the copy
+             * fails the mapping is valid but the user does not receive
+             * classification metadata. Log a warning since the caller
+             * has a valid mapping but incomplete result data. */
             dreq.mapping_class = info.mapping_class;
             dreq.failure_reason = info.failure_reason;
             dreq.peer_domain = info.peer_domain;
@@ -929,10 +948,8 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             dreq.peer_bar_length = info.peer_bar_length;
             if (copy_to_user((void __user*) arg, &dreq, sizeof(dreq)))
             {
-                /* Mapping is already committed; cannot unwind.
-                 * The ioctl return value signals partial success. */
                 printk(KERN_WARNING "uGDS: V2 result copy failed for "
-                       "mapping %llx (committed)\n", dreq.gpu_ptr);
+                       "mapping %llx (mapping is valid)\n", dreq.gpu_ptr);
             }
             return 0;
         }
