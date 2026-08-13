@@ -977,6 +977,10 @@ static bool ugds_range_in_bar(struct pci_dev* pdev, int bar,
  *
  * Returns a pci_dev reference (held) or NULL. If more than one device
  * matches (ambiguous ownership), returns NULL to fail closed.
+ *
+ * Implementation note: for_each_pci_dev automatically drops the reference
+ * on each iteration, so we must take an extra pci_dev_get() to keep the
+ * matched device alive beyond the loop.
  */
 static struct pci_dev* ugds_find_peer_bar_owner(struct pci_dev* importer,
                                                   u64 addr, u64 len,
@@ -996,15 +1000,14 @@ static struct pci_dev* ugds_find_peer_bar_owner(struct pci_dev* importer,
             if (ugds_range_in_bar(peer, bar, addr, len)) {
                 if (found) {
                     /* Ambiguous: more than one device claims this
-                     * address range. Fail closed by dropping the
-                     * first reference and returning NULL. */
+                     * address range. Fail closed. */
                     pci_dev_put(found);
                     return NULL;
                 }
                 *matched_bar = bar;
-                found = peer;
-                /* Keep the for_each_pci_dev reference; continue
-                 * scanning to check for ambiguity. */
+                /* Take an extra reference so the device survives
+                 * beyond the for_each_pci_dev loop body. */
+                found = pci_dev_get(peer);
                 break;
             }
         }
@@ -1223,11 +1226,12 @@ static int map_dmabuf_memory_v2(struct map* map, int dmabuf_fd,
                info->mapping_class, info->failure_reason);
         goto fail;
     }
-    /* Non-strict mode: classification may have set failure_reason to
-     * NOT_PEER_BAR even though the mapping is accepted. Clear it so
-     * the returned result is consistent with success. */
-    if (!err && info->failure_reason == NVM_DMABUF_FAIL_NOT_PEER_BAR) {
+    /* Non-strict mode: clear failure_reason if classification
+     * failed but we accept the mapping anyway. The caller gets
+     * mapping_class=SYSTEM with failure_reason=NONE. */
+    if (err && !(map_flags & UGDS_DMABUF_REQUIRE_P2P)) {
         info->failure_reason = NVM_DMABUF_FAIL_NONE;
+        err = 0;  /* non-strict accepts system memory */
     }
 
     /* Transfer peer device reference to dmabuf_region */
@@ -1263,6 +1267,10 @@ struct map* map_dmabuf_v2(const struct ctrl* ctrl,
 {
     int err;
     struct map* md;
+
+    /* Zero the entire info struct at entry so every early return
+     * path produces clean output for userspace. */
+    memset(info, 0, sizeof(*info));
 
     if (n_pages < 1) {
         info->mapping_class = NVM_DMABUF_MAPPING_UNKNOWN;

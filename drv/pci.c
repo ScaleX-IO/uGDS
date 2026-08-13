@@ -793,24 +793,42 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
                 return -EINVAL;
             }
 
-            /* Pin accounting: charge before mapping */
-            pin_charge = dreq.size;
-            if (dmabuf_pin_limit_per_file_mb > 0 &&
-                ctx->dmabuf_pinned_bytes + pin_charge >
-                (u64)dmabuf_pin_limit_per_file_mb * 1024 * 1024)
-            {
-                return -EDQUOT;
+            /* Check ctx->dead under lock before proceeding. The map
+             * operation itself sleeps (dma_buf_pin, fence wait) so
+             * the lock is released during mapping; a hot-remove that
+             * sets ctx->dead concurrently will still be caught by
+             * the ledger commit section's dead re-check below. */
+            if (mutex_lock_killable(&ctx->lock))
+                return -EINTR;
+            if (ctx->dead) {
+                mutex_unlock(&ctx->lock);
+                return -ENODEV;
             }
+            mutex_unlock(&ctx->lock);
+
+            /* Pin accounting: charge before mapping.
+             * Validate limits are positive before multiplication to
+             * avoid overflow from negative module parameter values. */
+            pin_charge = dreq.size;
             {
-                u64 old, new_val;
-                u64 global_limit = (u64)dmabuf_pin_limit_global_mb * 1024 * 1024;
-                do {
-                    old = atomic64_read(&dmabuf_pinned_global);
-                    new_val = old + pin_charge;
-                    if (dmabuf_pin_limit_global_mb > 0 && new_val > global_limit)
+                u64 per_file_limit = 0;
+                u64 global_limit = 0;
+                if (dmabuf_pin_limit_per_file_mb > 0) {
+                    per_file_limit = (u64)dmabuf_pin_limit_per_file_mb * 1024ULL * 1024ULL;
+                    if (ctx->dmabuf_pinned_bytes + pin_charge > per_file_limit)
                         return -EDQUOT;
-                } while (atomic64_cmpxchg(&dmabuf_pinned_global,
-                                          old, new_val) != old);
+                }
+                if (dmabuf_pin_limit_global_mb > 0) {
+                    u64 old, new_val;
+                    global_limit = (u64)dmabuf_pin_limit_global_mb * 1024ULL * 1024ULL;
+                    do {
+                        old = atomic64_read(&dmabuf_pinned_global);
+                        new_val = old + pin_charge;
+                        if (new_val > global_limit)
+                            return -EDQUOT;
+                    } while (atomic64_cmpxchg(&dmabuf_pinned_global,
+                                              old, new_val) != old);
+                }
             }
             ctx->dmabuf_pinned_bytes += pin_charge;
 
@@ -915,6 +933,7 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             handle->n_pages = n_pages;
             handle->dmabuf_fd = dreq.dmabuf_fd;
             handle->dmabuf_offset = dreq.dmabuf_offset;
+            handle->count = 1;
             handle->pinned_bytes = pin_charge;
 
             /* Copy addresses to user BEFORE committing to the ledger.
@@ -1174,8 +1193,16 @@ static void remove_pci_dev(struct pci_dev* dev)
         {
             list_del(&handle->node);
             unmap_and_release(handle->map);
+
+            /* Refund pin accounting for V2 mappings */
+            if (handle->pinned_bytes > 0)
+            {
+                atomic64_sub(handle->pinned_bytes, &dmabuf_pinned_global);
+            }
+
             kfree(handle);
         }
+        ctx->dmabuf_pinned_bytes = 0;
         ctx->dead = true;
         mutex_unlock(&ctx->lock);
     }
