@@ -41,8 +41,15 @@
 #define cudaError_t hipError_t
 #define cudaSuccess hipSuccess
 typedef hipStream_t cudaStream_t;
-#else
+#elif defined(_CUDA) || defined(__CUDACC__)
 #include <cuda_runtime.h>
+#else
+/* No GPU backend: async launch is not available. Stub definitions
+ * so the TU compiles for standalone dmabuf-only builds. */
+#define CUDART_CB
+typedef void* cudaStream_t;
+typedef int cudaError_t;
+#define cudaSuccess 0
 #endif
 #include <mutex>
 #include <cerrno>

@@ -756,6 +756,14 @@ static int map_dmabuf_memory(struct map* map, int dmabuf_fd,
         return -ENOMEM;
     }
 
+    /* Initialize all fields so common teardown is safe regardless
+     * of which step fails. peer_pdev is V2-only but release_dmabuf_memory
+     * checks it unconditionally, so it must be NULL for V1 mappings. */
+    dr->dmabuf = NULL;
+    dr->attachment = NULL;
+    dr->sgt = NULL;
+    dr->peer_pdev = NULL;
+
     dr->dmabuf = dma_buf_get(dmabuf_fd);
     if (IS_ERR(dr->dmabuf))
     {
@@ -1075,9 +1083,11 @@ static int map_dmabuf_memory_v2(struct map* map, int dmabuf_fd,
     int err;
     long fence_ret;
 
+    /* Zero-initialize the entire struct so error-path copies to userspace
+     * never disclose uninitialized kernel stack data. */
+    memset(info, 0, sizeof(*info));
     info->mapping_class = NVM_DMABUF_MAPPING_UNKNOWN;
     info->failure_reason = NVM_DMABUF_FAIL_NONE;
-    info->peer_pdev = NULL;
 
     if (expected_pages > ioaddrs_capacity) {
         info->failure_reason = NVM_DMABUF_FAIL_RANGE;
@@ -1199,6 +1209,12 @@ static int map_dmabuf_memory_v2(struct map* map, int dmabuf_fd,
                "classified as %u (reason %u)\n",
                info->mapping_class, info->failure_reason);
         goto fail;
+    }
+    /* Non-strict mode: classification may have set failure_reason to
+     * NOT_PEER_BAR even though the mapping is accepted. Clear it so
+     * the returned result is consistent with success. */
+    if (!err && info->failure_reason == NVM_DMABUF_FAIL_NOT_PEER_BAR) {
+        info->failure_reason = NVM_DMABUF_FAIL_NONE;
     }
 
     /* Transfer peer device reference to dmabuf_region */

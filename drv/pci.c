@@ -281,8 +281,16 @@ static int dev_release(struct inode* inode, struct file* file)
     {
         list_del(&handle->node);
         unmap_and_release(handle->map);
+
+        /* Release pin accounting charge for V2 mappings */
+        if (handle->pinned_bytes > 0)
+        {
+            atomic64_sub(handle->pinned_bytes, &dmabuf_pinned_global);
+        }
+
         kfree(handle);
     }
+    ctx->dmabuf_pinned_bytes = 0;
     mutex_unlock(&ctx->lock);
 
     ctrl_put(ctx->ctrl);
@@ -500,6 +508,7 @@ static long do_map(struct ugds_file_ctx* ctx, enum handle_type type,
     handle->dmabuf_fd = dmabuf_fd;
     handle->dmabuf_offset = dmabuf_offset;
     handle->count = 1;
+    handle->pinned_bytes = 0;  /* V2 sets this; V1/host/CUDA stay zero */
     list_add(&handle->node, &ctx->handles);
 
 out:
