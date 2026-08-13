@@ -587,13 +587,40 @@ struct dmabuf_region
 
 
 /*
- * We intentionally do NOT provide move_notify / invalidate_mappings.
- * The buffer is pinned (dma_buf_pin) for the entire mapping lifetime,
- * so the exporter cannot move it. If the kernel ever requires this
- * callback, the attachment will fail at dma_buf_attach time.
+ * Callback invoked by the exporter if it needs to move the buffer.
+ *
+ * With dma_buf_pin() held for the mapping lifetime, the exporter
+ * cannot move the buffer after pin succeeds. However, amdgpu may
+ * fire this callback during dma_buf_pin() as part of normal BO
+ * settling -- that case is handled by clearing map->invalid after
+ * pin completes (see map_dmabuf_memory).
+ *
+ * If the callback fires after pin (genuine migration), map->invalid
+ * stays set and pci.c returns -EIO during address exposure. The
+ * primary safety invariant is that successful pin prevents movement.
+ *
+ * On Linux 7.1+, this callback was renamed to invalidate_mappings
+ * and carries a stronger revocation contract. We do not set it there
+ * because uGDS does not implement bounded revocation; pin is the
+ * sole mechanism preventing buffer movement.
  */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7,1,0)
+static void ugds_dmabuf_move_notify(struct dma_buf_attachment* attachment)
+{
+    struct map* map = (struct map*) attachment->importer_priv;
+
+    if (map)
+    {
+        atomic_set(&map->invalid, 1);
+    }
+}
+#endif
+
 static const struct dma_buf_attach_ops ugds_dmabuf_attach_ops = {
     .allow_peer2peer = true,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7,1,0)
+    .move_notify     = ugds_dmabuf_move_notify,
+#endif
 };
 
 
