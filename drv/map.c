@@ -973,14 +973,17 @@ static bool ugds_range_in_bar(struct pci_dev* pdev, int bar,
 /*
  * Scan all PCI devices in the same domain as the importer (NVMe),
  * skipping the importer itself, and find the one whose memory BAR
- * contains the given address range. Returns a pci_dev reference
- * (held) or NULL.
+ * contains the given address range.
+ *
+ * Returns a pci_dev reference (held) or NULL. If more than one device
+ * matches (ambiguous ownership), returns NULL to fail closed.
  */
 static struct pci_dev* ugds_find_peer_bar_owner(struct pci_dev* importer,
                                                   u64 addr, u64 len,
                                                   int* matched_bar)
 {
     struct pci_dev* peer = NULL;
+    struct pci_dev* found = NULL;
     int bar;
 
     for_each_pci_dev(peer) {
@@ -991,12 +994,22 @@ static struct pci_dev* ugds_find_peer_bar_owner(struct pci_dev* importer,
 
         for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
             if (ugds_range_in_bar(peer, bar, addr, len)) {
+                if (found) {
+                    /* Ambiguous: more than one device claims this
+                     * address range. Fail closed by dropping the
+                     * first reference and returning NULL. */
+                    pci_dev_put(found);
+                    return NULL;
+                }
                 *matched_bar = bar;
-                return peer;  /* for_each_pci_dev holds a reference */
+                found = peer;
+                /* Keep the for_each_pci_dev reference; continue
+                 * scanning to check for ambiguity. */
+                break;
             }
         }
     }
-    return NULL;
+    return found;
 }
 
 /*
