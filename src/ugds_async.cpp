@@ -813,7 +813,8 @@ static uGDSError_t iov_launch_host_func(void* stream, AsyncRequest* req)
         return e;
     }
     return UGDS_OK;
-#else
+#elif defined(_CUDA) || defined(__CUDACC__)
+    /* CUDA-only build */
     cudaError_t err = cudaLaunchHostFunc((cudaStream_t)(uintptr_t)stream,
                                          async_iov_callback, req);
     if (err != cudaSuccess) {
@@ -823,6 +824,11 @@ static uGDSError_t iov_launch_host_func(void* stream, AsyncRequest* req)
         return e;
     }
     return UGDS_OK;
+#else
+    /* No GPU backend: async IO not available */
+    (void)stream;
+    delete req;
+    return make_error(UGDS_IO_NOT_SUPPORTED);
 #endif
 }
 

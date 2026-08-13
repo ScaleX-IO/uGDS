@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -69,9 +70,11 @@ static int ioctl_map(const struct device* dev, const struct va_range* va, uint64
         case MAP_TYPE_DMABUF_CUDA:
         case MAP_TYPE_DMABUF_EXT:
         {
-            /* External dmabuf with V2 flags: use the V2 ioctl path
-             * for strict P2P classification. */
-            if (m->type == MAP_TYPE_DMABUF_EXT && m->v2_flags != 0)
+            /* External dmabuf (MAP_TYPE_DMABUF_EXT) always uses the V2
+             * ioctl for pin accounting and mapping classification.
+             * HIP (MAP_TYPE_DMABUF) and CUDA (MAP_TYPE_DMABUF_CUDA)
+             * continue to use the V1 ioctl. */
+            if (m->type == MAP_TYPE_DMABUF_EXT)
             {
                 struct nvm_ioctl_dmabuf_v2 v2req;
                 memset(&v2req, 0, sizeof(v2req));
