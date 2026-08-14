@@ -240,22 +240,16 @@ if(UGDS_BACKEND_CUDA)
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 17)
 
-        # Suffix targets only in dual mode to preserve backward compatibility
-        if(UGDS_BACKEND_HIP)
-            set(CUDA_SUFFIX "_cuda")
-        else()
-            set(CUDA_SUFFIX "")
-        endif()
-
         foreach(test_name ${FUNCTIONAL_TESTS})
-            set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/${test_name}.cu)
-            add_executable(${test_name}${CUDA_SUFFIX} ${test_src})
-            target_include_directories(${test_name}${CUDA_SUFFIX} PRIVATE
+            set(test_target ${test_name}_cuda)
+            set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/cuda/${test_name}.cu)
+            add_executable(${test_target} ${test_src})
+            target_include_directories(${test_target} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/functional
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/cuda
             )
-            target_link_libraries(${test_name}${CUDA_SUFFIX} ugds CUDA::cudart)
-            set_target_properties(${test_name}${CUDA_SUFFIX} PROPERTIES
+            target_link_libraries(${test_target} ugds CUDA::cudart)
+            set_target_properties(${test_target} PROPERTIES
                 CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
                 BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
             )
@@ -264,57 +258,57 @@ if(UGDS_BACKEND_CUDA)
         # RDMA tests (only when UGDS_ENABLE_RDMA is ON)
         if(UGDS_ENABLE_RDMA)
             foreach(test_name ${RDMA_TESTS})
-                set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/${test_name}.cu)
-                add_executable(${test_name}${CUDA_SUFFIX} ${test_src})
-                target_include_directories(${test_name}${CUDA_SUFFIX} PRIVATE
+                set(test_target ${test_name}_cuda)
+                set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/cuda/${test_name}.cu)
+                add_executable(${test_target} ${test_src})
+                target_include_directories(${test_target} PRIVATE
                     ${CMAKE_CURRENT_SOURCE_DIR}/include
-                    ${CMAKE_CURRENT_SOURCE_DIR}/test/functional
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/cuda
                 )
-                target_link_libraries(${test_name}${CUDA_SUFFIX} ugds CUDA::cudart PkgConfig::IBVERBS)
-                set_target_properties(${test_name}${CUDA_SUFFIX} PROPERTIES
+                target_link_libraries(${test_target} ugds CUDA::cudart PkgConfig::IBVERBS)
+                set_target_properties(${test_target} PROPERTIES
                     CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
                     BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
                 )
                 if(${test_name} STREQUAL "test_rdma_tracked")
-                    target_compile_definitions(${test_name}${CUDA_SUFFIX} PRIVATE _RDMA)
+                    target_compile_definitions(${test_target} PRIVATE _RDMA)
                 endif()
             endforeach()
         endif()
 
         # bench_ugds (CUDA)
-        set(bench_src ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cufile_bench.cu)
-        add_executable(bench_ugds${CUDA_SUFFIX} ${bench_src})
-        target_include_directories(bench_ugds${CUDA_SUFFIX} PRIVATE
+        set(cuda_bench_src ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cuda/cufile_bench.cu)
+        add_executable(bench_ugds_cuda ${cuda_bench_src})
+        target_include_directories(bench_ugds_cuda PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cuda
         )
-        target_link_libraries(bench_ugds${CUDA_SUFFIX} ugds CUDA::cudart)
-        set_target_properties(bench_ugds${CUDA_SUFFIX} PROPERTIES
+        target_link_libraries(bench_ugds_cuda ugds CUDA::cudart)
+        set_target_properties(bench_ugds_cuda PROPERTIES
             CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )
 
         # bench_overlap: async IO + GPU compute overlap benchmark
-        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_overlap.cu)
-            add_executable(bench_overlap${CUDA_SUFFIX} test/perf/bench_overlap.cu)
-            target_include_directories(bench_overlap${CUDA_SUFFIX} PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
-            )
-            target_link_libraries(bench_overlap${CUDA_SUFFIX} ugds CUDA::cudart)
-            set_target_properties(bench_overlap${CUDA_SUFFIX} PROPERTIES
-                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
-                BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
-            )
-        endif()
+        set(cuda_overlap_src ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cuda/bench_overlap.cu)
+        add_executable(bench_overlap_cuda ${cuda_overlap_src})
+        target_include_directories(bench_overlap_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cuda
+        )
+        target_link_libraries(bench_overlap_cuda ugds CUDA::cudart)
+        set_target_properties(bench_overlap_cuda PROPERTIES
+            CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+            BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        )
 
         # bench_gds: NVIDIA GDS comparison (optional)
         set(CUFILE_LIB "" CACHE FILEPATH "Path to NVIDIA libcufile.so for GDS comparison benchmark")
         set(CUFILE_INCLUDE "" CACHE PATH "Path to NVIDIA cuFile headers (if different from ours)")
         if(CUFILE_LIB)
-            add_executable(bench_gds ${bench_src})
+            add_executable(bench_gds ${cuda_bench_src})
             target_include_directories(bench_gds PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cuda
             )
             if(CUFILE_INCLUDE)
                 target_include_directories(bench_gds PRIVATE ${CUFILE_INCLUDE})
@@ -327,22 +321,20 @@ if(UGDS_BACKEND_CUDA)
                 CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
             )
 
-            if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_overlap.cu)
-                add_executable(bench_overlap_gds test/perf/bench_overlap.cu)
-                target_include_directories(bench_overlap_gds PRIVATE
-                    ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
-                )
-                if(CUFILE_INCLUDE)
-                    target_include_directories(bench_overlap_gds PRIVATE ${CUFILE_INCLUDE})
-                else()
-                    target_include_directories(bench_overlap_gds PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-                endif()
-                target_link_libraries(bench_overlap_gds ${CUFILE_LIB} CUDA::cudart)
-                target_compile_definitions(bench_overlap_gds PRIVATE USE_O_DIRECT USE_NVIDIA_GDS)
-                set_target_properties(bench_overlap_gds PROPERTIES
-                    CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
-                )
+            add_executable(bench_overlap_gds ${cuda_overlap_src})
+            target_include_directories(bench_overlap_gds PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cuda
+            )
+            if(CUFILE_INCLUDE)
+                target_include_directories(bench_overlap_gds PRIVATE ${CUFILE_INCLUDE})
+            else()
+                target_include_directories(bench_overlap_gds PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
             endif()
+            target_link_libraries(bench_overlap_gds ${CUFILE_LIB} CUDA::cudart)
+            target_compile_definitions(bench_overlap_gds PRIVATE USE_O_DIRECT USE_NVIDIA_GDS)
+            set_target_properties(bench_overlap_gds PROPERTIES
+                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+            )
         endif()
     else()
         message(WARNING "CUDA compiler not found, CUDA tests will not be built")
@@ -357,32 +349,19 @@ if(UGDS_BACKEND_HIP)
         enable_language(HIP)
         set(CMAKE_HIP_STANDARD 17)
 
-        # Suffix targets only in dual mode to preserve backward compatibility
-        if(UGDS_BACKEND_CUDA)
-            set(HIP_SUFFIX "_hip")
-        else()
-            set(HIP_SUFFIX "")
-        endif()
-
         foreach(test_name ${FUNCTIONAL_TESTS})
-            set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/${test_name}.cu)
-            if(UGDS_BACKEND_CUDA)
-                # Dual mode: copy .cu to .hip.cu to avoid LANGUAGE conflict
-                set(hip_src ${CMAKE_CURRENT_BINARY_DIR}/${test_name}.hip.cu)
-                configure_file(${test_src} ${hip_src} COPYONLY)
-                set_source_files_properties(${hip_src} PROPERTIES LANGUAGE HIP)
-                add_executable(${test_name}${HIP_SUFFIX} ${hip_src})
-            else()
-                set_source_files_properties(${test_src} PROPERTIES LANGUAGE HIP)
-                add_executable(${test_name}${HIP_SUFFIX} ${test_src})
-            endif()
-            target_include_directories(${test_name}${HIP_SUFFIX} PRIVATE
+            set(test_target ${test_name}_hip)
+            set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/hip/${test_name}.hip)
+            set_source_files_properties(${test_src} PROPERTIES LANGUAGE HIP)
+            add_executable(${test_target} ${test_src})
+            target_include_directories(${test_target} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/functional
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/cuda
             )
-            target_link_libraries(${test_name}${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS})
-            target_compile_definitions(${test_name}${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
-            set_target_properties(${test_name}${HIP_SUFFIX} PROPERTIES
+            target_link_libraries(${test_target} ugds ${UGDS_HIP_LIBS})
+            target_compile_definitions(${test_target} PRIVATE __HIP_PLATFORM_AMD__)
+            set_target_properties(${test_target} PROPERTIES
                 HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
                 BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
             )
@@ -391,50 +370,55 @@ if(UGDS_BACKEND_HIP)
         # RDMA tests (only when UGDS_ENABLE_RDMA is ON)
         if(UGDS_ENABLE_RDMA)
             foreach(test_name ${RDMA_TESTS})
-                set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/${test_name}.cu)
-                if(UGDS_BACKEND_CUDA)
-                    set(hip_src ${CMAKE_CURRENT_BINARY_DIR}/${test_name}.hip.cu)
-                    configure_file(${test_src} ${hip_src} COPYONLY)
-                    set_source_files_properties(${hip_src} PROPERTIES LANGUAGE HIP)
-                    add_executable(${test_name}${HIP_SUFFIX} ${hip_src})
-                else()
-                    set_source_files_properties(${test_src} PROPERTIES LANGUAGE HIP)
-                    add_executable(${test_name}${HIP_SUFFIX} ${test_src})
-                endif()
-                target_include_directories(${test_name}${HIP_SUFFIX} PRIVATE
+                set(test_target ${test_name}_hip)
+                set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/hip/${test_name}.hip)
+                set_source_files_properties(${test_src} PROPERTIES LANGUAGE HIP)
+                add_executable(${test_target} ${test_src})
+                target_include_directories(${test_target} PRIVATE
                     ${CMAKE_CURRENT_SOURCE_DIR}/include
-                    ${CMAKE_CURRENT_SOURCE_DIR}/test/functional
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/hip
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/cuda
                 )
-                target_link_libraries(${test_name}${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS} PkgConfig::IBVERBS)
-                target_compile_definitions(${test_name}${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
-                set_target_properties(${test_name}${HIP_SUFFIX} PROPERTIES
+                target_link_libraries(${test_target} ugds ${UGDS_HIP_LIBS} PkgConfig::IBVERBS)
+                target_compile_definitions(${test_target} PRIVATE __HIP_PLATFORM_AMD__)
+                set_target_properties(${test_target} PROPERTIES
                     HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
                     BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
                 )
                 if(${test_name} STREQUAL "test_rdma_tracked")
-                    target_compile_definitions(${test_name}${HIP_SUFFIX} PRIVATE _RDMA)
+                    target_compile_definitions(${test_target} PRIVATE _RDMA)
                 endif()
             endforeach()
         endif()
 
         # bench_ugds (HIP)
-        set(bench_src_orig ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cufile_bench.cu)
-        if(UGDS_BACKEND_CUDA)
-            set(bench_src ${CMAKE_CURRENT_BINARY_DIR}/cufile_bench.hip.cu)
-            configure_file(${bench_src_orig} ${bench_src} COPYONLY)
-            set_source_files_properties(${bench_src} PROPERTIES LANGUAGE HIP)
-        else()
-            set(bench_src ${bench_src_orig})
-            set_source_files_properties(${bench_src} PROPERTIES LANGUAGE HIP)
-        endif()
-        add_executable(bench_ugds${HIP_SUFFIX} ${bench_src})
-        target_include_directories(bench_ugds${HIP_SUFFIX} PRIVATE
+        set(hip_bench_src ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/hip/hipfile_bench.hip)
+        set_source_files_properties(${hip_bench_src} PROPERTIES LANGUAGE HIP)
+        add_executable(bench_ugds_hip ${hip_bench_src})
+        target_include_directories(bench_ugds_hip PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/hip
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cuda
         )
-        target_link_libraries(bench_ugds${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS})
-        target_compile_definitions(bench_ugds${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
-        set_target_properties(bench_ugds${HIP_SUFFIX} PROPERTIES
+        target_link_libraries(bench_ugds_hip ugds ${UGDS_HIP_LIBS})
+        target_compile_definitions(bench_ugds_hip PRIVATE __HIP_PLATFORM_AMD__)
+        set_target_properties(bench_ugds_hip PROPERTIES
+            HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
+            BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        )
+
+        # bench_overlap: async IO + GPU compute overlap benchmark
+        set(hip_overlap_src ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/hip/bench_overlap.hip)
+        set_source_files_properties(${hip_overlap_src} PROPERTIES LANGUAGE HIP)
+        add_executable(bench_overlap_hip ${hip_overlap_src})
+        target_include_directories(bench_overlap_hip PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/hip
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/cuda
+        )
+        target_link_libraries(bench_overlap_hip ugds ${UGDS_HIP_LIBS})
+        target_compile_definitions(bench_overlap_hip PRIVATE __HIP_PLATFORM_AMD__)
+        set_target_properties(bench_overlap_hip PROPERTIES
             HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )

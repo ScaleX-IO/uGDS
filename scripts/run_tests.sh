@@ -4,13 +4,15 @@
 # Uses a single NVMe device, switching between modes via env_switch.sh.
 #
 # Usage:
-#   ./scripts/run_tests.sh [functional|perf|compare|all]
+#   BACKEND=hip ./scripts/run_tests.sh [functional|perf|compare|all]
 #
 # Environment variables:
 #   PCI_SLOT      PCI slot of the NVMe device  (default: auto-detect ugds_drv device)
 #   MOUNT_POINT   Mount point for GDS             (default: /mnt/ugds_test)
 #   GPU_ID        GPU device index              (default: 0)
 #   BUILD_DIR     Build output directory        (default: ./build)
+#   BACKEND       Backend to run: auto, all, cuda, hip (default: auto)
+#   HIP_RESULT_DIR  HIP performance logs (default: ./hipfile_test_result)
 #
 
 set -euo pipefail
@@ -22,6 +24,18 @@ ENV_SWITCH="${SCRIPT_DIR}/env_switch.sh"
 
 GPU_ID="${GPU_ID:-0}"
 MOUNT_POINT="${MOUNT_POINT:-/mnt/ugds_test}"
+BACKEND="${BACKEND:-auto}"
+HIP_RESULT_DIR="${HIP_RESULT_DIR:-${REPO_DIR}/hipfile_test_result}"
+
+case "$BACKEND" in
+    auto|all) BACKEND_SUFFIXES=("_cuda" "_hip") ;;
+    cuda)     BACKEND_SUFFIXES=("_cuda") ;;
+    hip)      BACKEND_SUFFIXES=("_hip") ;;
+    *)
+        echo "ERROR: BACKEND must be one of: auto, all, cuda, hip"
+        exit 2
+        ;;
+esac
 
 PASSED=0
 FAILED=0
@@ -182,20 +196,9 @@ run_functional() {
     )
 
     for t in "${tests[@]}"; do
-        # In dual-backend builds, targets may be suffixed (_cuda/_hip)
         local found=0
-        for suffix in "" "_cuda" "_hip"; do
+        for suffix in "${BACKEND_SUFFIXES[@]}"; do
             if [ -x "$BUILD_DIR/${t}${suffix}" ]; then
-                # Skip on-the-fly unregistered test for HIP in dual builds:
-                # nvm_dma_map_device() defaults to CUDA (flags=0), so HIP
-                # unregistered I/O would route to the wrong backend.
-                # AMD buffers must be explicitly registered via uGDSBufRegister.
-                if [ "$t" = "test_read_write_unregistered" ] && [ "$suffix" = "_hip" ]; then
-                    printf "  %-40s ${Y}SKIP${N} (unregistered HIP I/O unsupported in dual mode)\n" "${t}${suffix}"
-                    SKIPPED=$((SKIPPED + 1))
-                    found=1
-                    continue
-                fi
                 run_test "$t${suffix}" "$BUILD_DIR/${t}${suffix}" "$ugds_dev" "$GPU_ID"
                 found=1
             fi
@@ -207,9 +210,8 @@ run_functional() {
     done
     for t in "${rdma_tests[@]}"; do
         # RDMA tests may not be built in non-RDMA configs.
-        # In dual-backend builds, both _cuda and _hip variants may exist.
         local found=0
-        for suffix in "" "_cuda" "_hip"; do
+        for suffix in "${BACKEND_SUFFIXES[@]}"; do
             if [ -x "$BUILD_DIR/${t}${suffix}" ]; then
                 run_test "$t${suffix}" "$BUILD_DIR/${t}${suffix}" "$ugds_dev" "$GPU_ID"
                 found=1
@@ -225,6 +227,42 @@ run_functional() {
 
 # ── UGDS perf (UGDS mode) ────────────────────────────────────────────
 
+write_hip_result_header() {
+    local result_file="$1"
+    {
+        echo "uGDS HIP/ROCm performance test"
+        echo "timestamp: $(date --iso-8601=seconds)"
+        echo "host: $(hostname)"
+        echo "git_commit: $(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+        echo "gpu_id: $GPU_ID"
+        echo "build_dir: $BUILD_DIR"
+        echo ""
+        hipcc --version 2>&1 || true
+        echo ""
+        rocminfo 2>&1 | awk '/Name:[[:space:]]+gfx/ || /Marketing Name:[[:space:]]+AMD/' || true
+        echo ""
+    } > "$result_file"
+}
+
+run_perf_command() {
+    local backend="$1"
+    local result_file="$2"
+    shift 2
+
+    if [ "$backend" = "hip" ]; then
+        if "$@" 2>&1 | tee -a "$result_file"; then
+            PASSED=$((PASSED + 1))
+            return 0
+        fi
+    elif "$@"; then
+        PASSED=$((PASSED + 1))
+        return 0
+    fi
+
+    FAILED=$((FAILED + 1))
+    return 0
+}
+
 run_perf_ugds() {
     local slot="$1"
     echo "=== UGDS Performance ==="
@@ -232,28 +270,51 @@ run_perf_ugds() {
     local ugds_dev
     ugds_dev=$(ensure_ugds "$slot")
 
-    # Find bench_ugds (may be suffixed in dual-backend builds)
-    local bench_bin=""
-    for suffix in "" "_cuda" "_hip"; do
-        if [ -x "$BUILD_DIR/bench_ugds${suffix}" ]; then
-            bench_bin="$BUILD_DIR/bench_ugds${suffix}"
-            break
-        fi
-    done
-
-    if [ -z "$bench_bin" ]; then
-        echo "  SKIP (bench_ugds not built)"
-        echo ""
-        return
-    fi
-
     echo "  Device: $ugds_dev  GPU: $GPU_ID"
     echo ""
 
-    for sz in 4K 128K 1M; do
-        echo "[UGDS - ${sz} seq read]"
-        "$bench_bin" -f "$ugds_dev" -l 128M -s "$sz" -t 1 -d "$GPU_ID" -m read
+    local found=0
+    for suffix in "${BACKEND_SUFFIXES[@]}"; do
+        local backend="${suffix#_}"
+        local bench_bin="$BUILD_DIR/bench_ugds${suffix}"
+        local overlap_bin="$BUILD_DIR/bench_overlap${suffix}"
+        local result_file=""
+
+        if [ ! -x "$bench_bin" ]; then
+            continue
+        fi
+        found=1
+
+        if [ "$backend" = "hip" ]; then
+            mkdir -p "$HIP_RESULT_DIR"
+            result_file="${HIP_RESULT_DIR}/hip_perf_$(date +%Y%m%d_%H%M%S).log"
+            write_hip_result_header "$result_file"
+            echo "  HIP result: $result_file"
+        fi
+
+        for sz in 4K 128K 1M; do
+            echo "[UGDS ${backend^^} - ${sz} seq read]"
+            if [ "$backend" = "hip" ]; then
+                echo "[UGDS HIP - ${sz} seq read]" >> "$result_file"
+            fi
+            run_perf_command "$backend" "$result_file" \
+                "$bench_bin" -f "$ugds_dev" -l 128M -s "$sz" -t 1 -d "$GPU_ID" -m read
+        done
+
+        if [ -x "$overlap_bin" ]; then
+            echo "[UGDS ${backend^^} - async I/O and compute overlap]"
+            if [ "$backend" = "hip" ]; then
+                echo "[UGDS HIP - async I/O and compute overlap]" >> "$result_file"
+            fi
+            run_perf_command "$backend" "$result_file" \
+                "$overlap_bin" "$ugds_dev" "$GPU_ID" 1M 16 5000
+        fi
     done
+
+    if [ "$found" -eq 0 ]; then
+        echo "  SKIP (no selected bench_ugds backend was built)"
+        SKIPPED=$((SKIPPED + 1))
+    fi
     echo ""
 }
 

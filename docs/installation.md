@@ -158,16 +158,17 @@ Build outputs:
 | Target | Description |
 |--------|-------------|
 | `libugds.so` | Shared library (uGDS API) |
-| `bench_ugds` | Performance benchmark tool |
-| `test_driver_lifecycle` | Functional test: driver open/close |
-| `test_handle_register` | Functional test: handle register/deregister |
-| `test_buf_register` | Functional test: buffer register/deregister |
-| `test_read_write_basic` | Functional test: 4KB write + read-back |
-| `test_read_write_large` | Functional test: 1MB IO (cross-MDTS) |
-| `test_read_write_unregistered` | Functional test: on-the-fly DMA path |
-| `test_alignment_errors` | Functional test: alignment error handling |
-| `test_multi_offset` | Functional test: multi-offset LBA calculation |
-| `test_concurrent_qps` | Functional test: 4-thread concurrent IO |
+| `bench_ugds_cuda` / `bench_ugds_hip` | Backend-specific performance benchmark |
+| `bench_overlap_cuda` / `bench_overlap_hip` | Async I/O and GPU-compute overlap benchmark |
+| `test_driver_lifecycle_cuda` / `_hip` | Functional test: driver open/close |
+| `test_handle_register_cuda` / `_hip` | Functional test: handle register/deregister |
+| `test_buf_register_cuda` / `_hip` | Functional test: buffer register/deregister |
+| `test_read_write_basic_cuda` / `_hip` | Functional test: 4KB write + read-back |
+| `test_read_write_large_cuda` / `_hip` | Functional test: 1MB IO (cross-MDTS) |
+| `test_read_write_unregistered_cuda` / `_hip` | Functional test: on-the-fly DMA path |
+| `test_alignment_errors_cuda` / `_hip` | Functional test: alignment error handling |
+| `test_multi_offset_cuda` / `_hip` | Functional test: multi-offset LBA calculation |
+| `test_concurrent_qps_cuda` / `_hip` | Functional test: 4-thread concurrent IO |
 
 ### Optional: Build GDS Comparison Benchmark
 
@@ -178,14 +179,14 @@ cmake .. -DCUFILE_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcufile.so
 make -j$(nproc)
 ```
 
-This builds `bench_gds` alongside `bench_ugds` for direct performance comparison.
+This builds `bench_gds` alongside `bench_ugds_cuda` for direct performance comparison.
 
 ## Step 4: Verify
 
 Run the functional test suite:
 
 ```bash
-for t in build/test_*; do
+for t in build/test_*_cuda; do
     echo "=== $(basename $t) ==="
     $t /dev/ugds_drv0 0
 done
@@ -195,10 +196,13 @@ Run a quick performance check:
 
 ```bash
 # Single-thread 4KB read
-./build/bench_ugds -f /dev/ugds_drv0 -l 128M -s 4K -t 1 -d 0 -m read
+./build/bench_ugds_cuda -f /dev/ugds_drv0 -l 128M -s 4K -t 1 -d 0 -m read
 
 # 16-thread 64KB read
-./build/bench_ugds -f /dev/ugds_drv0 -l 256M -s 64K -t 16 -d 0 -m read
+./build/bench_ugds_cuda -f /dev/ugds_drv0 -l 256M -s 64K -t 16 -d 0 -m read
+
+# Run the HIP functional and performance suite
+BACKEND=hip ./scripts/run_tests.sh all
 ```
 
 ## Environment Switching
@@ -215,4 +219,3 @@ scripts/env_switch.sh gds <your-pci-slot> /mnt/nvme_test
 # Check status
 scripts/env_switch.sh status
 ```
-

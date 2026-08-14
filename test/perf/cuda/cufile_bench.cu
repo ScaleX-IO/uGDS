@@ -25,9 +25,11 @@
   #define cudaStreamSynchronize hipStreamSynchronize
   /* HIP builds must use dmabuf path */
   #define TEST_BUF_FLAGS  UGDS_REGISTER_DMABUF
+  #define GPU_BACKEND_NAME "HIP"
 #else
   #include <cuda_runtime.h>
   #define TEST_BUF_FLAGS  0
+  #define GPU_BACKEND_NAME "CUDA"
 #endif
 
 #ifdef USE_NVIDIA_GDS
@@ -66,7 +68,8 @@ static inline uGDSError_t uGDSStreamRegister(cudaStream_t s) { return cuFileStre
     do {                                                                        \
         cudaError_t err = (call);                                               \
         if (err != cudaSuccess) {                                               \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,   \
+            fprintf(stderr, "%s error at %s:%d: %s\n", GPU_BACKEND_NAME,       \
+                    __FILE__, __LINE__,                                         \
                     cudaGetErrorString(err));                                    \
             exit(EXIT_FAILURE);                                                 \
         }                                                                       \

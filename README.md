@@ -52,13 +52,15 @@ No kernel NVMe driver, no page cache — the CPU only touches doorbell registers
 
 ## Performance
 
-16-thread sequential read bandwidth on A100-40GB + Samsung 990 PRO (PCIe Gen4 x4):
+16-thread, 1 GiB sequential bandwidth on Samsung 990 PRO (PCIe Gen4 x4).
+The GDS and uGDS + CUDA baselines use an A100-40GB; uGDS + HIP was measured
+on an AMD Instinct MI210 with ROCm 7.1.1 using the same benchmark parameters.
 
-![Sequential Read: GDS vs uGDS](assets/ugds_vs_gds_16t_read.png)
+![Sync Read: GDS vs uGDS with CUDA and HIP](assets/ugds_vs_gds_16t_read.png)
 
-![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_16t_write.png)
+![Sequential Write: GDS vs uGDS with CUDA and HIP](assets/ugds_vs_gds_16t_write.png)
 
-uGDS bypasses the kernel NVMe driver, achieving up to **2.7x** higher read bandwidth and **28x** higher write bandwidth than NVIDIA GDS at small IO sizes.
+Both GPU backends bypass the kernel NVMe driver. 
 
 ## Quick Start
 
@@ -113,18 +115,25 @@ Requires ROCm 7.0+, `CONFIG_HSA_AMD_P2P=y`, and Large BAR enabled. See the [Inst
 ## Testing
 
 ```bash
-# Run functional tests only
-scripts/run_tests.sh functional
+# Run CUDA functional tests
+BACKEND=cuda scripts/run_tests.sh functional
 
-# Run uGDS performance benchmark
-scripts/run_tests.sh perf
+# Run HIP/ROCm functional tests
+BACKEND=hip scripts/run_tests.sh functional
+
+# Run HIP throughput and overlap benchmarks
+BACKEND=hip scripts/run_tests.sh perf
 
 # Run uGDS vs GDS comparison (auto-switches driver mode)
-scripts/run_tests.sh compare
+BACKEND=cuda scripts/run_tests.sh compare
 
-# Run all (functional + comparison)
+# Run every backend that was built
 scripts/run_tests.sh all
 ```
+
+Test sources are split by backend under `test/functional/{cuda,hip}` and
+`test/perf/{cuda,hip}`. Built test and benchmark names use `_cuda` or `_hip`
+suffixes so dual-backend builds remain unambiguous.
 
 ## API Coverage
 

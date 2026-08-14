@@ -4,7 +4,31 @@
 #include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
-#include <cuda_runtime.h>
+
+#ifdef __HIP_PLATFORM_AMD__
+  #include <hip/hip_runtime.h>
+  #define cudaMalloc             hipMalloc
+  #define cudaFree               hipFree
+  #define cudaMemset             hipMemset
+  #define cudaSetDevice          hipSetDevice
+  #define cudaDeviceSynchronize  hipDeviceSynchronize
+  #define cudaSuccess            hipSuccess
+  #define cudaError_t            hipError_t
+  #define cudaGetErrorString     hipGetErrorString
+  #define cudaStream_t           hipStream_t
+  #define cudaStreamCreate       hipStreamCreate
+  #define cudaStreamDestroy      hipStreamDestroy
+  #define cudaStreamSynchronize  hipStreamSynchronize
+  #define cudaHostAlloc          hipHostMalloc
+  #define cudaHostAllocDefault   hipHostMallocDefault
+  #define cudaFreeHost           hipHostFree
+  #define GPU_BACKEND_NAME       "HIP"
+  #define TEST_BUF_FLAGS         UGDS_REGISTER_DMABUF
+#else
+  #include <cuda_runtime.h>
+  #define GPU_BACKEND_NAME       "CUDA"
+  #define TEST_BUF_FLAGS         0
+#endif
 
 #ifdef USE_NVIDIA_GDS
 #include <cufile.h>
@@ -35,7 +59,8 @@ static inline uGDSError_t uGDSStreamRegister(cudaStream_t s) { return cuFileStre
     do {                                                                        \
         cudaError_t err = (call);                                               \
         if (err != cudaSuccess) {                                               \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,   \
+            fprintf(stderr, "%s error at %s:%d: %s\n", GPU_BACKEND_NAME,       \
+                    __FILE__, __LINE__,                                         \
                     cudaGetErrorString(err));                                    \
             exit(EXIT_FAILURE);                                                 \
         }                                                                       \
@@ -91,7 +116,7 @@ int main(int argc, char** argv)
     void* d_io_buf;
     CHECK_CUDA(cudaMalloc(&d_io_buf, total_buf));
     CHECK_CUDA(cudaMemset(d_io_buf, 0xAB, total_buf));
-    status = uGDSBufRegister(d_io_buf, total_buf, 0);
+    status = uGDSBufRegister(d_io_buf, total_buf, TEST_BUF_FLAGS);
     if (status.err != UGDS_SUCCESS) { fprintf(stderr, "BufRegister failed\n"); return 1; }
 
     size_t compute_n = 256 * 1024;
