@@ -53,14 +53,22 @@ No kernel NVMe driver, no page cache — the CPU only touches doorbell registers
 ## Performance
 
 16-thread, 1 GiB sequential bandwidth on Samsung 990 PRO (PCIe Gen4 x4).
-The GDS and uGDS + CUDA baselines use an A100-40GB; uGDS + HIP was measured
-on an AMD Instinct MI210 with ROCm 7.1.1 using the same benchmark parameters.
+Each panel compares the native direct-storage stack with uGDS on the same GPU
+platform: NVIDIA GDS vs uGDS on an A100-40GB, and AMD HipFile vs uGDS on an
+AMD Instinct MI210. Both AMD series use ROCm 7.2.4. AMD read points are the
+mean of three runs; write points are the mean of five runs, except uGDS 8K,
+which is the mean of ten runs. All four series use the same benchmark
+parameters.
 
-![Sync Read: GDS vs uGDS with CUDA and HIP](assets/ugds_vs_gds_16t_read.png)
+![Sync Read: GDS vs uGDS on CUDA and HipFile vs uGDS on ROCm](assets/ugds_vs_gds_16t_read.png)
 
-![Sequential Write: GDS vs uGDS with CUDA and HIP](assets/ugds_vs_gds_16t_write.png)
+![Sequential Write: GDS vs uGDS on CUDA and HipFile vs uGDS on ROCm](assets/ugds_vs_gds_16t_write.png)
 
-Both GPU backends bypass the kernel NVMe driver. 
+The CUDA and ROCm results are shown in separate panels so comparisons remain
+within a single GPU platform. HipFile was run with compatibility mode disabled,
+which forces its direct-storage fast path instead of CPU fallback I/O. During
+the controlled write rerun, the SSD link remained PCIe 4.0 x4 and the MI210
+path remained PCIe 4.0 x16 with both the NVMe and uGDS drivers.
 
 ## Quick Start
 
