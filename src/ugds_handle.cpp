@@ -406,10 +406,10 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     return UGDS_OK;
 }
 
-extern "C" uGDSError_t uGDSGetDeviceSize(uGDSHandle_t fh,
-                                           uint64_t* size_bytes)
+extern "C" uGDSError_t uGDSGetDeviceCapacity(uGDSHandle_t fh,
+                                               uint64_t* capacity_bytes)
 {
-    if (fh == nullptr || size_bytes == nullptr)
+    if (fh == nullptr || capacity_bytes == nullptr)
         return make_error(UGDS_INVALID_VALUE);
 
     std::shared_ptr<HandleState> hs_sp;
@@ -427,7 +427,7 @@ extern "C" uGDSError_t uGDSGetDeviceSize(uGDSHandle_t fh,
         capacity_blocks > UINT64_MAX / block_size) {
         result = make_error(UGDS_INTERNAL_ERROR);
     } else {
-        *size_bytes = capacity_blocks * block_size;
+        *capacity_bytes = capacity_blocks * block_size;
     }
 
     handle_release(hs);

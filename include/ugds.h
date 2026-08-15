@@ -128,7 +128,8 @@ uGDSError_t uGDSDriverClose(void);
 uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr);
 
 /* Return the usable NVMe namespace capacity in bytes for a registered handle. */
-uGDSError_t uGDSGetDeviceSize(uGDSHandle_t fh, uint64_t* size_bytes);
+uGDSError_t uGDSGetDeviceCapacity(uGDSHandle_t fh,
+                                  uint64_t* capacity_bytes);
 
 void uGDSHandleDeregister(uGDSHandle_t fh);
 

@@ -21,20 +21,22 @@ int main(int argc, char** argv) {
     ASSERT_OK(st, "HandleRegister");
 
     // 2. Query the registered namespace capacity
-    uint64_t device_size = 0;
-    st = uGDSGetDeviceSize(fh, &device_size);
-    ASSERT_OK(st, "GetDeviceSize");
-    if (device_size == 0) TEST_FAIL("GetDeviceSize returned zero capacity");
+    uint64_t device_capacity = 0;
+    st = uGDSGetDeviceCapacity(fh, &device_capacity);
+    ASSERT_OK(st, "GetDeviceCapacity");
+    if (device_capacity == 0)
+        TEST_FAIL("GetDeviceCapacity returned zero capacity");
 
-    st = uGDSGetDeviceSize(fh, nullptr);
-    ASSERT_ERR(st, UGDS_INVALID_VALUE, "GetDeviceSize nullptr output");
-    st = uGDSGetDeviceSize(nullptr, &device_size);
-    ASSERT_ERR(st, UGDS_INVALID_VALUE, "GetDeviceSize nullptr handle");
+    st = uGDSGetDeviceCapacity(fh, nullptr);
+    ASSERT_ERR(st, UGDS_INVALID_VALUE, "GetDeviceCapacity nullptr output");
+    st = uGDSGetDeviceCapacity(nullptr, &device_capacity);
+    ASSERT_ERR(st, UGDS_INVALID_VALUE, "GetDeviceCapacity nullptr handle");
 
     // 3. Deregister and reject the stale handle
     uGDSHandleDeregister(fh);
-    st = uGDSGetDeviceSize(fh, &device_size);
-    ASSERT_ERR(st, UGDS_HANDLE_NOT_REGISTERED, "GetDeviceSize stale handle");
+    st = uGDSGetDeviceCapacity(fh, &device_capacity);
+    ASSERT_ERR(st, UGDS_HANDLE_NOT_REGISTERED,
+               "GetDeviceCapacity stale handle");
 
     // 4. Register again on the same fd (reuse after deregister)
     fh = nullptr;
