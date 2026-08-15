@@ -406,6 +406,34 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     return UGDS_OK;
 }
 
+extern "C" uGDSError_t uGDSGetDeviceCapacity(uGDSHandle_t fh,
+                                               uint64_t* capacity_bytes)
+{
+    if (fh == nullptr || capacity_bytes == nullptr)
+        return make_error(UGDS_INVALID_VALUE);
+
+    std::shared_ptr<HandleState> hs_sp;
+    HandleState* hs = handle_lookup(fh, &hs_sp);
+    if (hs == nullptr)
+        return make_error(UGDS_HANDLE_NOT_REGISTERED);
+
+    const uint64_t capacity_blocks =
+        static_cast<uint64_t>(hs->ns_info.capacity);
+    const uint64_t block_size =
+        static_cast<uint64_t>(hs->ns_info.lba_data_size);
+
+    uGDSError_t result = UGDS_OK;
+    if (capacity_blocks == 0 || block_size == 0 ||
+        capacity_blocks > UINT64_MAX / block_size) {
+        result = make_error(UGDS_INTERNAL_ERROR);
+    } else {
+        *capacity_bytes = capacity_blocks * block_size;
+    }
+
+    handle_release(hs);
+    return result;
+}
+
 extern "C" void uGDSHandleDeregister(uGDSHandle_t fh)
 {
     /* Legacy API: infinite wait. This void API cannot return an error

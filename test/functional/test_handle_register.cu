@@ -20,26 +20,41 @@ int main(int argc, char** argv) {
     st = uGDSHandleRegister(&fh, &descr);
     ASSERT_OK(st, "HandleRegister");
 
-    // 2. Deregister
-    uGDSHandleDeregister(fh);
+    // 2. Query the registered namespace capacity
+    uint64_t device_capacity = 0;
+    st = uGDSGetDeviceCapacity(fh, &device_capacity);
+    ASSERT_OK(st, "GetDeviceCapacity");
+    if (device_capacity == 0)
+        TEST_FAIL("GetDeviceCapacity returned zero capacity");
 
-    // 3. Register again on the same fd (reuse after deregister)
+    st = uGDSGetDeviceCapacity(fh, nullptr);
+    ASSERT_ERR(st, UGDS_INVALID_VALUE, "GetDeviceCapacity nullptr output");
+    st = uGDSGetDeviceCapacity(nullptr, &device_capacity);
+    ASSERT_ERR(st, UGDS_INVALID_VALUE, "GetDeviceCapacity nullptr handle");
+
+    // 3. Deregister and reject the stale handle
+    uGDSHandleDeregister(fh);
+    st = uGDSGetDeviceCapacity(fh, &device_capacity);
+    ASSERT_ERR(st, UGDS_HANDLE_NOT_REGISTERED,
+               "GetDeviceCapacity stale handle");
+
+    // 4. Register again on the same fd (reuse after deregister)
     fh = nullptr;
     st = uGDSHandleRegister(&fh, &descr);
     ASSERT_OK(st, "HandleRegister after deregister");
     uGDSHandleDeregister(fh);
     close(fd);
 
-    // 4. nullptr fh pointer -> INVALID_VALUE
+    // 5. nullptr fh pointer -> INVALID_VALUE
     st = uGDSHandleRegister(nullptr, &descr);
     ASSERT_ERR(st, UGDS_INVALID_VALUE, "nullptr fh");
 
-    // 5. nullptr descr -> INVALID_VALUE
+    // 6. nullptr descr -> INVALID_VALUE
     uGDSHandle_t fh2 = nullptr;
     st = uGDSHandleRegister(&fh2, nullptr);
     ASSERT_ERR(st, UGDS_INVALID_VALUE, "nullptr descr");
 
-    // 6. Invalid handle type (WIN32) -> INVALID_FILE_TYPE
+    // 7. Invalid handle type (WIN32) -> INVALID_FILE_TYPE
     fd = open(g_dev_path, O_RDWR);
     if (fd < 0) TEST_FAIL("open(%s) failed for win32 test", g_dev_path);
     uGDSDescr_t bad_descr;
@@ -51,7 +66,7 @@ int main(int argc, char** argv) {
     ASSERT_ERR(st, UGDS_INVALID_FILE_TYPE, "WIN32 handle type");
     close(fd);
 
-    // 7. Deregister nullptr should not crash
+    // 8. Deregister nullptr should not crash
     uGDSHandleDeregister(nullptr);
 
     uGDSDriverClose();
