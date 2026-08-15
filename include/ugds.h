@@ -85,6 +85,7 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
     case UGDS_INVALID_VALUE:               return "invalid arguments";
     case UGDS_MEMORY_ALREADY_REGISTERED:   return "memory already registered";
     case UGDS_MEMORY_NOT_REGISTERED:       return "memory not registered";
+    case UGDS_HANDLE_NOT_REGISTERED:       return "handle not registered";
     case UGDS_INTERNAL_ERROR:              return "internal error";
     case UGDS_GPU_MEMORY_PINNING_FAILED:   return "GPU memory pinning failed";
     case UGDS_BATCH_CAPACITY_EXCEEDED:     return "batch capacity exceeded";
@@ -125,6 +126,9 @@ uGDSError_t uGDSDriverOpen(void);
 uGDSError_t uGDSDriverClose(void);
 
 uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr);
+
+/* Return the usable NVMe namespace capacity in bytes for a registered handle. */
+uGDSError_t uGDSGetDeviceSize(uGDSHandle_t fh, uint64_t* size_bytes);
 
 void uGDSHandleDeregister(uGDSHandle_t fh);
 
