@@ -20,10 +20,14 @@
   <a href="https://www.amd.com/en/products/software/rocm.html">
     <img src="https://cdn.simpleicons.org/amd/000000" alt="AMD" height="150" align="middle">
   </a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://github.com/vllm-project/vllm">
+  <img src="https://raw.githubusercontent.com/vllm-project/media-kit/main/vLLM-Full-Logo.svg" alt="vLLM" height="80" align="middle">
+</a>
 </p>
 
 ## News
-
+- **2026-08** — The core idea of uGDS developed into a backup for machine that do not support P2P DMA, which adds a native vLLM disk offloading path with zero external dependencies. See [vLLM Disk Offloading](https://github.com/vllm-project/vllm/pull/49644)
 - **2026-08** — The [uGDS adapter for LMCache](https://github.com/LMCache/LMCache/pull/4420) has landed upstream! Use uGDS as the GDS L1 backend on NVIDIA CUDA or AMD ROCm, then [try it with LMCache](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/configuration.rst#gds-l1-tier) by setting `--gds-l1-backend ugds`. 🚀
 - **2026-07** — AMD Infinity Storage (HIP/ROCm) backend merged ([PR #1](https://github.com/ScaleX-IO/uGDS/pull/1)): dual-backend CUDA + HIP support. 🎉
 - **2026-03** — CoPilotIO: CPU as a Co-pilot for GPU I/O to Free GPU Compute accepted to [OSDI '26](https://www.usenix.org/conference/osdi26/presentation/chen-guanyi). 🎓
