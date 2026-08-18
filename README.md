@@ -12,9 +12,19 @@
 
 ---
 
+<p align="center">
+  <a href="https://github.com/LMCache/LMCache">
+    <img src="https://raw.githubusercontent.com/LMCache/LMCache/dev/asset/logo.png" alt="LMCache" height="36">
+  </a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.amd.com/en/products/software/rocm.html">
+    <img src="https://cdn.simpleicons.org/amd/000000" alt="AMD" height="52">
+  </a>
+</p>
+
 ## News
 
-- **2026-07** — [LMCache uGDS backend](https://github.com/ScaleX-IO/LMCache/tree/ugds-backend) released: uGDS as the storage backend for LMCache KV cache, achieving 2x TTFT reduction and 2x throughput improvement over the GDS backend in vLLM end-to-end benchmarks. 🚀
+- **2026-08** — The [uGDS adapter for LMCache](https://github.com/LMCache/LMCache/pull/4420) has landed upstream! Use uGDS as the GDS L1 backend on NVIDIA CUDA or AMD ROCm, then [try it with LMCache](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/configuration.rst#gds-l1-tier) by setting `--gds-l1-backend ugds`. 🚀
 - **2026-07** — AMD Infinity Storage (HIP/ROCm) backend merged ([PR #1](https://github.com/ScaleX-IO/uGDS/pull/1)): dual-backend CUDA + HIP support. 🎉
 - **2026-03** — CoPilotIO: CPU as a Co-pilot for GPU I/O to Free GPU Compute accepted to [OSDI '26](https://www.usenix.org/conference/osdi26/presentation/chen-guanyi). 🎓
 
