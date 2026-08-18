@@ -13,17 +13,11 @@
 ---
 
 <p align="center">
-  <a href="https://github.com/LMCache/LMCache">
-    <img src="https://raw.githubusercontent.com/LMCache/LMCache/dev/asset/logo.png" alt="LMCache" height="36" align="middle">
-  </a>
+  <a href="https://github.com/LMCache/LMCache"><img src="https://raw.githubusercontent.com/LMCache/LMCache/dev/asset/logo.png" alt="LMCache" height="36" align="middle"></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.amd.com/en/products/software/rocm.html">
-    <img src="https://cdn.simpleicons.org/amd/000000" alt="AMD" height="150" align="middle">
-  </a>
+  <a href="https://www.amd.com/en/products/software/rocm.html"><img src="https://cdn.simpleicons.org/amd/000000" alt="AMD" height="150" align="middle"></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/vllm-project/vllm">
-  <img src="https://raw.githubusercontent.com/vllm-project/media-kit/main/vLLM-Full-Logo.svg" alt="vLLM" height="80" align="middle">
-</a>
+  <a href="https://github.com/vllm-project/vllm"><img src="https://raw.githubusercontent.com/vllm-project/media-kit/main/vLLM-Full-Logo.svg" alt="vLLM" height="80" align="middle"></a>
 </p>
 
 ## News
