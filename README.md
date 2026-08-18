@@ -14,11 +14,11 @@
 
 <p align="center">
   <a href="https://github.com/LMCache/LMCache">
-    <img src="https://raw.githubusercontent.com/LMCache/LMCache/dev/asset/logo.png" alt="LMCache" height="36">
+    <img src="https://raw.githubusercontent.com/LMCache/LMCache/dev/asset/logo.png" alt="LMCache" height="36" align="middle">
   </a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://www.amd.com/en/products/software/rocm.html">
-    <img src="https://cdn.simpleicons.org/amd/000000" alt="AMD" height="52">
+    <img src="https://cdn.simpleicons.org/amd/000000" alt="AMD" height="150" align="middle">
   </a>
 </p>
 
