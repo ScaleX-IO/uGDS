@@ -7,6 +7,8 @@
 #include <atomic>
 #include <time.h>
 #include <cstdio>
+#include <poll.h>
+#include <unistd.h>
 
 /* Release in-flight reference held by batch submit.
  * Called on validation failure or when batch entry completes. */
@@ -49,8 +51,6 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
     uint16_t status = UGDS_CPL_SCT_SC(cpl);
 
     nvm_sq_update(&qp.sq);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    nvm_cq_update(&qp.cq);
 
     CmdSlot& slot = bs->cmd_map[cid];
     BatchIOEntry& entry = bs->entries[slot.io_idx];
@@ -80,6 +80,19 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
     }
 
     return true;
+}
+
+static unsigned drain_completions(IOQueuePair& qp, BatchState* bs)
+{
+    unsigned drained = 0;
+    while (drain_one_completion(qp, bs))
+        ++drained;
+
+    if (drained > 0) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        nvm_cq_update(&qp.cq);
+    }
+    return drained;
 }
 
 static size_t compute_max_xfer(HandleState* hs)
@@ -234,6 +247,18 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         entry.n_cmds = static_cast<uint16_t>(n_cmds);
     }
 
+    size_t total_cmds = 0;
+    for (unsigned i = 0; i < nr; ++i)
+        total_cmds += bs->entries[base + i].n_cmds;
+
+    if (qp.irq_efd >= 0 && total_cmds > 0) {
+        uint8_t threshold = static_cast<uint8_t>(
+            std::min<size_t>(total_cmds, 256) - 1);
+        if (!nvm_ok(nvm_admin_set_irq_coalescing(
+                hs->aq_ref, threshold, UGDS_BATCH_IRQ_TIME_100US)))
+            fprintf(stderr, "uGDS: failed to configure batch IRQ coalescing\n");
+    }
+
     // Phase 2: build sub-command list
     struct SubCmd {
         unsigned io_idx;
@@ -243,9 +268,6 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         nvm_dma_t* buf_dma;
     };
 
-    size_t total_cmds = 0;
-    for (unsigned i = 0; i < nr; ++i)
-        total_cmds += bs->entries[base + i].n_cmds;
     std::vector<SubCmd> work;
     work.reserve(total_cmds);
 
@@ -336,14 +358,14 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                     uint64_t spins = 0;
                     const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
                     while ((pidx = prp_pool_alloc(&bs->prp_pool)) < 0) {
-                        if (!drain_one_completion(qp, bs)) {
+                        if (drain_completions(qp, bs) == 0) {
                             if (++spins > max_spins) {
                                 /* Release in_flight refs only for entries
                                  * that are still WAITING (ref acquired but
                                  * not yet submitted). PENDING entries have
                                  * commands in the SQ -- keep ref until drain.
                                  * COMPLETE entries were already released by
-                                 * drain_one_completion. FAILED already done. */
+                                 * drain_completions. FAILED already done. */
                                 for (unsigned i = 0; i < nr; ++i) {
                                     BatchIOEntry& e = bs->entries[base + i];
                                     if (e.status == UGDS_BATCH_WAITING) {
@@ -356,6 +378,8 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                                 return make_error(UGDS_INTERNAL_ERROR);
                             }
                             __builtin_ia32_pause();
+                        } else {
+                            spins = 0;
                         }
                     }
                 }
@@ -374,7 +398,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                 const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
                 bool drained = false;
                 while (!drained) {
-                    if (drain_one_completion(qp, bs)) {
+                    if (drain_completions(qp, bs) > 0) {
                         drained = true;
                     } else if (++spins > max_spins) {
                         if (prp_idx != UINT16_MAX)
@@ -488,33 +512,36 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
     unsigned n_ready = 0;
 
     while (true) {
-        std::lock_guard<std::mutex> batch_lock(bs->lock);
+        {
+            std::lock_guard<std::mutex> batch_lock(bs->lock);
 
-        // Poll single CQ for completions
-        if (bs->in_flight > 0) {
-            std::lock_guard<std::mutex> qp_lock(qp.lock);
-            while (drain_one_completion(qp, bs)) {}
+            if (bs->in_flight > 0) {
+                std::lock_guard<std::mutex> qp_lock(qp.lock);
+                drain_completions(qp, bs);
+            }
+
+            for (unsigned i = 0; i < bs->n_entries && n_ready < max_events; ++i) {
+                BatchIOEntry& entry = bs->entries[i];
+                if (entry.event_returned) continue;
+                if (entry.status != UGDS_BATCH_COMPLETE &&
+                    entry.status != UGDS_BATCH_FAILED) continue;
+
+                events[n_ready].cookie = entry.cookie;
+                events[n_ready].status = entry.status;
+                events[n_ready].ret = entry.error_code;
+                entry.event_returned = true;
+                bs->n_events_read++;
+                n_ready++;
+            }
+
+            if (n_ready >= min_nr || min_nr == 0 || n_ready >= max_events) {
+                *nr = n_ready;
+                return UGDS_OK;
+            }
         }
 
-        for (unsigned i = 0; i < bs->n_entries && n_ready < max_events; ++i) {
-            BatchIOEntry& entry = bs->entries[i];
-            if (entry.event_returned) continue;
-            if (entry.status != UGDS_BATCH_COMPLETE &&
-                entry.status != UGDS_BATCH_FAILED) continue;
-
-            events[n_ready].cookie = entry.cookie;
-            events[n_ready].status = entry.status;
-            events[n_ready].ret = entry.error_code;
-            entry.event_returned = true;
-            bs->n_events_read++;
-            n_ready++;
-        }
-
-        if (n_ready >= min_nr || min_nr == 0 || n_ready >= max_events) {
-            *nr = n_ready;
-            return UGDS_OK;
-        }
-
+        struct timespec wait_ts;
+        struct timespec* wait_ptr = nullptr;
         if (has_deadline) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -523,9 +550,35 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
                 *nr = n_ready;
                 return UGDS_OK;
             }
+            wait_ts.tv_sec = deadline.tv_sec - now.tv_sec;
+            wait_ts.tv_nsec = deadline.tv_nsec - now.tv_nsec;
+            if (wait_ts.tv_nsec < 0) {
+                wait_ts.tv_sec--;
+                wait_ts.tv_nsec += 1000000000L;
+            }
+            wait_ptr = &wait_ts;
         }
 
-        __builtin_ia32_pause();
+        if (qp.irq_efd < 0) {
+            __builtin_ia32_pause();
+            continue;
+        }
+
+        struct pollfd pfd = {qp.irq_efd, POLLIN, 0};
+        int pr = ppoll(&pfd, 1, wait_ptr, nullptr);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return make_error(UGDS_INTERNAL_ERROR);
+        }
+        if (pr == 0) continue;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            return make_error(UGDS_INTERNAL_ERROR);
+        if (pfd.revents & POLLIN) {
+            uint64_t count;
+            ssize_t ret = read(qp.irq_efd, &count, sizeof(count));
+            if (ret < 0 && errno != EINTR && errno != EAGAIN)
+                return make_error(UGDS_INTERNAL_ERROR);
+        }
     }
 }
 
@@ -543,7 +596,7 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
         uint64_t spins = 0;
         const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
         while (bs->in_flight > 0) {
-            if (!drain_one_completion(qp, bs)) {
+            if (drain_completions(qp, bs) == 0) {
                 if (++spins > max_spins) break;
                 __builtin_ia32_pause();
             } else {

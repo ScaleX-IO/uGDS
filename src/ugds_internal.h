@@ -27,6 +27,7 @@
 #define UGDS_BATCH_QUEUE_DEPTH   512
 #define UGDS_MAX_BATCH_IO_SIZE   128
 #define UGDS_PRP_POOL_PAGES      64
+#define UGDS_BATCH_IRQ_TIME_100US 1
 #define UGDS_HUGEPAGE_SIZE       (2UL * 1024 * 1024)
 
 /* Fallback maximum data-transfer size (bytes) for a single I/O when the controller
