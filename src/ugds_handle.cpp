@@ -335,8 +335,12 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
 
         if (batch_irq &&
             setup_qp_irq(hs.get(), &bqp->qp, batch_irq_vec)) {
+            /* FID 08h is controller-wide, so configure a stable policy once
+             * during queue setup rather than issuing an Admin command for
+             * every batch. Both values come from the built-in balanced policy. */
             int irq_status = nvm_admin_set_irq_coalescing(
-                hs->aq_ref, 0, UGDS_BATCH_IRQ_TIME_100US);
+                hs->aq_ref, UGDS_BATCH_IRQ_THRESHOLD,
+                UGDS_BATCH_IRQ_TIME_100US);
             if (!nvm_ok(irq_status)) {
                 fprintf(stderr, "uGDS: NVMe IRQ coalescing unavailable: %s; "
                                 "batch uses poll mode\n",

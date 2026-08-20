@@ -27,7 +27,9 @@
 #define UGDS_BATCH_QUEUE_DEPTH   512
 #define UGDS_MAX_BATCH_IO_SIZE   128
 #define UGDS_PRP_POOL_PAGES      64
-#define UGDS_BATCH_IRQ_TIME_100US 1
+/* Balanced zero-configuration policy: 16 completions or 5 ms. */
+#define UGDS_BATCH_IRQ_THRESHOLD 15
+#define UGDS_BATCH_IRQ_TIME_100US 50
 #define UGDS_HUGEPAGE_SIZE       (2UL * 1024 * 1024)
 
 /* Fallback maximum data-transfer size (bytes) for a single I/O when the controller
@@ -219,6 +221,9 @@ struct BatchState {
     HandleState* hs = nullptr;
     std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive for batch lifetime */
     std::mutex   lock;
+    /* eventfd is a consuming counter. Serialize GetStatus callers so one
+     * waiter cannot consume the wakeup that another waiter depends on. */
+    std::mutex   status_lock;
 };
 
 static inline uGDSError_t make_error(uGDSOpError err) {
