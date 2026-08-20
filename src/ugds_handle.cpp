@@ -11,6 +11,18 @@
 #include <unistd.h>
 #include <time.h>
 
+static void cleanup_qp_irq(IOQueuePair* qp, int dev_fd) {
+    if (qp->irq_efd < 0) return;
+
+    struct nvm_ioctl_irq req = {};
+    req.vector = qp->irq_vec;
+    req.eventfd = qp->irq_efd;
+    if (dev_fd >= 0)
+        ioctl(dev_fd, NVM_UNREGISTER_INTERRUPT, &req);
+    close(qp->irq_efd);
+    qp->irq_efd = -1;
+}
+
 static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp, int dev_fd) {
     if (qp->sq_dma) {
         nvm_admin_sq_delete(aq_ref, &qp->sq, &qp->cq);
@@ -20,15 +32,7 @@ static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp, int dev_fd) {
         nvm_admin_cq_delete(aq_ref, &qp->cq);
         nvm_dma_unmap(qp->cq_dma);
     }
-    if (qp->irq_efd >= 0) {
-        struct nvm_ioctl_irq req = {};
-        req.vector = qp->irq_vec;
-        req.eventfd = qp->irq_efd;
-        if (dev_fd >= 0)
-            ioctl(dev_fd, NVM_UNREGISTER_INTERRUPT, &req);
-        close(qp->irq_efd);
-        qp->irq_efd = -1;
-    }
+    cleanup_qp_irq(qp, dev_fd);
     if (qp->prp_dma) nvm_dma_unmap(qp->prp_dma);
     free(qp->sq_buf);
     free(qp->cq_buf);
@@ -45,6 +49,22 @@ static void cleanup_batch_qp(nvm_aq_ref aq_ref, IOQueuePairHuge* bqp, int dev_fd
         hugepage_free(bqp->sq_huge, bqp->sq_huge_size);
     if (bqp->cq_huge)
         hugepage_free(bqp->cq_huge, bqp->cq_huge_size);
+}
+
+static bool setup_qp_irq(HandleState* hs, IOQueuePair* qp, uint16_t vector) {
+    int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (efd < 0) return false;
+
+    struct nvm_ioctl_irq req = {};
+    req.vector = vector;
+    req.eventfd = efd;
+    if (ioctl(hs->fd, NVM_REGISTER_INTERRUPT, &req) != 0) {
+        close(efd);
+        return false;
+    }
+    qp->irq_efd = efd;
+    qp->irq_vec = vector;
+    return true;
 }
 
 /* Release resources retained by timed-out synchronous I/O. The caller must
@@ -168,7 +188,9 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     uint16_t sync_qps = total_qps - 1;
     hs->num_qps = sync_qps;
 
-    uint16_t irq_vectors = 0;
+    uint16_t sync_irq_vectors = 0;
+    uint16_t batch_irq_vec = 0;
+    bool batch_irq = false;
     {
         const char* env = getenv("UGDS_INTERRUPT_MODE");
         bool want = env != nullptr &&
@@ -178,8 +200,12 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
             uint32_t nv = 0;
             if (ioctl(hs->fd, NVM_GET_NUM_VECTORS, &nv) == 0 && nv > 0) {
                 hs->interrupt_mode = true;
-                irq_vectors = std::min<uint16_t>(sync_qps,
-                                                 static_cast<uint16_t>(nv));
+                batch_irq = true;
+                uint16_t available = static_cast<uint16_t>(nv);
+                sync_irq_vectors = std::min<uint16_t>(
+                    sync_qps, available - (batch_irq ? 1 : 0));
+                if (batch_irq)
+                    batch_irq_vec = sync_irq_vectors;
             } else {
                 fprintf(stderr, "uGDS: interrupt mode requested but no MSI-X "
                                 "vectors available; using poll mode\n");
@@ -198,20 +224,8 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         status = nvm_dma_map_host(&qp->cq_dma, hs->ctrl, qp->cq_buf, page_size);
         if (!nvm_ok(status)) goto fail;
 
-        if (hs->interrupt_mode && i < irq_vectors) {
-            int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-            if (efd >= 0) {
-                struct nvm_ioctl_irq req = {};
-                req.vector = i;
-                req.eventfd = efd;
-                if (ioctl(hs->fd, NVM_REGISTER_INTERRUPT, &req) == 0) {
-                    qp->irq_efd = efd;
-                    qp->irq_vec = i;
-                } else {
-                    close(efd);
-                }
-            }
-        }
+        if (hs->interrupt_mode && i < sync_irq_vectors)
+            setup_qp_irq(hs.get(), qp.get(), i);
 
         status = nvm_admin_cq_create(hs->aq_ref, &qp->cq, i + 1,
                                      qp->cq_dma, 0, UGDS_DEFAULT_QUEUE_DEPTH,
@@ -220,6 +234,14 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
             nvm_dma_unmap(qp->cq_dma);
             qp->cq_dma = nullptr;
             goto fail;
+        }
+        if (batch_irq && qp->irq_efd >= 0) {
+            int irq_status = nvm_admin_set_irq_vector_config(
+                hs->aq_ref, qp->irq_vec, true);
+            if (!nvm_ok(irq_status))
+                fprintf(stderr, "uGDS: sync IRQ vector %u could not disable "
+                                "coalescing: %s\n",
+                        qp->irq_vec, nvm_strerror(irq_status));
         }
 
         // SQ
@@ -311,15 +333,40 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         sq_data_size = batch_depth * sizeof(nvm_cmd_t);
         cq_data_size = batch_depth * sizeof(nvm_cpl_t);
 
+        if (batch_irq &&
+            setup_qp_irq(hs.get(), &bqp->qp, batch_irq_vec)) {
+            /* FID 08h is controller-wide, so configure a stable policy once
+             * during queue setup rather than issuing an Admin command for
+             * every batch. Both values come from the built-in balanced policy. */
+            int irq_status = nvm_admin_set_irq_coalescing(
+                hs->aq_ref, UGDS_BATCH_IRQ_THRESHOLD,
+                UGDS_BATCH_IRQ_TIME_100US);
+            if (!nvm_ok(irq_status)) {
+                fprintf(stderr, "uGDS: NVMe IRQ coalescing unavailable: %s; "
+                                "batch uses poll mode\n",
+                        nvm_strerror(irq_status));
+                cleanup_qp_irq(&bqp->qp, hs->fd);
+            }
+        }
+
         status = nvm_dma_map_host(&bqp->qp.cq_dma, hs->ctrl,
                                    bqp->qp.cq_buf, cq_data_size);
         if (!nvm_ok(status)) goto batch_fail;
         status = nvm_admin_cq_create(hs->aq_ref, &bqp->qp.cq, batch_qp_id,
-                                     bqp->qp.cq_dma, 0, batch_depth);
+                                     bqp->qp.cq_dma, 0, batch_depth, false,
+                                     bqp->qp.irq_vec, bqp->qp.irq_efd >= 0);
         if (!nvm_ok(status)) {
             nvm_dma_unmap(bqp->qp.cq_dma);
             bqp->qp.cq_dma = nullptr;
             goto batch_fail;
+        }
+        if (bqp->qp.irq_efd >= 0) {
+            int irq_status = nvm_admin_set_irq_vector_config(
+                hs->aq_ref, bqp->qp.irq_vec, false);
+            if (!nvm_ok(irq_status))
+                fprintf(stderr, "uGDS: batch IRQ vector %u could not enable "
+                                "coalescing: %s\n",
+                        bqp->qp.irq_vec, nvm_strerror(irq_status));
         }
 
         status = nvm_dma_map_host(&bqp->qp.sq_dma, hs->ctrl,

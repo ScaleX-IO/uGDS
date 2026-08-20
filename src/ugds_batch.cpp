@@ -7,6 +7,22 @@
 #include <atomic>
 #include <time.h>
 #include <cstdio>
+#include <poll.h>
+#include <unistd.h>
+
+/* Batch completion architecture
+ * -----------------------------
+ * Both modes decode CQEs through drain_completions().  It consumes every CQE
+ * currently visible and rings the CQ doorbell once for the whole burst.
+ *
+ * Polling mode repeatedly drains the CQ and keeps the caller on CPU.
+ * Interrupt mode drains before sleeping, blocks on the CQ's eventfd, then
+ * drains again.  Checking the CQ before ppoll prevents a completion that is
+ * already visible from being hidden behind a later interrupt.
+ *
+ * Submit may also poll while reclaiming SQ/PRP resources.  That is queue
+ * backpressure inside Submit, not the completion mode selected by the user.
+ */
 
 /* Release in-flight reference held by batch submit.
  * Called on validation failure or when batch entry completes. */
@@ -18,7 +34,7 @@ static void async_release_inflight_batch(void* devPtr_base)
         it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-static void cleanup_prp_pool(BatchState* bs)
+static void prp_pool_destroy(BatchState* bs)
 {
     PRPPool& pool = bs->prp_pool;
     if (pool.dma) nvm_dma_unmap(pool.dma);
@@ -27,7 +43,7 @@ static void cleanup_prp_pool(BatchState* bs)
     pool.buf = nullptr;
 }
 
-static int prp_pool_alloc(PRPPool* pool)
+static int prp_pool_alloc_page(PRPPool* pool)
 {
     if (pool->free_bitmap == 0) return -1;
     int idx = __builtin_ctzll(pool->free_bitmap);
@@ -35,7 +51,7 @@ static int prp_pool_alloc(PRPPool* pool)
     return idx;
 }
 
-static void prp_pool_free(PRPPool* pool, int idx)
+static void prp_pool_release_page(PRPPool* pool, int idx)
 {
     pool->free_bitmap |= (1ULL << idx);
 }
@@ -49,10 +65,9 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
     uint16_t status = UGDS_CPL_SCT_SC(cpl);
 
     nvm_sq_update(&qp.sq);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    nvm_cq_update(&qp.cq);
-
+    //Represents which batch hardware command in the SQ
     CmdSlot& slot = bs->cmd_map[cid];
+    //Represents which sub‑IO within the batch packet
     BatchIOEntry& entry = bs->entries[slot.io_idx];
 
     if (status != 0) {
@@ -62,7 +77,7 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
     }
 
     if (slot.prp_page_idx != UINT16_MAX) {
-        prp_pool_free(&bs->prp_pool, slot.prp_page_idx);
+        prp_pool_release_page(&bs->prp_pool, slot.prp_page_idx);
     }
     slot.active = false;
     bs->in_flight--;
@@ -82,6 +97,23 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
     return true;
 }
 
+static unsigned drain_completions(IOQueuePair& qp, BatchState* bs)
+{
+    unsigned drained = 0;
+    while (drain_one_completion(qp, bs))
+        ++drained;
+
+    if (drained > 0) {
+        /* Publish one new CQ head after the entire ready burst, rather than
+         * paying one MMIO doorbell write for every CQE. */
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        nvm_cq_update(&qp.cq);
+    }
+    return drained;
+}
+
+//Calculate the maximum number of bytes that can be transferred in a single 
+//uGDS hardware command
 static size_t compute_max_xfer(HandleState* hs)
 {
     const size_t page_size = hs->ctrl->page_size;
@@ -234,6 +266,10 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         entry.n_cmds = static_cast<uint16_t>(n_cmds);
     }
 
+    size_t total_cmds = 0;
+    for (unsigned i = 0; i < nr; ++i)
+        total_cmds += bs->entries[base + i].n_cmds;
+
     // Phase 2: build sub-command list
     struct SubCmd {
         unsigned io_idx;
@@ -243,9 +279,6 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         nvm_dma_t* buf_dma;
     };
 
-    size_t total_cmds = 0;
-    for (unsigned i = 0; i < nr; ++i)
-        total_cmds += bs->entries[base + i].n_cmds;
     std::vector<SubCmd> work;
     work.reserve(total_cmds);
 
@@ -329,21 +362,23 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
 
             uint16_t prp_idx = UINT16_MAX;
             if (n_pages > 2) {
-                int pidx = prp_pool_alloc(&bs->prp_pool);
+                int pidx = prp_pool_alloc_page(&bs->prp_pool);
                 if (pidx < 0) {
+                    /* Resource backpressure: commands already built must run
+                     * before Submit can reuse their PRP-list pages. */
                     nvm_sq_submit(&qp.sq);
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     uint64_t spins = 0;
                     const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
-                    while ((pidx = prp_pool_alloc(&bs->prp_pool)) < 0) {
-                        if (!drain_one_completion(qp, bs)) {
+                    while ((pidx = prp_pool_alloc_page(&bs->prp_pool)) < 0) {
+                        if (drain_completions(qp, bs) == 0) {
                             if (++spins > max_spins) {
                                 /* Release in_flight refs only for entries
                                  * that are still WAITING (ref acquired but
                                  * not yet submitted). PENDING entries have
                                  * commands in the SQ -- keep ref until drain.
                                  * COMPLETE entries were already released by
-                                 * drain_one_completion. FAILED already done. */
+                                 * drain_completions. FAILED already done. */
                                 for (unsigned i = 0; i < nr; ++i) {
                                     BatchIOEntry& e = bs->entries[base + i];
                                     if (e.status == UGDS_BATCH_WAITING) {
@@ -356,6 +391,8 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                                 return make_error(UGDS_INTERNAL_ERROR);
                             }
                             __builtin_ia32_pause();
+                        } else {
+                            spins = 0;
                         }
                     }
                 }
@@ -367,6 +404,8 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             nvm_cmd_t* cmd = nvm_sq_enqueue(&qp.sq);
 
             if (cmd == nullptr) {
+                /* Resource backpressure: expose the queued SQEs and reclaim
+                 * completed SQ slots locally, regardless of completion mode. */
                 nvm_sq_submit(&qp.sq);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
 
@@ -374,11 +413,11 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                 const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
                 bool drained = false;
                 while (!drained) {
-                    if (drain_one_completion(qp, bs)) {
+                    if (drain_completions(qp, bs) > 0) {
                         drained = true;
                     } else if (++spins > max_spins) {
                         if (prp_idx != UINT16_MAX)
-                            prp_pool_free(&bs->prp_pool, prp_idx);
+                            prp_pool_release_page(&bs->prp_pool, prp_idx);
                         /* Release in_flight refs only for WAITING entries. */
                         for (unsigned i = 0; i < nr; ++i) {
                             BatchIOEntry& e = bs->entries[base + i];
@@ -400,7 +439,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                 cmd = nvm_sq_enqueue(&qp.sq);
                 if (cmd == nullptr) {
                     if (prp_idx != UINT16_MAX)
-                        prp_pool_free(&bs->prp_pool, prp_idx);
+                        prp_pool_release_page(&bs->prp_pool, prp_idx);
                     /* Release in_flight refs only for WAITING entries. */
                     for (unsigned i = 0; i < nr; ++i) {
                         BatchIOEntry& e = bs->entries[base + i];
@@ -449,7 +488,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             entry.status = UGDS_BATCH_PENDING;
         }
 
-        // Single doorbell for all commands
+        /* Expose all newly enqueued commands with one SQ doorbell write. */
         std::atomic_thread_fence(std::memory_order_seq_cst);
         nvm_sq_submit(&qp.sq);
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -457,6 +496,164 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
 
     bs->n_entries += nr;
     return UGDS_OK;
+}
+
+static bool status_request_satisfied(unsigned min_events,
+                                     unsigned max_events,
+                                     unsigned n_ready)
+{
+    return min_events == 0 || n_ready >= min_events || n_ready >= max_events;
+}
+
+/* Drain hardware completions and copy newly completed logical batch entries.
+ * The CQ lock protects queue head/doorbell state; the batch lock protects the
+ * command map, entry state and event_returned flags. */
+static bool collect_batch_events(BatchState* bs, IOQueuePair& qp,
+                                 unsigned min_events, unsigned max_events,
+                                 uGDSIOEvents_t* events, unsigned* n_ready)
+{
+    std::lock_guard<std::mutex> batch_lock(bs->lock);
+
+    if (bs->in_flight > 0) {
+        std::lock_guard<std::mutex> qp_lock(qp.lock);
+        drain_completions(qp, bs);
+    }
+
+    for (unsigned i = 0;
+         i < bs->n_entries && *n_ready < max_events; ++i) {
+        BatchIOEntry& entry = bs->entries[i];
+        if (entry.event_returned)
+            continue;
+        if (entry.status != UGDS_BATCH_COMPLETE &&
+            entry.status != UGDS_BATCH_FAILED)
+            continue;
+
+        events[*n_ready].cookie = entry.cookie;
+        events[*n_ready].status = entry.status;
+        events[*n_ready].ret = entry.error_code;
+        entry.event_returned = true;
+        bs->n_events_read++;
+        (*n_ready)++;
+    }
+
+    return status_request_satisfied(min_events, max_events, *n_ready);
+}
+
+static void make_deadline(const struct timespec& timeout,
+                          struct timespec* deadline)
+{
+    clock_gettime(CLOCK_MONOTONIC, deadline);
+    deadline->tv_sec += timeout.tv_sec;
+    deadline->tv_nsec += timeout.tv_nsec;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec += deadline->tv_nsec / 1000000000L;
+        deadline->tv_nsec %= 1000000000L;
+    }
+}
+
+/* Return false when the absolute deadline has expired. */
+static bool remaining_time(const struct timespec* deadline,
+                           struct timespec* remaining)
+{
+    if (deadline == nullptr)
+        return true;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    remaining->tv_sec = deadline->tv_sec - now.tv_sec;
+    remaining->tv_nsec = deadline->tv_nsec - now.tv_nsec;
+    if (remaining->tv_nsec < 0) {
+        remaining->tv_sec--;
+        remaining->tv_nsec += 1000000000L;
+    }
+    return remaining->tv_sec >= 0;
+}
+
+static uGDSError_t get_status_polling(BatchState* bs, IOQueuePair& qp,
+                                      unsigned min_events,
+                                      unsigned max_events,
+                                      uGDSIOEvents_t* events,
+                                      const struct timespec* deadline,
+                                      unsigned* nr)
+{
+    unsigned n_ready = 0;
+
+    for (;;) {
+        if (collect_batch_events(bs, qp, min_events, max_events,
+                                 events, &n_ready)) {
+            *nr = n_ready;
+            return UGDS_OK;
+        }
+
+        struct timespec unused;
+        if (!remaining_time(deadline, &unused)) {
+            /* Close the timeout edge: a CQE may have arrived between the last
+             * drain and the clock check. */
+            collect_batch_events(bs, qp, min_events, max_events,
+                                 events, &n_ready);
+            *nr = n_ready;
+            return UGDS_OK;
+        }
+
+        __builtin_ia32_pause();
+    }
+}
+
+static uGDSError_t get_status_interrupt(BatchState* bs, IOQueuePair& qp,
+                                        unsigned min_events,
+                                        unsigned max_events,
+                                        uGDSIOEvents_t* events,
+                                        const struct timespec* deadline,
+                                        unsigned* nr)
+{
+    unsigned n_ready = 0;
+
+    for (;;) {
+        /* Always inspect the CQ before blocking.  eventfd is only a wakeup
+         * hint; the CQ phase bit remains the source of completion truth. */
+        if (collect_batch_events(bs, qp, min_events, max_events,
+                                 events, &n_ready)) {
+            *nr = n_ready;
+            return UGDS_OK;
+        }
+
+        struct timespec wait_time;
+        struct timespec* wait_ptr = nullptr;
+        if (deadline != nullptr) {
+            if (!remaining_time(deadline, &wait_time)) {
+                /* As in polling mode, perform a final CQ drain at timeout. */
+                collect_batch_events(bs, qp, min_events, max_events,
+                                     events, &n_ready);
+                *nr = n_ready;
+                return UGDS_OK;
+            }
+            wait_ptr = &wait_time;
+        }
+
+        struct pollfd pfd = {qp.irq_efd, POLLIN, 0};
+        int pr = ppoll(&pfd, 1, wait_ptr, nullptr);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            return make_error(UGDS_INTERNAL_ERROR);
+        }
+        if (pr == 0)
+            continue;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            return make_error(UGDS_INTERNAL_ERROR);
+        if (!(pfd.revents & POLLIN))
+            continue;
+
+        /* Reading acknowledges all IRQs accumulated in eventfd.  The next
+         * loop iteration drains every CQE currently ready as one burst. */
+        uint64_t count;
+        ssize_t ret = read(qp.irq_efd, &count, sizeof(count));
+        if (ret == static_cast<ssize_t>(sizeof(count)))
+            continue;
+        if (ret < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        return make_error(UGDS_INTERNAL_ERROR);
+    }
 }
 
 extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
@@ -472,61 +669,24 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
     IOQueuePair& qp = hs->batch_qp->qp;
     unsigned max_events = *nr > 0 ? *nr : bs->capacity;
 
-    bool has_deadline = false;
     struct timespec deadline;
+    struct timespec* deadline_ptr = nullptr;
     if (timeout != nullptr) {
-        has_deadline = true;
-        clock_gettime(CLOCK_MONOTONIC, &deadline);
-        deadline.tv_sec += timeout->tv_sec;
-        deadline.tv_nsec += timeout->tv_nsec;
-        if (deadline.tv_nsec >= 1000000000L) {
-            deadline.tv_sec++;
-            deadline.tv_nsec -= 1000000000L;
-        }
+        make_deadline(*timeout, &deadline);
+        deadline_ptr = &deadline;
     }
 
-    unsigned n_ready = 0;
+    /* A batch CQ has one consuming eventfd, so only one GetStatus call may
+     * own its wait/collect cycle at a time.  Submit uses bs->lock separately
+     * and can still run while an interrupt-mode caller sleeps here. */
+    std::lock_guard<std::mutex> status_guard(bs->status_lock);
 
-    while (true) {
-        std::lock_guard<std::mutex> batch_lock(bs->lock);
+    if (qp.irq_efd < 0)
+        return get_status_polling(bs, qp, min_nr, max_events, events,
+                                  deadline_ptr, nr);
 
-        // Poll single CQ for completions
-        if (bs->in_flight > 0) {
-            std::lock_guard<std::mutex> qp_lock(qp.lock);
-            while (drain_one_completion(qp, bs)) {}
-        }
-
-        for (unsigned i = 0; i < bs->n_entries && n_ready < max_events; ++i) {
-            BatchIOEntry& entry = bs->entries[i];
-            if (entry.event_returned) continue;
-            if (entry.status != UGDS_BATCH_COMPLETE &&
-                entry.status != UGDS_BATCH_FAILED) continue;
-
-            events[n_ready].cookie = entry.cookie;
-            events[n_ready].status = entry.status;
-            events[n_ready].ret = entry.error_code;
-            entry.event_returned = true;
-            bs->n_events_read++;
-            n_ready++;
-        }
-
-        if (n_ready >= min_nr || min_nr == 0 || n_ready >= max_events) {
-            *nr = n_ready;
-            return UGDS_OK;
-        }
-
-        if (has_deadline) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (now.tv_sec > deadline.tv_sec ||
-                (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
-                *nr = n_ready;
-                return UGDS_OK;
-            }
-        }
-
-        __builtin_ia32_pause();
-    }
+    return get_status_interrupt(bs, qp, min_nr, max_events, events,
+                                deadline_ptr, nr);
 }
 
 extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
@@ -543,7 +703,7 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
         uint64_t spins = 0;
         const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
         while (bs->in_flight > 0) {
-            if (!drain_one_completion(qp, bs)) {
+            if (drain_completions(qp, bs) == 0) {
                 if (++spins > max_spins) break;
                 __builtin_ia32_pause();
             } else {
@@ -593,7 +753,7 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
         return;
     }
 
-    cleanup_prp_pool(bs);
+    prp_pool_destroy(bs);
 
     /* Mark batch inactive before releasing handle ref.
      * HandleDeregister waits on handle_in_flight==0, so we must not

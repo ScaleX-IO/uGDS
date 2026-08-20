@@ -215,6 +215,7 @@ set(FUNCTIONAL_TESTS
     test_batch_errors
     test_batch_reuse
     test_batch_deep
+    test_batch_interrupt
     test_async_basic
     test_async_stream_order
     test_async_late_binding
@@ -307,6 +308,19 @@ if(UGDS_BACKEND_CUDA)
                 BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
             )
         endif()
+
+        # Compact polling vs batch-interrupt demonstration.
+        add_executable(bench_batch_interrupt${CUDA_SUFFIX}
+            test/perf/batch_interrupt_compute.cu)
+        target_include_directories(bench_batch_interrupt${CUDA_SUFFIX} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(bench_batch_interrupt${CUDA_SUFFIX}
+            ugds CUDA::cudart Threads::Threads)
+        set_target_properties(bench_batch_interrupt${CUDA_SUFFIX} PROPERTIES
+            CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+            BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        )
 
         # bench_gds: NVIDIA GDS comparison (optional)
         set(CUFILE_LIB "" CACHE FILEPATH "Path to NVIDIA libcufile.so for GDS comparison benchmark")
