@@ -102,6 +102,8 @@ See [examples/01_basic_read_write.cu](examples/01_basic_read_write.cu) for a com
 
 For build instructions, environment setup, and driver management, see the **[Installation Guide](docs/installation.md)**.
 
+Run the [vLLM + LMCache + uGDS end-to-end benchmark](examples/vllm_lmcache_bench/README.md) to validate KV-cache offloading on a dedicated NVMe SSD.
+
 ### AMD Infinity Storage (HIP/ROCm) Backend
 
 To build with the AMD HIP backend instead of CUDA:
