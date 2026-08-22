@@ -92,6 +92,39 @@ int nvm_dma_map_device(nvm_dma_t** map, const nvm_ctrl_t* ctrl, void* devptr, si
 #define NVM_MAP_FORCE_CUDA  0x4    /* Force CUDA path (skip auto-probe) */
 int nvm_dma_map_device_ex(nvm_dma_t** map, const nvm_ctrl_t* ctrl, void* devptr, size_t size, int flags);
 
+/*
+ * Map an external application-exported dma-buf fd for the controller.
+ * The fd is duplicated (F_DUPFD_CLOEXEC) so uGDS owns the duplicate.
+ * Uses the V1 NVM_MAP_DMABUF_MEMORY ioctl (cmd 4).
+ *
+ * Only available when UGDS_HAVE_DMABUF is defined (HIP, CUDA dmabuf,
+ * or external import build).
+ */
+#if defined(UGDS_HAVE_DMABUF)
+int nvm_dma_map_dmabuf_fd(nvm_dma_t** handle, const nvm_ctrl_t* ctrl,
+                           void* devptr, size_t size,
+                           int dmabuf_fd, uint64_t dmabuf_offset);
+
+/* Forward declaration for the V2 struct (defined in internal/ioctl.h,
+ * but we avoid pulling it into the public header to keep the ABI clean).
+ * Callers that need the V2 result struct include internal/ioctl.h or
+ * the kernel mirror header directly. */
+struct nvm_ioctl_dmabuf_v2;
+
+/*
+ * Map an external dma-buf fd using the V2 ioctl with classification.
+ * Issues NVM_MAP_DMABUF_MEMORY_V2 (cmd 9) with flags and receives
+ * the kernel classification output in *result.
+ *
+ * Only available when UGDS_HAVE_DMABUF is defined.
+ */
+int nvm_dma_map_dmabuf_v2(nvm_dma_t** handle, const nvm_ctrl_t* ctrl,
+                           void* devptr, size_t size,
+                           int dmabuf_fd, uint64_t dmabuf_offset,
+                           uint16_t flags,
+                           struct nvm_ioctl_dmabuf_v2* result);
+#endif /* UGDS_HAVE_DMABUF */
+
 /* (nvm_dma_get_dmabuf_info is internal-only -- declared in internal/dma.h) */
 
 //#endif /* __CUDA__ */

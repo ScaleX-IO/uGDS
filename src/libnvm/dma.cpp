@@ -40,10 +40,12 @@ struct map
     uint64_t            dmabuf_offset;   /* 0 if not dmabuf */
     size_t              dmabuf_length;   /* 0 if not dmabuf */
 
-    /* Backend origin tag: true if mapping went through the HIP/dmabuf
-     * path (regardless of whether fd was retained). Used by dual-backend
-     * dispatch to select the correct async launch function. */
-    bool                hip_origin;
+    /* Backend origin tag: typed enum identifying whether the mapping
+     * went through the HIP, CUDA, or external fd path (regardless of
+     * whether the fd was retained). Used by dual-backend dispatch to
+     * select the correct async launch function and by uGDSBufRegister
+     * to choose the registration backend. */
+    enum nvm_dmabuf_origin dmabuf_origin;
 };
 
 
@@ -114,7 +116,7 @@ static int create_map(struct map** md, const nvm_ctrl_t* ctrl, struct va_range* 
     m->dmabuf_fd = -1;
     m->dmabuf_offset = 0;
     m->dmabuf_length = 0;
-    m->hip_origin = false;
+    m->dmabuf_origin = NVM_DMABUF_ORIGIN_NONE;
 
     *md = m;
     return 0;
@@ -521,17 +523,17 @@ int nvm_dma_get_dmabuf_info(const nvm_dma_t* handle,
     return 0;
 }
 
-bool nvm_dma_is_hip_origin(const nvm_dma_t* handle)
+enum nvm_dmabuf_origin nvm_dma_origin(const nvm_dma_t* handle)
 {
-    if (handle == NULL) return false;
+    if (handle == NULL) return NVM_DMABUF_ORIGIN_NONE;
     const struct container* c = _nvm_container_of(handle, struct container, handle);
-    return c->map->hip_origin;
+    return c->map->dmabuf_origin;
 }
 
-void _nvm_dma_set_hip_origin(nvm_dma_t* handle)
+void _nvm_dma_set_origin(nvm_dma_t* handle, enum nvm_dmabuf_origin origin)
 {
     if (handle == NULL) return;
     struct container* c = _nvm_container_of(handle, struct container, handle);
-    c->map->hip_origin = true;
+    c->map->dmabuf_origin = origin;
 }
 

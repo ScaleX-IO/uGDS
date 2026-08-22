@@ -11,6 +11,22 @@
 struct va_range;
 
 
+/*
+ * dma-buf origin tagging.
+ *
+ * Replaces the former bool hip_origin with a typed enum so that
+ * external (application-exported) dma-buf mappings can be
+ * distinguished from HIP and CUDA exports.  The origin is used by
+ * dual-backend dispatch and by uGDSBufRegister to pick the correct
+ * launch backend.
+ */
+enum nvm_dmabuf_origin {
+    NVM_DMABUF_ORIGIN_NONE     = 0,
+    NVM_DMABUF_ORIGIN_HIP      = 1,
+    NVM_DMABUF_ORIGIN_CUDA     = 2,
+    NVM_DMABUF_ORIGIN_EXTERNAL = 3,
+};
+
 
 /*
  * Callback type for freeing an address range descriptor.
@@ -62,11 +78,17 @@ int _nvm_dma_set_dmabuf_info(nvm_dma_t* handle,
                               int fd, uint64_t offset, size_t length);
 
 /*
- * Tag a DMA handle as originating from the HIP/dmabuf path.
- * Called after _nvm_dma_init for HIP mappings, regardless of
- * whether the dmabuf fd was retained or closed.
+ * Set the dma-buf origin on a DMA handle's internal map.
+ * Called after _nvm_dma_init for HIP, CUDA, or external mappings.
  */
-void _nvm_dma_set_hip_origin(nvm_dma_t* handle);
+void _nvm_dma_set_origin(nvm_dma_t* handle, enum nvm_dmabuf_origin origin);
+
+/*
+ * Retrieve the dma-buf origin of a DMA handle.
+ * Used by dual-backend dispatch to select the correct async launch
+ * and by uGDSBufRegister to choose the registration backend.
+ */
+enum nvm_dmabuf_origin nvm_dma_origin(const nvm_dma_t* handle);
 
 /*
  * Retrieve dmabuf metadata from a DMA handle (internal only).
@@ -76,11 +98,20 @@ void _nvm_dma_set_hip_origin(nvm_dma_t* handle);
 int nvm_dma_get_dmabuf_info(const nvm_dma_t* handle,
                              int* out_fd, uint64_t* out_offset, size_t* out_length);
 
-/*
- * Query whether a DMA handle was created through the HIP/dmabuf path.
- * Returns true even if the fd was closed after kernel import.
- * Used by dual-backend dispatch to select the correct async launch.
- */
-bool nvm_dma_is_hip_origin(const nvm_dma_t* handle);
+/* --- Backward-compatibility inline shims -------------------------------
+ *
+ * Existing HIP code calls _nvm_dma_set_hip_origin / nvm_dma_is_hip_origin.
+ * These inline shims forward to the new origin-based API so that
+ * existing callers compile without modification. */
+
+static inline void _nvm_dma_set_hip_origin(nvm_dma_t* handle)
+{
+    _nvm_dma_set_origin(handle, NVM_DMABUF_ORIGIN_HIP);
+}
+
+static inline bool nvm_dma_is_hip_origin(const nvm_dma_t* handle)
+{
+    return nvm_dma_origin(handle) == NVM_DMABUF_ORIGIN_HIP;
+}
 
 #endif /* __NVM_INTERNAL_DMA_H__ */

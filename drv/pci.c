@@ -88,6 +88,18 @@ MODULE_PARM_DESC(max_num_ctrls, "Number of controller devices");
 /* Only the minor number is tracked; IDA is the ID-only allocator. */
 static DEFINE_IDA(ctrl_ida);
 
+/* --- Pin accounting (V2 dma-buf) ----------------------------------- */
+static atomic64_t dmabuf_pinned_global = ATOMIC64_INIT(0);
+static int dmabuf_pin_limit_per_file_mb = 16384; /* 16 GiB default */
+module_param(dmabuf_pin_limit_per_file_mb, int, 0444);
+MODULE_PARM_DESC(dmabuf_pin_limit_per_file_mb,
+    "Per-file dma-buf pin limit in MiB (0 = unlimited, read-only after load)");
+
+static int dmabuf_pin_limit_global_mb = 65536; /* 64 GiB default */
+module_param(dmabuf_pin_limit_global_mb, int, 0444);
+MODULE_PARM_DESC(dmabuf_pin_limit_global_mb,
+    "Global dma-buf pin limit in MiB (0 = unlimited, read-only after load)");
+
 
 enum handle_type
 {
@@ -110,6 +122,7 @@ struct ugds_file_ctx
     struct mutex        lock;           /* Protects handles and dead */
     bool                dead;           /* Controller removed */
     struct ugds_irq_owner irq_owner;
+    u64                 dmabuf_pinned_bytes; /* V2 pin accounting */
 };
 
 
@@ -130,6 +143,7 @@ struct map_handle
     int                 dmabuf_fd;      /* -1 unless HANDLE_DMABUF */
     u64                 dmabuf_offset;
     unsigned int        count;          /* Registrations from this file */
+    u64                 pinned_bytes;   /* V2 pin charge for this handle */
 };
 
 
@@ -225,6 +239,7 @@ static int dev_open(struct inode* inode, struct file* file)
     INIT_LIST_HEAD(&ctx->handles);
     mutex_init(&ctx->lock);
     ctx->dead = false;
+    ctx->dmabuf_pinned_bytes = 0;
     ugds_irq_owner_init(&ctx->irq_owner);
     file->private_data = ctx;
 
@@ -266,8 +281,16 @@ static int dev_release(struct inode* inode, struct file* file)
     {
         list_del(&handle->node);
         unmap_and_release(handle->map);
+
+        /* Release pin accounting charge for V2 mappings */
+        if (handle->pinned_bytes > 0)
+        {
+            atomic64_sub(handle->pinned_bytes, &dmabuf_pinned_global);
+        }
+
         kfree(handle);
     }
+    ctx->dmabuf_pinned_bytes = 0;
     mutex_unlock(&ctx->lock);
 
     ctrl_put(ctx->ctrl);
@@ -485,6 +508,7 @@ static long do_map(struct ugds_file_ctx* ctx, enum handle_type type,
     handle->dmabuf_fd = dmabuf_fd;
     handle->dmabuf_offset = dmabuf_offset;
     handle->count = 1;
+    handle->pinned_bytes = 0;  /* V2 sets this; V1/host/CUDA stay zero */
     list_add(&handle->node, &ctx->handles);
 
 out:
@@ -521,6 +545,14 @@ static long do_unmap(struct ugds_file_ctx* ctx, u64 vaddr)
     {
         list_del(&handle->node);
         unmap_and_release(handle->map);
+
+        /* Release pin accounting charge */
+        if (handle->pinned_bytes > 0)
+        {
+            ctx->dmabuf_pinned_bytes -= handle->pinned_bytes;
+            atomic64_sub(handle->pinned_bytes, &dmabuf_pinned_global);
+        }
+
         kfree(handle);
     }
 
@@ -655,6 +687,296 @@ static long map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
             }
             return 0;
         }
+
+#if defined(UGDS_HAVE_DMABUF)
+        case NVM_GET_CAPS:
+        {
+            struct nvm_ioctl_caps caps;
+
+            if (copy_from_user(&caps, (void __user*) arg, sizeof(caps)))
+            {
+                return -EFAULT;
+            }
+
+            /* Validate version */
+            if (caps.version != NVM_CAPS_VERSION_1)
+            {
+                return -EPROTONOSUPPORT;
+            }
+
+            /* Build capability flags */
+            caps.kernel_uapi_version = NVM_DMABUF_MAP_VERSION_1;
+            caps.flags = 0;
+            caps.flags |= NVM_CAP_DMABUF_V1;
+            caps.flags |= NVM_CAP_DMABUF_V2;
+            caps.flags |= NVM_CAP_DMABUF_REQUIRE_P2P;
+            caps.flags |= NVM_CAP_DMABUF_MAPPING_CLASS;
+            caps.flags |= NVM_CAP_DMABUF_PIN_ACCOUNTING;
+
+            caps.max_dmabuf_map_bytes = (u64)1024 * 1024 * PAGE_SIZE;
+            caps.per_file_pin_limit_bytes = dmabuf_pin_limit_per_file_mb * 1024ULL * 1024;
+            caps.global_pin_limit_bytes = dmabuf_pin_limit_global_mb * 1024ULL * 1024;
+            caps.current_file_pinned_bytes = ctx->dmabuf_pinned_bytes;
+            caps.current_global_pinned_bytes = atomic64_read(&dmabuf_pinned_global);
+
+            if (copy_to_user((void __user*) arg, &caps, sizeof(caps)))
+            {
+                return -EFAULT;
+            }
+            return 0;
+        }
+
+        case NVM_MAP_DMABUF_MEMORY_V2:
+        {
+            struct nvm_ioctl_dmabuf_v2 dreq;
+            struct ugds_dmabuf_map_info info;
+            unsigned long n_pages;
+            struct map* map;
+            struct map_handle* handle;
+            u64 pin_charge;
+
+            if (copy_from_user(&dreq, (void __user*) arg, sizeof(dreq)))
+            {
+                return -EFAULT;
+            }
+
+            /* Validate V2 fields */
+            if (dreq.version != NVM_DMABUF_MAP_VERSION_1)
+            {
+                return -EPROTONOSUPPORT;
+            }
+            if (dreq.struct_size < sizeof(struct nvm_ioctl_dmabuf_v2))
+            {
+                return -EINVAL;
+            }
+            if (dreq.size == 0 || dreq.size % PAGE_SIZE != 0)
+            {
+                return -EINVAL;
+            }
+            if (dreq.gpu_ptr == 0 || dreq.gpu_ptr % PAGE_SIZE != 0)
+            {
+                return -EINVAL;
+            }
+            if (dreq.ioaddrs == 0 || dreq.ioaddrs_capacity == 0)
+            {
+                return -EINVAL;
+            }
+            if (dreq.dmabuf_offset != 0 && dreq.dmabuf_offset % PAGE_SIZE != 0)
+            {
+                return -EINVAL;
+            }
+            if (dreq.dmabuf_fd < 0)
+            {
+                return -EINVAL;
+            }
+            /* Reject unknown flag bits */
+            if (dreq.flags & ~UGDS_DMABUF_REQUIRE_P2P)
+            {
+                return -EINVAL;
+            }
+            /* Reject nonzero reserved fields */
+            if (dreq.reserved0 != 0)
+            {
+                return -EINVAL;
+            }
+            {
+                int ri;
+                for (ri = 0; ri < 4; ri++) {
+                    if (dreq.reserved[ri] != 0)
+                        return -EINVAL;
+                }
+            }
+
+            n_pages = dreq.size / PAGE_SIZE;
+            if (n_pages > 1024 * 1024)
+            {
+                return -EINVAL;
+            }
+
+            /* Check ctx->dead under lock before proceeding. The map
+             * operation itself sleeps (dma_buf_pin, fence wait) so
+             * the lock is released during mapping; a hot-remove that
+             * sets ctx->dead concurrently will still be caught by
+             * the ledger commit section's dead re-check below. */
+            if (mutex_lock_killable(&ctx->lock))
+                return -EINTR;
+            if (ctx->dead) {
+                mutex_unlock(&ctx->lock);
+                return -ENODEV;
+            }
+            mutex_unlock(&ctx->lock);
+
+            /* Pin accounting: charge before mapping.
+             * Validate limits are positive before multiplication to
+             * avoid overflow from negative module parameter values. */
+            pin_charge = dreq.size;
+            {
+                u64 per_file_limit = 0;
+                u64 global_limit = 0;
+                if (dmabuf_pin_limit_per_file_mb > 0) {
+                    per_file_limit = (u64)dmabuf_pin_limit_per_file_mb * 1024ULL * 1024ULL;
+                    if (ctx->dmabuf_pinned_bytes + pin_charge > per_file_limit)
+                        return -EDQUOT;
+                }
+                if (dmabuf_pin_limit_global_mb > 0) {
+                    u64 old, new_val;
+                    global_limit = (u64)dmabuf_pin_limit_global_mb * 1024ULL * 1024ULL;
+                    do {
+                        old = atomic64_read(&dmabuf_pinned_global);
+                        new_val = old + pin_charge;
+                        if (new_val > global_limit)
+                            return -EDQUOT;
+                    } while (atomic64_cmpxchg(&dmabuf_pinned_global,
+                                              old, new_val) != old);
+                }
+            }
+            ctx->dmabuf_pinned_bytes += pin_charge;
+
+            /* Map with classification */
+            map = map_dmabuf_v2(ctx->ctrl, dreq.gpu_ptr,
+                                 dreq.dmabuf_fd, dreq.dmabuf_offset,
+                                 n_pages, dreq.ioaddrs_capacity,
+                                 dreq.flags, &info);
+
+            if (IS_ERR_OR_NULL(map))
+            {
+                long ret = (map == NULL) ? -EIO : PTR_ERR(map);
+
+                /* Rollback pin charge */
+                ctx->dmabuf_pinned_bytes -= pin_charge;
+                atomic64_sub(pin_charge, &dmabuf_pinned_global);
+
+                /* Best-effort: copy classification info to user */
+                dreq.mapping_class = info.mapping_class;
+                dreq.failure_reason = info.failure_reason;
+                dreq.peer_domain = info.peer_domain;
+                dreq.peer_bus = info.peer_bus;
+                dreq.peer_devfn = info.peer_devfn;
+                dreq.peer_bar = info.peer_bar;
+                dreq.peer_bar_start = info.peer_bar_start;
+                dreq.peer_bar_length = info.peer_bar_length;
+                /* Ignore copy_to_user failure on error path */
+                copy_to_user((void __user*) arg, &dreq, sizeof(dreq));
+                return ret;
+            }
+
+            if (map_is_dead(HANDLE_DMABUF, map))
+            {
+                unmap_and_release(map);
+                ctx->dmabuf_pinned_bytes -= pin_charge;
+                atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                return -EIO;
+            }
+
+            if (map->n_addrs > dreq.ioaddrs_capacity)
+            {
+                unmap_and_release(map);
+                ctx->dmabuf_pinned_bytes -= pin_charge;
+                atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                return -EOVERFLOW;
+            }
+
+            handle = kmalloc(sizeof(*handle), GFP_KERNEL);
+            if (handle == NULL)
+            {
+                unmap_and_release(map);
+                ctx->dmabuf_pinned_bytes -= pin_charge;
+                atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                return -ENOMEM;
+            }
+
+            if (map_is_dead(HANDLE_DMABUF, map))
+            {
+                kfree(handle);
+                unmap_and_release(map);
+                ctx->dmabuf_pinned_bytes -= pin_charge;
+                atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                return -EIO;
+            }
+
+            /* Commit to ledger */
+            if (mutex_lock_killable(&ctx->lock))
+            {
+                kfree(handle);
+                unmap_and_release(map);
+                ctx->dmabuf_pinned_bytes -= pin_charge;
+                atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                return -EINTR;
+            }
+            {
+                u64 page_sz = PAGE_SIZE;
+                u64 map_size;
+                if (check_mul_overflow((u64)n_pages, page_sz, &map_size))
+                {
+                    mutex_unlock(&ctx->lock);
+                    kfree(handle);
+                    unmap_and_release(map);
+                    ctx->dmabuf_pinned_bytes -= pin_charge;
+                    atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                    return -EINVAL;
+                }
+                if (handle_find_overlap(ctx, dreq.gpu_ptr, map_size) != NULL)
+                {
+                    mutex_unlock(&ctx->lock);
+                    kfree(handle);
+                    unmap_and_release(map);
+                    ctx->dmabuf_pinned_bytes -= pin_charge;
+                    atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                    return -EEXIST;
+                }
+            }
+
+            handle->map = map;
+            handle->type = HANDLE_DMABUF;
+            handle->vaddr = dreq.gpu_ptr;
+            handle->size = (size_t)n_pages * PAGE_SIZE;
+            handle->n_pages = n_pages;
+            handle->dmabuf_fd = dreq.dmabuf_fd;
+            handle->dmabuf_offset = dreq.dmabuf_offset;
+            handle->count = 1;
+            handle->pinned_bytes = pin_charge;
+
+            /* Copy addresses to user BEFORE committing to the ledger.
+             * If this fails we can still fully unwind. */
+            if (copy_to_user((void __user*)(uintptr_t) dreq.ioaddrs,
+                              map->addrs, map->n_addrs * sizeof(uint64_t)))
+            {
+                mutex_unlock(&ctx->lock);
+                kfree(handle);
+                unmap_and_release(map);
+                ctx->dmabuf_pinned_bytes -= pin_charge;
+                atomic64_sub(pin_charge, &dmabuf_pinned_global);
+                return -EFAULT;
+            }
+
+            list_add(&handle->node, &ctx->handles);
+            mutex_unlock(&ctx->lock);
+
+            /* Copy classification result to user after the mapping is
+             * committed. At this point the mapping is live; if the copy
+             * fails the mapping is valid but the user does not receive
+             * classification metadata. Log a warning since the caller
+             * has a valid mapping but incomplete result data. */
+            dreq.mapping_class = info.mapping_class;
+            dreq.failure_reason = info.failure_reason;
+            dreq.peer_domain = info.peer_domain;
+            dreq.peer_bus = info.peer_bus;
+            dreq.peer_devfn = info.peer_devfn;
+            dreq.peer_bar = info.peer_bar;
+            dreq.peer_bar_start = info.peer_bar_start;
+            dreq.peer_bar_length = info.peer_bar_length;
+            if (copy_to_user((void __user*) arg, &dreq, sizeof(dreq)))
+            {
+                printk(KERN_WARNING "uGDS: V2 result copy failed for "
+                       "mapping %llx (mapping is valid)\n", dreq.gpu_ptr);
+            }
+            return 0;
+        }
+#else
+        case NVM_GET_CAPS:
+        case NVM_MAP_DMABUF_MEMORY_V2:
+            return -EOPNOTSUPP;
+#endif
 
         default:
             printk(KERN_NOTICE "Unknown ioctl command from process %d: %u\n",
@@ -871,8 +1193,16 @@ static void remove_pci_dev(struct pci_dev* dev)
         {
             list_del(&handle->node);
             unmap_and_release(handle->map);
+
+            /* Refund pin accounting for V2 mappings */
+            if (handle->pinned_bytes > 0)
+            {
+                atomic64_sub(handle->pinned_bytes, &dmabuf_pinned_global);
+            }
+
             kfree(handle);
         }
+        ctx->dmabuf_pinned_bytes = 0;
         ctx->dead = true;
         mutex_unlock(&ctx->lock);
     }

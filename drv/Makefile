@@ -16,20 +16,8 @@ ifneq ($(KERNELRELEASE),)
 	obj-m := ugds_drv.o
 	ugds_drv-objs := pci.o list.o ctrl.o map.o irq.o
 
-	# KUnit self-test module (opt-in, HIP-only)
- ifeq ($(BUILD_KUNIT),1)
-  ifneq ($(BUILD_HIP),1)
-  $(error BUILD_KUNIT requires BUILD_HIP=1 -- SG flatten tests are HIP-only)
-  endif
-	obj-m += sg_flatten_test.o
-	sg_flatten_test-objs := test/sg_flatten_test.o
-	ccflags-y += -DUGDS_KUNIT
- endif
-
-	# AMD HIP backend (optional)
- ifeq ($(BUILD_HIP),1)
-	ccflags-y += -D_HIP
- endif
+	# Step 1: Resolve CUDA enablement and compute the aggregate dma-buf
+	# flag BEFORE any gate that depends on it.
 
 	# NVIDIA CUDA backend (optional)
 	# BUILD_CUDA: 1 = force enable, 0 = force disable, unset = auto (if NVIDIA_DIR found)
@@ -45,17 +33,10 @@ ifneq ($(KERNELRELEASE),)
   endif
  endif
 
-	# Error if neither backend is selected
- ifndef ENABLE_CUDA
- ifneq ($(BUILD_HIP),1)
-	$(error No GPU backend selected. Set BUILD_HIP=1 for AMD HIP, or install NVIDIA driver source for CUDA)
- endif
- endif
-
-	# dmabuf backend available when HIP is enabled, or when CUDA
-	# explicitly requests it via HAVE_CUDA_DMABUF=1.
+	# Compute aggregate dma-buf support. Available when HIP, standalone
+	# BUILD_DMABUF, or CUDA with HAVE_CUDA_DMABUF is enabled.
 UGDS_HAVE_DMABUF := 0
-ifeq ($(BUILD_HIP),1)
+ifneq ($(filter 1,$(BUILD_HIP) $(BUILD_DMABUF)),)
   UGDS_HAVE_DMABUF := 1
 endif
 ifdef HAVE_CUDA_DMABUF
@@ -63,6 +44,33 @@ ifdef HAVE_CUDA_DMABUF
     UGDS_HAVE_DMABUF := 1
   endif
 endif
+
+	# Step 2: Backend gate -- at least one of CUDA, HIP, or standalone
+	# dmabuf must be selected.
+ ifndef ENABLE_CUDA
+  ifneq ($(BUILD_HIP),1)
+   ifneq ($(BUILD_DMABUF),1)
+	$(error No backend selected. Set BUILD_HIP=1, BUILD_DMABUF=1, or install NVIDIA driver source for CUDA)
+   endif
+  endif
+ endif
+
+	# Step 3: KUnit gate -- requires dma-buf support.
+ ifeq ($(BUILD_KUNIT),1)
+  ifneq ($(UGDS_HAVE_DMABUF),1)
+  $(error BUILD_KUNIT requires dma-buf support -- enable BUILD_HIP=1, BUILD_DMABUF=1, or CUDA dmabuf)
+  endif
+	obj-m += sg_flatten_test.o
+	sg_flatten_test-objs := test/sg_flatten_test.o
+	ccflags-y += -DUGDS_KUNIT
+ endif
+
+	# Step 4: Compile definitions and objects.
+
+	# AMD HIP backend (optional)
+ ifeq ($(BUILD_HIP),1)
+	ccflags-y += -D_HIP
+ endif
 
 ifeq ($(UGDS_HAVE_DMABUF),1)
   ccflags-y += -DUGDS_HAVE_DMABUF

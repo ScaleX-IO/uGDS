@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -67,10 +68,47 @@ static int ioctl_map(const struct device* dev, const struct va_range* va, uint64
 #if defined(UGDS_HAVE_DMABUF)
         case MAP_TYPE_DMABUF:
         case MAP_TYPE_DMABUF_CUDA:
+        case MAP_TYPE_DMABUF_EXT:
         {
-            /* DMA-buf path: pass fd + offset + gpu_ptr to kernel.
-             * Both HIP (MAP_TYPE_DMABUF) and CUDA (MAP_TYPE_DMABUF_CUDA)
-             * go through the same NVM_MAP_DMABUF_MEMORY ioctl. */
+            /* External dmabuf (MAP_TYPE_DMABUF_EXT) always uses the V2
+             * ioctl for pin accounting and mapping classification.
+             * HIP (MAP_TYPE_DMABUF) and CUDA (MAP_TYPE_DMABUF_CUDA)
+             * continue to use the V1 ioctl. */
+            if (m->type == MAP_TYPE_DMABUF_EXT)
+            {
+                struct nvm_ioctl_dmabuf_v2 v2req;
+                memset(&v2req, 0, sizeof(v2req));
+                v2req.struct_size      = sizeof(v2req);
+                v2req.version          = NVM_DMABUF_MAP_VERSION_1;
+                v2req.flags            = m->v2_flags;
+                v2req.gpu_ptr          = (uint64_t) m->buffer;
+                v2req.dmabuf_fd        = m->dmabuf_fd;
+                v2req.dmabuf_offset    = m->dmabuf_offset;
+                v2req.size             = (uint64_t)(va->page_size * va->n_pages);
+                v2req.ioaddrs_capacity = (uint64_t)va->n_pages;
+                v2req.ioaddrs          = (uint64_t)(uintptr_t)ioaddrs;
+
+                int v2err = ioctl(dev->fd, NVM_MAP_DMABUF_MEMORY_V2, &v2req);
+                if (v2err < 0)
+                {
+                    dprintf("DMA-buf V2 kernel request failed: %s\n",
+                            strerror(errno));
+                    /* Copy partial classification output so the caller
+                     * can translate the errno precisely. */
+                    if (m->v2_result != NULL)
+                        memcpy(m->v2_result, &v2req, sizeof(v2req));
+                    return errno;
+                }
+                /* Copy classification output to the caller's result */
+                if (m->v2_result != NULL)
+                    memcpy(m->v2_result, &v2req, sizeof(v2req));
+                return 0;
+            }
+
+            /* V1 DMA-buf path: pass fd + offset + gpu_ptr to kernel.
+             * HIP (MAP_TYPE_DMABUF), CUDA (MAP_TYPE_DMABUF_CUDA),
+             * and external without V2 flags (MAP_TYPE_DMABUF_EXT) all
+             * go through NVM_MAP_DMABUF_MEMORY (cmd 4). */
             struct nvm_ioctl_dmabuf request = {
                 .gpu_ptr          = (uint64_t) m->buffer,
                 .dmabuf_fd        = m->dmabuf_fd,
@@ -129,6 +167,61 @@ static void ioctl_unmap(const struct device* dev, const struct va_range* va)
         dprintf("Page unmapping kernel request failed: %s\n", strerror(errno));
     }
 }
+
+
+#if defined(UGDS_HAVE_DMABUF)
+/*
+ * Issue the V2 dma-buf map ioctl directly on the controller's device fd.
+ *
+ * This bypasses the map_range callback because the V2 ioctl uses a
+ * different struct size and produces classification output that the V1
+ * path cannot carry.  The caller (linux_dma.cpp) builds the full V2
+ * request including flags and an output result pointer; this helper
+ * only performs the ioctl on the already-opened fd.
+ *
+ * Returns 0 on success or a positive errno.
+ */
+int _nvm_dmabuf_ioctl_v2(const nvm_ctrl_t* ctrl,
+                          struct nvm_ioctl_dmabuf_v2* req)
+{
+    if (ctrl == NULL || req == NULL)
+        return EINVAL;
+
+    struct controller* c = _nvm_container_of(ctrl, struct controller, handle);
+    struct device* dev = c->device;
+
+    int err = ioctl(dev->fd, NVM_MAP_DMABUF_MEMORY_V2, req);
+    if (err < 0)
+    {
+        dprintf("DMA-buf V2 kernel request failed: %s\n", strerror(errno));
+        return errno;
+    }
+    return 0;
+}
+
+
+/*
+ * Issue the NVM_GET_CAPS ioctl directly on the controller's device fd.
+ * Returns 0 on success or a positive errno.
+ */
+int _nvm_dmabuf_get_caps(const nvm_ctrl_t* ctrl,
+                          struct nvm_ioctl_caps* caps)
+{
+    if (ctrl == NULL || caps == NULL)
+        return EINVAL;
+
+    struct controller* c = _nvm_container_of(ctrl, struct controller, handle);
+    struct device* dev = c->device;
+
+    int err = ioctl(dev->fd, NVM_GET_CAPS, caps);
+    if (err < 0)
+    {
+        dprintf("GET_CAPS kernel request failed: %s\n", strerror(errno));
+        return errno;
+    }
+    return 0;
+}
+#endif /* UGDS_HAVE_DMABUF */
 
 
 
