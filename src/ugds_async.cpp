@@ -825,9 +825,10 @@ static uGDSError_t iov_launch_host_func(void* stream, AsyncRequest* req)
     }
     return UGDS_OK;
 #else
-    /* No GPU backend: async IO not available */
+    /* No GPU backend: async IO not available.
+     * The caller owns req through its unique_ptr and releases it on
+     * every failure return; do not delete it here. */
     (void)stream;
-    delete req;
     return make_error(UGDS_IO_NOT_SUPPORTED);
 #endif
 }
