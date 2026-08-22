@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <cstdint>
 #include <cstddef>
+#include <type_traits>
 
 #define UGDS_DEFAULT_NUM_QPS     16
 #define UGDS_DEFAULT_QUEUE_DEPTH 64
@@ -36,6 +37,198 @@
 /* SCT+SC (11-bit) from an NVMe completion: 0 = success. See NVMe Base Spec section 4.6.1. */
 #define UGDS_CPL_SCT_SC(cpl)     (((cpl)->dword[3] >> 17) & 0x7FF)
 
+/* Forward declarations: HandleOpGuard and SglRefOwner reference HandleState
+ * and handle_release, which are fully defined later in this header. */
+struct HandleState;
+static inline void handle_release(HandleState* hs);
+
+/* --- Per-IO resolved segment ------------------------------------------- */
+/* A segment resolved against the buffer registry under one g_driver.lock
+ * hold.  Identity fields (dma, base, registered_length, backend) are
+ * immutable snapshots valid as long as the owning SglRefOwner holds its
+ * reference; geometry fields (page_start, size) are filled at resolve time
+ * (sync/batch) or in the async callback (late binding). */
+struct SegView {
+    nvm_dma_t*     dma;
+    const void*    base;               /* registry key, for release/park */
+    size_t         registered_length;  /* snapshot of BufEntry::length */
+    uGDSBackend_t  backend;            /* snapshot, for async dispatch */
+    size_t         page_start;         /* offset / MPS (offset MPS-aligned) */
+    size_t         size;               /* bytes */
+};
+
+/* --- Reference ownership ----------------------------------------------- */
+/* Owns one in_flight reference per SGL occurrence.  Duplicate bases are
+ * intentionally repeated.  The representation has capacity for the public
+ * maximum and never allocates; this is ~8 KiB on LP64 and is stored in
+ * request/QP objects, not copied into a std::vector on timeout. */
+class SglRefOwner {
+    std::array<const void*, UGDS_IOV_MAX> bases_{};
+    uint16_t size_ = 0;                 /* UGDS_IOV_MAX == 1024 */
+public:
+    SglRefOwner() noexcept = default;
+    SglRefOwner(const SglRefOwner&) = delete;
+    SglRefOwner& operator=(const SglRefOwner&) = delete;
+    SglRefOwner(SglRefOwner&& other) noexcept;
+    SglRefOwner& operator=(SglRefOwner&& other) noexcept;
+    ~SglRefOwner() noexcept;            /* release() if still non-empty */
+
+    bool empty() const noexcept { return size_ == 0; }
+    uint16_t size() const noexcept { return size_; }
+    const void* base_at(uint16_t i) const noexcept { return bases_[i]; }
+
+    /* acquire(segs, nr): nr was already checked <= UGDS_IOV_MAX.  Under one
+     * g_driver.lock hold, validate registration, exact length, and affinity,
+     * then increment each counter and append its base.  All-or-nothing: a
+     * failure rolls back 0..k-1 inside the same hold.  Returns 0 on success
+     * or -EINVAL.  No reserve/growth/allocation exists.
+     *
+     * hs_ctrl is the submitting handle's controller (for affinity check).
+     * page_size is MPS for the offset-alignment and page-index math.
+     * seg_views_out (optional): if non-null, resolved SegView[] filled
+     * (identity + geometry; page_start uses segs[k].offset). */
+    int acquire(const uGDSIoSegment_t* segs, uint32_t nr,
+                const nvm_ctrl_t* hs_ctrl,
+                size_t page_size,
+                SegView* seg_views_out = nullptr);
+
+    /* acquire_identity_only(segs, nr): like acquire() but performs only the
+     * registration + controller affinity checks and the in_flight
+     * reference acquisition.  The registered-range bound on
+     * offset/size is deliberately skipped because the async path
+     * defers offset/size validation to the stream callback
+     * (late binding).
+     *
+     * seg_views_out (optional): if non-null, identity-only SegView[] is
+     * filled -- dma, base, registered_length, and backend are snapshotted;
+     * page_start and size are left zero and completed by the caller once
+     * the late-bound offset/size are observed.  Returns 0 on success or
+     * -EINVAL. */
+    int acquire_identity_only(const uGDSIoSegment_t* segs, uint32_t nr,
+                              const nvm_ctrl_t* hs_ctrl,
+                              SegView* seg_views_out = nullptr);
+
+    /* release(): decrement each stored occurrence under one g_driver.lock
+     * hold and set size_ = 0.  Idempotent on empty. */
+    void release() noexcept;
+
+    /* disarm(): set size_ = 0 so the destructor does not release.
+     * The acquired in_flight references remain in the registry; the
+     * caller becomes responsible for releasing them by other means
+     * (the batch owns the release via kind-aware
+     * drain_release_scratch). */
+    void disarm() noexcept { size_ = 0; }
+};
+
+static_assert(std::is_nothrow_move_constructible<SglRefOwner>::value);
+static_assert(std::is_nothrow_move_assignable<SglRefOwner>::value);
+static_assert(UGDS_IOV_MAX <= UINT16_MAX);
+
+/* --- Sync handle-operation ownership ----------------------------------- */
+/* handle_lookup() increments the bare HandleState::handle_in_flight counter
+ * independently of the returned shared_ptr.  This non-allocating guard is
+ * constructed immediately after a successful lookup and must be declared
+ * after the local hs_sp, so hs_sp outlives the guard.  Every early return
+ * and exception therefore calls handle_release() exactly once.  The normal
+ * path calls release() only after do_iov_engine returns; release() performs
+ * handle_release() and then disarms the destructor. */
+class HandleOpGuard {
+    HandleState* hs_ = nullptr;
+    bool         armed_ = false;
+public:
+    HandleOpGuard() noexcept = default;
+    explicit HandleOpGuard(HandleState* hs) noexcept
+        : hs_(hs), armed_(true) {}
+    HandleOpGuard(const HandleOpGuard&) = delete;
+    HandleOpGuard& operator=(const HandleOpGuard&) = delete;
+    HandleOpGuard(HandleOpGuard&&) = delete;
+    HandleOpGuard& operator=(HandleOpGuard&&) = delete;
+    ~HandleOpGuard() noexcept { if (armed_) handle_release(hs_); }
+
+    void arm(HandleState* hs) noexcept { hs_ = hs; armed_ = true; }
+    void release() noexcept {
+        if (armed_) { handle_release(hs_); armed_ = false; }
+    }
+};
+
+static_assert(std::is_nothrow_destructible<HandleOpGuard>::value);
+
+/* --- Engine result ------------------------------------------------------ */
+/* An integer alone cannot drive cleanup: the caller must know whether the
+ * engine consumed (parked) the resource owners. */
+struct IovEngineResult {
+    ssize_t ret;        /* bytes transferred or -errno */
+    bool    timed_out;  /* true <=> handle wedged AND the engine moved the
+                           owner (registered) or the transient dma
+                           (on-the-fly) into QP timeout parking; the
+                           caller's owner is empty / dma pointer stolen */
+};
+
+/* --- Command window ---------------------------------------------------- */
+struct CmdWindow {
+    uint32_t     first_seg;          /* index into SegView[] */
+    uint32_t     n_segs;             /* slices spanned by this command */
+    size_t       first_seg_page_off; /* pages already consumed from first_seg
+                                        by earlier windows (mid-segment split) */
+    size_t       bytes;              /* command length; block-multiple by construction */
+    size_t       n_pages;            /* ceil-sum of slice pages; <= MPS/8 + 1 */
+};
+
+/* --- SglWindowCursor --------------------------------------------------- */
+/* Stateful, allocation-free forward generator.  next() emits at most one
+ * window and advances (seg_idx, bytes_in_seg, open-window state).  It never
+ * owns or materializes an array of CmdWindow objects. */
+struct SglWindowCursor {
+    const SegView* segs;
+    uint32_t       nr_segs;
+    uint32_t       seg_idx;
+    size_t         bytes_in_seg;     /* consumed so far in segs[seg_idx] */
+    size_t         window_cap;
+    size_t         page_size;        /* MPS */
+    size_t         block_size;
+    size_t         split_unit;       /* lcm(MPS, block_size) */
+};
+
+/* Initialize a cursor.  Returns false if window_cap == 0 (reject). */
+bool sgl_cursor_init(SglWindowCursor& c, const SegView* segs, uint32_t nr_segs,
+                     size_t window_cap, size_t page_size, size_t block_size);
+
+/* Emit at most one window into out.  Returns true if a window was produced,
+ * false when the SGL is exhausted. */
+bool sgl_cursor_next(SglWindowCursor& c, CmdWindow& out) noexcept;
+
+/* O(nr_segs) analytic count.  Produces the same count as the cursor. */
+bool sgl_count_windows_analytic(const uGDSIoSegment_t* segs,
+                                uint32_t nr_segs,
+                                size_t window_cap, size_t page_size,
+                                size_t block_size,
+                                uint32_t* out) noexcept;
+
+/* --- SglPageCursor ----------------------------------------------------- */
+/* Forward iterator over the MPS page addresses of a window.  Replaces
+ * buf_dma->ioaddrs[current_page + i] in the PRP builders.  Tracks position
+ * across segment boundaries.
+ *
+ * Usage contract: the caller initializes the cursor for a CmdWindow, then
+ * calls sgl_page_cursor_next() exactly CmdWindow::n_pages times.  The
+ * cursor walks the segment slices in order, emitting MPS-granular bus
+ * addresses from each segment's dma->ioaddrs[]. */
+struct SglPageCursor {
+    const SegView* segs;        /* pointer to segs[0] (absolute base) */
+    uint32_t       abs_seg;     /* absolute segment index into segs[] */
+    uint32_t       end_seg;     /* one-past-last absolute segment index */
+    size_t         page_in_seg; /* absolute ioaddr index within current seg */
+    size_t         slice_pages_left; /* pages left in current segment slice */
+};
+
+void sgl_page_cursor_init(SglPageCursor& c, const SegView* segs,
+                          uint32_t first_seg, size_t first_seg_page_off,
+                          uint32_t n_segs, size_t n_pages) noexcept;
+
+/* Returns current ioaddr, advances across segment boundaries.  Total calls
+ * bounded by CmdWindow::n_pages. */
+uint64_t sgl_page_cursor_next(SglPageCursor& c) noexcept;
+
 struct IOQueuePair {
     nvm_queue_t    sq{};
     nvm_queue_t    cq{};
@@ -48,9 +241,16 @@ struct IOQueuePair {
     int            irq_efd = -1;   /* eventfd for interrupt mode; -1 = poll */
     uint16_t       irq_vec = 0;    /* MSI-X vector bound to this CQ */
     /* Timeout resources remain owned by the QP until controller recovery.
-     * At most one synchronous operation can hold this QP lock. */
+     * At most one synchronous operation can hold this QP lock.
+     * timeout_dma: on-the-fly (1-buf) mapping parked by the scalar engine.
+     * timeout_registered_base: a registered-buffer base whose in_flight
+     *   ref was parked by the legacy scalar path.  The ref
+     *   is released by cleanup_timeout_resources.
+     * timeout_refs: fixed-capacity registered-ref owner parked by the SGL
+     *               engine (also used by the refactored scalar path). */
     nvm_dma_t*     timeout_dma = nullptr;           /* on-the-fly mapping */
-    const void*    timeout_registered_buf = nullptr; /* registered ref */
+    const void*    timeout_registered_base = nullptr; /* legacy scalar ref */
+    SglRefOwner    timeout_refs;                    /* registered refs */
     std::mutex     lock;
 };
 
@@ -80,6 +280,20 @@ struct HandleState {
     std::unique_ptr<IOQueuePairHuge> batch_qp;
     uint16_t                    batch_queue_depth;
     std::atomic<bool>           batch_active{false};
+    /* Owning recovery link to the active batch.  Together with
+     * batch_active and batch_setting_up it forms one link-state machine
+     * whose every transition happens inside a g_driver.lock critical
+     * section.  Set by BatchIOSetUp publication; detached by exactly one
+     * of the successful-destroy link transaction or the force-deregister
+     * walk. */
+    std::shared_ptr<struct BatchState> active_batch;
+    /* True while a BatchIOSetUp that passed the setup gate (closing check
+     * + batch_active CAS, one g_driver.lock section) has not yet committed
+     * or rolled back.  Only the gate winner can set it; only that call
+     * clears it (at publication, or as the LAST rollback action).  Written
+     * only under g_driver.lock; read lock-free by force teardown, which
+     * drains it to false before freeing any host-side QP/controller. */
+    std::atomic<bool>           batch_setting_up{false};
     bool                        interrupt_mode = false;  /* UGDS_INTERRUPT_MODE */
     std::atomic<bool>           wedged{false};          /* batch timeout: handle poisoned, controller reset required */
     std::atomic<uint32_t>       handle_in_flight{0};  /* IO refcount for safe deregister */
@@ -104,6 +318,14 @@ struct DriverState {
         nvm_dma_t*           dma;
         uGDSBackend_t        backend;
         std::atomic<uint32_t> in_flight{0};
+        size_t               length;    /* exact bytes from uGDSBufRegister */
+        const nvm_ctrl_t*    map_ctrl;  /* controller at registration time */
+        BufEntry() noexcept
+            : dma(nullptr), backend(UGDS_BACKEND_DEFAULT),
+              in_flight(0), length(0), map_ctrl(nullptr) {}
+        BufEntry(nvm_dma_t* d, uGDSBackend_t b, size_t len,
+                 const nvm_ctrl_t* ctrl) noexcept
+            : dma(d), backend(b), in_flight(0), length(len), map_ctrl(ctrl) {}
     };
     std::unordered_map<const void*, BufEntry>     buf_registry;
 
@@ -202,6 +424,31 @@ struct BatchIOEntry {
     uint16_t            n_cmds        = 0;
     uint16_t            n_cmds_done   = 0;
     bool                event_returned = false;
+
+    /* SGL/lifecycle extensions */
+    uint8_t             kind          = 0;  /* BatchEntryKind: 0=PLAIN, 1=VECTORED */
+    uint32_t            seg_begin     = 0;  /* arena range start; valid iff VECTORED */
+    uint32_t            seg_count     = 0;  /* number of segments in this entry */
+    bool                refs_held     = false;  /* true while in-flight ref is held */
+    bool                release_queued = false; /* true iff index is in release_scratch */
+    uint16_t            n_cmds_submitted = 0;  /* successfully enqueued sub-commands */
+};
+
+/* Batch entry kind: plain (single buffer) or vectored (scatter-gather). */
+enum BatchEntryKind : uint8_t {
+    BATCH_ENTRY_PLAIN    = 0,
+    BATCH_ENTRY_VECTORED = 1,
+};
+
+/* Batch lifecycle states (under bs->lock).
+ * ACTIVE   -- normal operation; the public one-shot Destroy is available.
+ * WEDGED   -- Destroy could not drain; one-shot Destroy was consumed.
+ *             Force teardown drops self (no cycle retained).
+ * TORN_DOWN-- all resources released; any further API call is a no-op. */
+enum BatchLifecycle : uint8_t {
+    BATCH_LIFECYCLE_ACTIVE    = 0,
+    BATCH_LIFECYCLE_WEDGED    = 1,
+    BATCH_LIFECYCLE_TORN_DOWN = 2,
 };
 
 struct BatchState {
@@ -218,7 +465,51 @@ struct BatchState {
     HandleState* hs = nullptr;
     std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive for batch lifetime */
     std::mutex   lock;
+
+    /* Deferred-release scratch: entry indices whose registry refs must be
+     * dropped after qp.lock is released.  Fixed-size, resized to capacity
+     * at SetUp.  Written by index only under bs->lock; drained in one
+     * g_driver.lock hold after qp.lock drops.  release_queued on each
+     * BatchIOEntry is the authoritative membership bit. */
+    std::vector<uint32_t> release_scratch;
+    uint32_t              n_release_pending = 0;
+
+    /* SGL segment arena for vectored batch entries.
+     * Fixed-size, lazily resized to capacity * UGDS_BATCH_IOV_MAX at the
+     * first Submitv call; never resized again.  recycle resets
+     * arena_used to 0 but never touches size()/capacity.  Each vectored
+     * entry copies its segments into [seg_begin, seg_begin+seg_count). */
+    std::vector<SegView> seg_arena;
+    uint32_t             arena_used = 0;
+
+    BatchLifecycle       lifecycle = BATCH_LIFECYCLE_ACTIVE;
+
+    /* Public-handle ownership: the reference held on behalf of the user's
+     * uGDSBatchHandle_t.  Accessed only under bs->lock.  Moved out -- never
+     * reset in place -- at successful destroy, tombstone destroy, or
+     * WEDGED-force cleanup, via the pin rule.  The object is destroyed when
+     * the last reference (self, active_batch link, or transient pin) drops. */
+    std::shared_ptr<BatchState> self;
 };
+
+/* SubCmdV: one windowed sub-command for vectored batch submit.
+ * The work array is sized to the analytic total_cmds, then filled by
+ * SglWindowCursor.  The enqueue loop iterates [0, work_used) and
+ * enqueues one NVMe command per element.  window references segments in
+ * bs->seg_arena[entry.seg_begin .. entry.seg_begin+seg_count). */
+struct SubCmdV {
+    unsigned  io_idx;        /* index into bs->entries */
+    uint64_t  lba;           /* starting LBA for this window */
+    CmdWindow window;        /* window geometry (bytes, n_pages, etc.) */
+};
+
+/* Kind-aware release of the in-flight reference(s) held by a batch
+ * entry.  Defined in ugds_batch.cpp.
+ * - BATCH_ENTRY_PLAIN: one ref at entry.devPtr_base.
+ * - BATCH_ENTRY_VECTORED: one ref per base in
+ *   bs->seg_arena[entry.seg_begin .. seg_begin + seg_count).
+ * Must be called WITHOUT holding g_driver.lock. */
+void release_entry_refs(BatchState* bs, BatchIOEntry& entry);
 
 static inline uGDSError_t make_error(uGDSOpError err) {
     uGDSError_t e;
@@ -232,15 +523,92 @@ static inline uGDSError_t make_error(uGDSOpError err) {
 ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                        off_t file_offset, off_t bufPtr_offset, uint8_t opcode);
 
+/* --- SGL engine -------------------------------------------------------- */
+
+/* Publish PRP list stores before the doorbell/data pointer.  Centralizes the
+ * platform DMA-publish contract: on x86-64 the seq_cst fence is sufficient
+ * because PRP lists live in cache-coherent host memory and normal stores
+ * are ordered before the subsequent MMIO doorbell write.  Porting to a
+ * weaker platform changes this one helper. */
+static inline void sgl_publish_prp() noexcept {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+/* Wait for one completion on a sync QP.  Returns nullptr on timeout.
+ * Defined in ugds_io.cpp; shared with ugds_iov.cpp. */
+nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp);
+
+/* Streaming windowed IO engine shared by scalar and vectored sync paths.
+ *
+ * hs: submitting handle state (must already be lookup-acquired).
+ * segs: resolved segment views (identity + geometry complete).
+ * nr_segs: number of entries in segs (>= 1).
+ * file_offset: starting byte offset in the namespace (block-aligned).
+ * opcode: NVM_IO_READ or NVM_IO_WRITE.
+ * owner: holds in-flight buffer refs (may be empty if on_the_fly).
+ * transient: on-the-fly DMA mapping, or nullptr for registered buffers.
+ *
+ * Returns {bytes, false} on success, {-errno, false} on device/validation
+ * failure, or {-errno, true} on timeout with owner/transient moved into
+ * qp.timeout_refs / qp.timeout_dma. */
+IovEngineResult do_iov_engine(HandleState* hs, SegView* segs, uint32_t nr_segs,
+                              off_t file_offset, uint8_t opcode,
+                              SglRefOwner* owner, nvm_dma_t* transient);
+
 struct AsyncRequest {
-    uGDSHandle_t    fh;
-    void*           bufPtr_base;
-    size_t*         size_p;
-    off_t*          file_offset_p;
-    off_t*          bufPtr_offset_p;
-    ssize_t*        bytes_done_p;
-    uint8_t         opcode;
+    /* Scalar async fields (used by uGDSReadAsync/uGDSWriteAsync).
+     * Pointer parameters are caller-owned host-accessible storage
+     * read in the stream callback (late binding).  The caller MUST
+     * keep them valid until the callback runs. */
+    uGDSHandle_t    fh;             /* submitting handle (for do_io_internal) */
+    void*           bufPtr_base;    /* registered buffer base */
+    size_t*         size_p;         /* late-bound transfer size (bytes) */
+    off_t*          file_offset_p;  /* late-bound namespace offset */
+    off_t*          bufPtr_offset_p;/* late-bound offset inside bufPtr_base */
+    ssize_t*        bytes_done_p;   /* result sink (bytes or -errno) */
+    uint8_t         opcode;         /* NVM_IO_READ or NVM_IO_WRITE */
     std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive until callback */
+
+    /* Vectored async fields (valid when nr_segs > 0).
+     *
+     * user_segs points to the caller's array (held until the callback runs);
+     * the identity fields of resolved[i] (dma, base, registered_length,
+     * backend) were snapshotted under g_driver.lock at enqueue, and the
+     * per-segment in_flight references live in owner.  Geometry
+     * (page_start/size) is filled in the callback from user_segs[i] after
+     * late binding.  launch_backend was computed once at enqueue from the
+     * segment-backend and stream-backend snapshots and is never re-read.
+     *
+     * Because SglRefOwner is noexcept move-only and not copyable, AsyncRequest
+     * itself becomes move-only; the public async path only heap-allocates it
+     * via new and deletes it from the callback, so no copy is required.
+     *
+     * resolved[] is owned by the request.  resolved_owns_heap records
+     * whether it points at a heap allocation (nr_segs > 4); the
+     * destructor releases it so every callback path frees it via a
+     * single `delete req`. */
+    uGDSIoSegment_t* user_segs = nullptr;
+    unsigned         nr_segs = 0;
+    SegView*         resolved = nullptr;  /* resolved segments (inline/heap) */
+    bool             resolved_owns_heap = false; /* iff resolved is heap[] */
+    SglRefOwner      owner;               /* in-flight refs (single-owner handoff) */
+    uGDSBackend_t    launch_backend = UGDS_BACKEND_DEFAULT;
+
+    /* Inline SegView storage for the common nr <= 4 case (no heap at
+     * callback time).  resolved points here when nr_segs is in [1, 4];
+     * otherwise it points at the heap allocation performed at enqueue. */
+    SegView          inline_resolved[4];
+
+    /* Owning destructor.  When the callback (or any early-return path)
+     * does `delete req`, the heap resolved[] is freed exactly once.
+     * inline_resolved is not heap-allocated, so it is left alone. */
+    ~AsyncRequest() noexcept {
+        if (resolved_owns_heap) {
+            delete[] resolved;
+            resolved = nullptr;
+            resolved_owns_heap = false;
+        }
+    }
 };
 
 /* Internal stream type -- void* for backend neutrality */
