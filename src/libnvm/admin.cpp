@@ -64,6 +64,21 @@ static void admin_current_num_queues(nvm_cmd_t* cmd, bool set, uint16_t n_cqs, u
 }
 
 
+static int admin_set_feature(nvm_aq_ref ref, uint8_t feature, uint32_t value)
+{
+    nvm_cmd_t command;
+    nvm_cpl_t completion;
+
+    memset(&command, 0, sizeof(command));
+    memset(&completion, 0, sizeof(completion));
+    nvm_cmd_header(&command, 0, NVM_ADMIN_SET_FEATURES, 0);
+    command.dword[10] = feature;
+    command.dword[11] = value;
+
+    return nvm_raw_rpc(ref, &command, &completion);
+}
+
+
 
 static void admin_identify_ctrl(nvm_cmd_t* cmd, uint64_t ioaddr)
 {
@@ -477,6 +492,22 @@ int nvm_admin_set_num_queues(nvm_aq_ref ref, uint16_t n_cqs, uint16_t n_sqs)
 }
 
 
+int nvm_admin_set_irq_coalescing(nvm_aq_ref ref, uint8_t threshold,
+                                 uint8_t time_100us)
+{
+    return admin_set_feature(ref, 0x08,
+                             ((uint32_t) time_100us << 8) | threshold);
+}
+
+
+int nvm_admin_set_irq_vector_config(nvm_aq_ref ref, uint16_t vector,
+                                    bool disable_coalescing)
+{
+    return admin_set_feature(ref, 0x09,
+                             ((uint32_t) disable_coalescing << 16) | vector);
+}
+
+
 
 int nvm_admin_request_num_queues(nvm_aq_ref ref, uint16_t* n_cqs, uint16_t* n_sqs)
 {
@@ -505,4 +536,3 @@ int nvm_admin_request_num_queues(nvm_aq_ref ref, uint16_t* n_cqs, uint16_t* n_sq
 
     return NVM_ERR_PACK(NULL, 0);
 }
-

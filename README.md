@@ -184,7 +184,7 @@ uGDS originated from the motivation experiments in CoPilotIO. If you find uGDS u
 
 - [ssd-gpu-dma](https://github.com/enfiskutensykkel/ssd-gpu-dma) — User-space NVMe driver with GPU support
 - [BaM](https://github.com/ZaidQureshi/bam) — Big accelerator Memory, GPU-orchestrated NVMe access
-- [Phoenix](https://github.com/xPU-IO/phoenix) — GPU Direct Storage Optimization
+- [SPDK](https://spdk.io/) — Storage Performance Development Kit, user-space NVMe driver
 
 ## Contact
 

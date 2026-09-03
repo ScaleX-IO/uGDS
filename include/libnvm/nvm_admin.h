@@ -46,6 +46,16 @@ int nvm_admin_get_num_queues(nvm_aq_ref ref, uint16_t* n_cqs, uint16_t* n_sqs);
 int nvm_admin_request_num_queues(nvm_aq_ref ref, uint16_t* n_cqs, uint16_t* n_sqs);
 
 
+/* Configure controller interrupt coalescing (Feature 08h).  Both fields use
+ * the NVMe zero-based/100-us encodings directly. */
+int nvm_admin_set_irq_coalescing(nvm_aq_ref ref, uint8_t threshold,
+                                 uint8_t time_100us);
+
+/* Enable or disable coalescing for one MSI-X vector (Feature 09h). */
+int nvm_admin_set_irq_vector_config(nvm_aq_ref ref, uint16_t vector,
+                                    bool disable_coalescing);
+
+
 /*
  * Create IO completion queue (CQ)
  * Caller must set queue memory to zero manually.
