@@ -15,7 +15,10 @@ LMCache through uGDS.
 | File | Purpose |
 |---|---|
 | `quickstart.sh` | Main entry point: prepares the environment, builds uGDS, binds the SSD, downloads the model, and runs the benchmark |
-| `setup_env.sh` | Creates `.venv`, installs the current vLLM and LMCache sources, builds `libugds.so`, and builds `ugds_drv.ko` when `BUILD_UGDS_DRIVER=1` |
+| `setup_env.sh` | Creates the current user's `.venv`, syncs the locked dependencies, installs the current vLLM and LMCache sources, and builds uGDS |
+| `lock_requirements.sh` | Regenerates the dependency lock and records the current vLLM and LMCache revisions |
+| `requirements.in` | Human-maintained dependency inputs for Python 3.12 and CUDA 12.9 |
+| `requirements.txt` | Fully resolved dependency versions consumed by `setup_env.sh` |
 | `run_e2e_bench.sh` | Starts LMCache and vLLM, invokes the benchmark client, collects logs, and stops the services |
 | `bench_client.py` | Sends the cold and warm requests, reads vLLM metrics, and writes `bench-result.json` |
 | `tests/test_bench_client.py` | Unit tests for `bench_client.py`; uses mocks to test metrics and streaming-response parsing and is not part of the real benchmark |
@@ -43,6 +46,44 @@ workspace/
 ├── uGDS/
 ├── LMCache/
 └── vllm/
+```
+
+## Per-User Python Environment
+
+The repository contains one shared dependency lock, but it does not contain a
+shared virtual environment. Each user creates an independent `.venv` under
+their XDG data directory:
+
+```text
+${XDG_DATA_HOME:-$HOME/.local/share}/ugds-bench/vllm_lmcache_bench/.venv
+```
+
+Create or synchronize it from the benchmark directory:
+
+```bash
+cd uGDS/examples/vllm_lmcache_bench
+./setup_env.sh
+```
+
+`setup_env.sh` uses `uv pip sync`, so every run restores the exact third-party
+versions in `requirements.txt`. It then installs the sibling vLLM and LMCache
+repositories in editable mode. Their source revisions are therefore determined
+by the commits checked out in `../../../vllm` and `../../../LMCache`. The
+package versions and commits used to generate the current lock are recorded at
+the top of both `requirements.in` and `requirements.txt`.
+
+To place the environment elsewhere, set a user-owned path consistently:
+
+```bash
+VENV_DIR="$HOME/venvs/ugds-vllm-lmcache/.venv" ./setup_env.sh
+```
+
+The lock targets CPython 3.12 on x86-64 Linux with CUDA 12.9 PyTorch wheels.
+After changing dependency inputs or updating either source repository's
+requirements, regenerate it from this directory:
+
+```bash
+./lock_requirements.sh
 ```
 
 The default model is `Qwen/Qwen3-0.6B`, and the default uGDS slab size is
@@ -74,9 +115,9 @@ I_UNDERSTAND_UGDS_ERASES_DEVICE=1 \
 ./quickstart.sh
 ```
 
-`quickstart.sh` creates an isolated `.venv`, builds the uGDS driver and library,
-binds the selected SSD to `ugds_drv`, downloads the model, and starts LMCache
-and vLLM to run the benchmark.
+`quickstart.sh` creates or synchronizes the current user's isolated `.venv`,
+builds the uGDS driver and library, binds the selected SSD to `ugds_drv`,
+downloads the model, and starts LMCache and vLLM to run the benchmark.
 
 If the system already has multiple `/dev/ugds_drv*` devices, explicitly specify
 the character device that corresponds to the PCI address:
