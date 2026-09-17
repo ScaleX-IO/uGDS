@@ -56,10 +56,8 @@ struct IOQueuePair {
 
 struct IOQueuePairHuge {
     IOQueuePair                 qp;
-    void*                       sq_huge      = nullptr;
-    void*                       cq_huge      = nullptr;
-    size_t                      sq_huge_size = 0;
-    size_t                      cq_huge_size = 0;
+    void*                       huge_buf  = nullptr;  /* shared SQ/CQ backing */
+    size_t                      huge_size = 0;
 };
 
 struct HandleState {
@@ -211,7 +209,8 @@ struct BatchState {
     unsigned    n_events_read = 0;
 
     std::vector<BatchIOEntry> entries;
-    std::vector<CmdSlot>      cmd_map;
+    std::vector<CmdSlot>      cmd_map;   /* indexed by CID, not SQ position */
+    std::vector<uint16_t>     free_cids; /* returned only by that CID's CQE */
     uint16_t                  in_flight = 0;
     PRPPool                   prp_pool;
 

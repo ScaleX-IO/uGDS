@@ -55,7 +55,7 @@ static inline
 nvm_cmd_t* nvm_sq_enqueue(nvm_queue_t* sq)
 {
     // Check if queue is full
-    if (((uint16_t) (sq->tail - sq->head) % sq->qs) == sq->qs - 1)
+    if ((sq->tail + 1) % sq->qs == sq->head)
     {
         return NULL;
     }
