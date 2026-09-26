@@ -363,6 +363,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             return make_error(UGDS_INTERNAL_ERROR);
         };
 
+        const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
         for (auto& sc : work) {
             BatchIOEntry& entry = bs->entries[sc.io_idx];
             size_t n_pages = (sc.chunk_size + page_size - 1) / page_size;
@@ -375,7 +376,6 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                     nvm_sq_submit(&qp.sq);
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     uint64_t spins = 0;
-                    const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
                     while ((pidx = prp_pool_alloc(&bs->prp_pool)) < 0) {
                         DrainResult result = drain_one_completion(qp, bs);
                         if (result == DrainResult::Error)
@@ -392,7 +392,6 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
 
             nvm_cmd_t* cmd = nullptr;
             uint64_t spins = 0;
-            const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
             while (bs->free_cids.empty() || (cmd = nvm_sq_enqueue(&qp.sq)) == nullptr) {
                 nvm_sq_submit(&qp.sq);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
