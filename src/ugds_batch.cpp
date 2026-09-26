@@ -29,15 +29,18 @@ static void cleanup_prp_pool(BatchState* bs)
 
 static int prp_pool_alloc(PRPPool* pool)
 {
-    if (pool->free_bitmap == 0) return -1;
-    int idx = __builtin_ctzll(pool->free_bitmap);
-    pool->free_bitmap &= ~(1ULL << idx);
-    return idx;
+    for (int word = 0; word < UGDS_PRP_POOL_BITMAP_WORDS; ++word) {
+        if (pool->free_bitmap[word] == 0) continue;
+        int bit = __builtin_ctzll(pool->free_bitmap[word]);
+        pool->free_bitmap[word] &= ~(1ULL << bit);
+        return word * 64 + bit;
+    }
+    return -1;
 }
 
 static void prp_pool_free(PRPPool* pool, int idx)
 {
-    pool->free_bitmap |= (1ULL << idx);
+    pool->free_bitmap[idx / 64] |= (1ULL << (idx % 64));
 }
 
 enum class DrainResult { Empty, Completed, Error };
@@ -179,8 +182,10 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
         return make_error(UGDS_INTERNAL_ERROR);
     }
     pool.n_pages = UGDS_PRP_POOL_PAGES;
-    pool.free_bitmap = (UGDS_PRP_POOL_PAGES >= 64)
-        ? ~0ULL : (1ULL << UGDS_PRP_POOL_PAGES) - 1;
+    for (int word = 0; word < UGDS_PRP_POOL_BITMAP_WORDS; ++word) {
+        size_t bits = std::min<size_t>(64, pool.n_pages - word * 64);
+        pool.free_bitmap[word] = bits == 64 ? ~0ULL : (1ULL << bits) - 1;
+    }
 
     *batch = static_cast<uGDSBatchHandle_t>(bs);
 

@@ -26,7 +26,8 @@
 #define UGDS_DEFAULT_QUEUE_DEPTH 64
 #define UGDS_BATCH_QUEUE_DEPTH   512
 #define UGDS_MAX_BATCH_IO_SIZE   128
-#define UGDS_PRP_POOL_PAGES      64
+#define UGDS_PRP_POOL_PAGES      128
+#define UGDS_PRP_POOL_BITMAP_WORDS ((UGDS_PRP_POOL_PAGES + 63) / 64)
 #define UGDS_HUGEPAGE_SIZE       (2UL * 1024 * 1024)
 
 /* Fallback maximum data-transfer size (bytes) for a single I/O when the controller
@@ -176,7 +177,7 @@ struct PRPPool {
     nvm_dma_t*  dma       = nullptr;
     void*       buf       = nullptr;
     size_t      n_pages   = 0;
-    uint64_t    free_bitmap = 0;
+    uint64_t    free_bitmap[UGDS_PRP_POOL_BITMAP_WORDS] = {};
 };
 
 struct CmdSlot {
