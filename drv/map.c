@@ -108,16 +108,14 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
 {
     unsigned long i;
     struct map* map = NULL;
-
-    /* Prevent integer overflow in the flexible-array allocation.
-     * (n_pages - 1) * sizeof(uint64_t) must not overflow unsigned long. */
-    if (n_pages == 0 || n_pages > (ULONG_MAX - sizeof(struct map)) / sizeof(uint64_t) + 1)
+    
+    if (n_pages == 0)
     {
-        printk(KERN_ERR "n_pages overflow: %lu\n", n_pages);
+        printk(KERN_ERR "n_pages can not be zero\n");
         return ERR_PTR(-EINVAL);
     }
 
-    map = kvmalloc(sizeof(struct map) + (n_pages - 1) * sizeof(uint64_t), GFP_KERNEL);
+    map = kvmalloc(struct_size(map, addrs, n_pages), GFP_KERNEL);
     if (map == NULL)
     {
         printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
