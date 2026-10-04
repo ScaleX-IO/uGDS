@@ -68,7 +68,7 @@ Test Platform: A100-40GB + Samsung 990 PRO (PCIe Gen4 x4)
 
 ![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_sync_12t_write.png)
 
-uGDS bypasses the kernel NVMe driver, achieving up to **1.47x** higher read bandwidth and **2.69x** higher write bandwidth than NVIDIA GDS at small IO sizes.For 4-KiB reads, uGDS cuts latency from 78.01 𝜇s (GDS) down to 37.56 𝜇s—a **51.9%** latency reduction.
+uGDS bypasses the kernel NVMe driver, achieving up to **1.47x** higher read bandwidth and **2.69x** higher write bandwidth than NVIDIA GDS at small IO sizes. For 4-KiB reads, uGDS cuts latency from 78.01 𝜇s (GDS) down to 37.56 𝜇s—a **51.9%** latency reduction.
 
 
 
