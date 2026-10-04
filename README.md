@@ -76,7 +76,7 @@ The batch interfaces evaluation across transfer sizes (4--128\,KiB) and logical 
 ![Batch Read: GDS vs uGDS](assets/ugds_vs_gds_batch_read_depth.png)
 
 ![Batch Write: GDS vs uGDS](assets/ugds_vs_gds_batch_write_depth.png)
-uGDS outperforms GDS across all 36 evaluation points, delivering throughput gains ranging from **2.12$\times$ to 12.12$\times$** for reads and **2.33$\times$ to 30.69$\times$** for writes.
+uGDS outperforms GDS across all 36 evaluation points, delivering throughput gains ranging from **2.12$\times$ to 12.12$\times$** for reads and **2.33x to 30.69x** for writes.
 
 ## Quick Start
 
