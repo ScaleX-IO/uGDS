@@ -60,13 +60,23 @@ No kernel NVMe driver, no page cache — the CPU only touches doorbell registers
 
 ## Performance
 
-16-thread sequential read bandwidth on A100-40GB + Samsung 990 PRO (PCIe Gen4 x4):
+Test Platform: A100-40GB + Samsung 990 PRO (PCIe Gen4 x4)
 
-![Sequential Read: GDS vs uGDS](assets/ugds_vs_gds_16t_read.png)
+12-thread sequential read and write bandwidth:
 
-![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_16t_write.png)
+![Sequential Read: GDS vs uGDS](assets/ugds_vs_gds_sync_read.png)
 
-uGDS bypasses the kernel NVMe driver, achieving up to **2.7x** higher read bandwidth and **28x** higher write bandwidth than NVIDIA GDS at small IO sizes.
+![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_sync_write.png)
+
+uGDS bypasses the kernel NVMe driver, achieving up to **1.47x** higher read bandwidth and **2.69x** higher write bandwidth than NVIDIA GDS at small IO sizes.
+
+
+
+The batch interfaces evaluation across transfer sizes (4--128\,KiB) and logical batch sizes (QD 1--128) across a 64-MiB working set. 
+![Batch Read: GDS vs uGDS](assets/ugds_vs_gds_batch_read_depth.png)
+
+![Batch Write: GDS vs uGDS](assets/ugds_vs_gds_batch_write_depth.png)
+uGDS outperforms GDS across all 36 evaluation points, delivering throughput gains ranging from **2.12$\times$ to 12.12$\times$** for reads and **2.33$\times$ to 30.69$\times$** for writes.
 
 ## Quick Start
 
