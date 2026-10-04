@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  uGDS is the first production-oriented user-space GPU Direct Storage library where the CPU constructs NVMe commands and the SSD DMAs data directly to/from GPU memory over PCIe, bypassing the kernel NVMe driver. With a GDS-compatible API, uGDS achieves up to 5.3x higher bandwidth and 108x lower 4KB latency (5.2μs vs 561μs) compared to NVIDIA GDS.
+  uGDS is the first production-oriented user-space GPU Direct Storage library where the CPU constructs NVMe commands and the SSD DMAs data directly to/from GPU memory over PCIe, bypassing the kernel NVMe driver. With a GDS-compatible API, uGDS achieves up to 30.69x higher bandwidth and 51.9% lower 4KB latency (37.56μs vs 78.01μs) compared to NVIDIA GDS.
 </p>
 
 ---
@@ -60,13 +60,23 @@ No kernel NVMe driver, no page cache — the CPU only touches doorbell registers
 
 ## Performance
 
-16-thread sequential read bandwidth on A100-40GB + Samsung 990 PRO (PCIe Gen4 x4):
+Test Platform: A100-40GB + Samsung 990 PRO (PCIe Gen4 x4)
 
-![Sequential Read: GDS vs uGDS](assets/ugds_vs_gds_16t_read.png)
+12-thread sequential read and write bandwidth:
 
-![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_16t_write.png)
+![Sequential Read: GDS vs uGDS](assets/ugds_vs_gds_sync_12t_read.png)
 
-uGDS bypasses the kernel NVMe driver, achieving up to **2.7x** higher read bandwidth and **28x** higher write bandwidth than NVIDIA GDS at small IO sizes.
+![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_sync_12t_write.png)
+
+uGDS bypasses the kernel NVMe driver, achieving up to **1.47x** higher read bandwidth and **2.69x** higher write bandwidth than NVIDIA GDS at small IO sizes. For 4-KiB reads, uGDS cuts latency from 78.01 𝜇s (GDS) down to 37.56 𝜇s—a **51.9%** latency reduction.
+
+
+
+The batch interfaces evaluation across transfer sizes (4--128,KiB) and logical batch sizes (QD 1--128) across a 64-MiB working set. 
+![Batch Read: GDS vs uGDS](assets/ugds_vs_gds_batch_read_depth.png)
+
+![Batch Write: GDS vs uGDS](assets/ugds_vs_gds_batch_write_depth.png)
+uGDS outperforms GDS across all 36 evaluation points, delivering throughput gains ranging from **2.12x to 12.12x** for reads and **2.33x to 30.69x** for writes.
 
 ## Quick Start
 
