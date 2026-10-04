@@ -68,15 +68,15 @@ Test Platform: A100-40GB + Samsung 990 PRO (PCIe Gen4 x4)
 
 ![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_sync_12t_write.png)
 
-uGDS bypasses the kernel NVMe driver, achieving up to **1.47x** higher read bandwidth and **2.69x** higher write bandwidth than NVIDIA GDS at small IO sizes.
+uGDS bypasses the kernel NVMe driver, achieving up to **1.47x** higher read bandwidth and **2.69x** higher write bandwidth than NVIDIA GDS at small IO sizes.For 4-KiB reads, uGDS cuts latency from 78.01 𝜇s (GDS) down to 37.56 𝜇s—a **51.9%** latency reduction.
 
 
 
-The batch interfaces evaluation across transfer sizes (4--128\,KiB) and logical batch sizes (QD 1--128) across a 64-MiB working set. 
+The batch interfaces evaluation across transfer sizes (4--128,KiB) and logical batch sizes (QD 1--128) across a 64-MiB working set. 
 ![Batch Read: GDS vs uGDS](assets/ugds_vs_gds_batch_read_depth.png)
 
 ![Batch Write: GDS vs uGDS](assets/ugds_vs_gds_batch_write_depth.png)
-uGDS outperforms GDS across all 36 evaluation points, delivering throughput gains ranging from **2.12$\times$ to 12.12$\times$** for reads and **2.33x to 30.69x** for writes.
+uGDS outperforms GDS across all 36 evaluation points, delivering throughput gains ranging from **2.12x to 12.12x** for reads and **2.33x to 30.69x** for writes.
 
 ## Quick Start
 
