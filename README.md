@@ -64,9 +64,9 @@ Test Platform: A100-40GB + Samsung 990 PRO (PCIe Gen4 x4)
 
 12-thread sequential read and write bandwidth:
 
-![Sequential Read: GDS vs uGDS](assets/ugds_vs_gds_sync_read.png)
+![Sequential Read: GDS vs uGDS](assets/ugds_vs_gds_sync_12t_read.png)
 
-![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_sync_write.png)
+![Sequential Write: GDS vs uGDS](assets/ugds_vs_gds_sync_12t_write.png)
 
 uGDS bypasses the kernel NVMe driver, achieving up to **1.47x** higher read bandwidth and **2.69x** higher write bandwidth than NVIDIA GDS at small IO sizes.
 
