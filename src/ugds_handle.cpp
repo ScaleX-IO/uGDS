@@ -1,6 +1,8 @@
 #include "ugds_internal.h"
+#include "ugds_nvmeof.h"
 #include "libnvm/internal/ioctl.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -384,6 +386,79 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     return UGDS_OK;
 }
 
+extern "C" uGDSError_t uGDSHandleRegisterNvmeof(uGDSHandle_t* fh, int fd)
+{
+    return uGDSHandleRegisterNvmeofEx(fh, fd, 0);
+}
+
+/* Remote handle setup, in order: probe the kernel block device, build a
+ * HandleState with no local controller, open the remote endpoint, attach
+ * the GPU-direct controller if asked, and only then publish the handle in
+ * the registry. Nothing is visible to other threads until the last step,
+ * so every failure before it just frees what was built. */
+extern "C" uGDSError_t uGDSHandleRegisterNvmeofEx(uGDSHandle_t* fh, int fd,
+                                                  unsigned int flags)
+{
+    if (fh == nullptr || fd < 0 || (flags & ~UGDS_NVMEOF_GPU_DIRECT))
+        return make_error(UGDS_INVALID_VALUE);
+    if (!g_driver.initialized)
+        return make_error(UGDS_DRIVER_NOT_INITIALIZED);
+
+    size_t block_size = 0;
+    uint64_t capacity = 0;
+    if (ugds_nvmeof_probe(fd, &block_size, &capacity) != 0)
+        return make_error(UGDS_INVALID_FILE_TYPE);
+    /* Any sector size the kernel reports (512 B local SSD, 4 KiB on the
+     * GP target). I/O checks alignment against hs->block_size; nothing
+     * here assumes 4 KiB. Lane threads are not started yet: a handle that
+     * only uses uGDSRead/Write never creates them. */
+
+    auto hs = std::make_shared<HandleState>();
+    hs->fd = fd;
+    hs->is_remote = true;
+    hs->ns_id = 1;
+    hs->block_size = block_size;
+    hs->remote_capacity = capacity;
+    hs->max_transfer_size = UGDS_DEFAULT_MAX_TRANSFER_SIZE;
+    hs->num_qps = 0;
+    hs->remote_ep = ugds_nvmeof_open(fd, block_size);
+    if (!hs->remote_ep)
+        return make_error(UGDS_OUT_OF_MEMORY);
+    /* Asked-for direct mode that cannot be set up is an error, not a quiet
+     * fallback: the caller chose it for performance and should know. */
+    if (flags & UGDS_NVMEOF_GPU_DIRECT) {
+        int r = ugds_nvmeof_attach_direct(hs->remote_ep, capacity);
+        if (r) {
+            ugds_nvmeof_close(hs->remote_ep);
+            hs->remote_ep = nullptr;
+            fprintf(stderr, "uGDS: GPU-direct NVMe-oF unavailable (%s)\n", strerror(-r));
+            return make_error(r == -ENOTSUP ? UGDS_IO_NOT_SUPPORTED : UGDS_INTERNAL_ERROR);
+        }
+    }
+
+    HandleState* raw = hs.get();
+    uGDSError_t err = UGDS_OK;
+    {
+        std::lock_guard<std::mutex> g(g_driver.lock);
+        if (!g_driver.initialized) {
+            err = make_error(UGDS_DRIVER_NOT_INITIALIZED);
+        } else {
+            try {
+                g_driver.handle_registry[raw] = hs;
+            } catch (const std::bad_alloc&) {
+                err = make_error(UGDS_OUT_OF_MEMORY);
+            }
+        }
+    }
+    if (err.err != UGDS_SUCCESS) {
+        ugds_nvmeof_close(hs->remote_ep);
+        hs->remote_ep = nullptr;
+        return err;
+    }
+    *fh = reinterpret_cast<uGDSHandle_t>(raw);
+    return UGDS_OK;
+}
+
 extern "C" uGDSError_t uGDSGetDeviceCapacity(uGDSHandle_t fh,
                                                uint64_t* capacity_bytes)
 {
@@ -394,6 +469,12 @@ extern "C" uGDSError_t uGDSGetDeviceCapacity(uGDSHandle_t fh,
     HandleState* hs = handle_lookup(fh, &hs_sp);
     if (hs == nullptr)
         return make_error(UGDS_HANDLE_NOT_REGISTERED);
+
+    if (hs->is_remote) {
+        *capacity_bytes = hs->remote_capacity;
+        handle_release(hs);
+        return hs->remote_capacity ? UGDS_OK : make_error(UGDS_INTERNAL_ERROR);
+    }
 
     const uint64_t capacity_blocks =
         static_cast<uint64_t>(hs->ns_info.capacity);
@@ -516,6 +597,17 @@ extern "C" uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec)
             hs->closing.store(false, std::memory_order_release);
             return make_error(UGDS_BUSY);
         }
+    }
+
+    /* Remote handle: the drain above already waited for in-flight calls.
+     * Close joins lane threads if Batch or Async started any. No local
+     * QP, admin queue, or DMA mapping exists. The caller still owns fd. */
+    if (hs->is_remote) {
+        ugds_nvmeof_close(hs->remote_ep);
+        hs->remote_ep = nullptr;
+        std::lock_guard<std::mutex> g(g_driver.lock);
+        g_driver.handle_registry.erase(raw);
+        return UGDS_OK;
     }
 
     if (force)
