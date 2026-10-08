@@ -150,6 +150,7 @@ set(UGDS_SOURCES
     src/ugds_handle.cpp
     src/ugds_buf.cpp
     src/ugds_io.cpp
+    src/ugds_nvmeof.cpp
     src/ugds_batch.cpp
     src/ugds_async.cpp
     src/ugds_rdma.cpp
@@ -195,6 +196,36 @@ if(UGDS_ENABLE_RDMA)
     target_compile_definitions(ugds PRIVATE _RDMA)
 endif()
 
+# io_uring (optional, for NVMe-oF remote parallel chunk I/O)
+find_library(URING_LIB uring)
+if(URING_LIB)
+    target_link_libraries(ugds PRIVATE ${URING_LIB})
+    target_compile_definitions(ugds PRIVATE UGDS_HAVE_URING)
+    message(STATUS "io_uring support enabled (${URING_LIB})")
+else()
+    message(STATUS "io_uring not found -- remote path uses pread/pwrite")
+endif()
+
+# GPU-direct NVMe-oF (UGDS_NVMEOF_GPU_DIRECT): user-space initiator whose
+# SGLs point at GPU memory registered with the NIC through dma-buf.
+option(UGDS_ENABLE_NVMEOF_CAPSULE "Build the GPU-direct NVMe-oF initiator" OFF)
+set(UGDS_CAPSULE_BUILT OFF)
+if(UGDS_ENABLE_NVMEOF_CAPSULE)
+    find_library(RDMACM_LIB rdmacm)
+    find_library(IBVERBS_LIB ibverbs)
+    if(NOT UGDS_BACKEND_CUDA)
+        message(WARNING "UGDS_ENABLE_NVMEOF_CAPSULE needs the CUDA backend; disabled")
+    elseif(RDMACM_LIB AND IBVERBS_LIB)
+        target_sources(ugds PRIVATE src/ugds_nvmeof_capsule.cpp)
+        target_link_libraries(ugds PRIVATE ${RDMACM_LIB} ${IBVERBS_LIB})
+        target_compile_definitions(ugds PRIVATE UGDS_HAVE_CAPSULE)
+        set(UGDS_CAPSULE_BUILT ON)
+        message(STATUS "GPU-direct NVMe-oF initiator enabled")
+    else()
+        message(WARNING "UGDS_ENABLE_NVMEOF_CAPSULE requested but rdmacm/ibverbs not found")
+    endif()
+endif()
+
 target_link_libraries(ugds PRIVATE Threads::Threads)
 target_compile_options(ugds PRIVATE -Wall -O2)
 
@@ -224,6 +255,7 @@ set(FUNCTIONAL_TESTS
     test_cq_dw11
     test_interrupt_mode
     test_dmabuf_export
+    test_nvmeof_register
 )
 
 # RDMA/dmabuf tests -- only built/run when RDMA is enabled
@@ -293,6 +325,25 @@ if(UGDS_BACKEND_CUDA)
             CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )
+
+        add_executable(bench_nvmeof_remote test/perf/bench_nvmeof_remote.cu)
+        target_include_directories(bench_nvmeof_remote PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(bench_nvmeof_remote ugds CUDA::cudart)
+        set_target_properties(bench_nvmeof_remote PROPERTIES
+            CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+            BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        )
+
+        if(UGDS_CAPSULE_BUILT)
+            add_executable(test_nvmeof_direct test/functional/test_nvmeof_direct.cu)
+            target_link_libraries(test_nvmeof_direct ugds CUDA::cudart)
+            set_target_properties(test_nvmeof_direct PROPERTIES
+                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+                BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+            )
+        endif()
 
         # bench_overlap: async IO + GPU compute overlap benchmark
         if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_overlap.cu)
