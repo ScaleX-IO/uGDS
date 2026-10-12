@@ -6,6 +6,11 @@ UGDS_REPO="${UGDS_REPO:-$(cd -- "$BENCH_DIR/../.." && pwd)}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$(dirname -- "$UGDS_REPO")}"
 LMCACHE_REPO="${LMCACHE_REPO:-$WORKSPACE_DIR/LMCache}"
 VLLM_REPO="${VLLM_REPO:-$WORKSPACE_DIR/vllm}"
+USER_DATA_ROOT="${XDG_DATA_HOME:-${HOME:?HOME is required}/.local/share}"
+USER_CACHE_ROOT="${XDG_CACHE_HOME:-${HOME:?HOME is required}/.cache}"
+BENCH_USER_DIR="$USER_DATA_ROOT/ugds-bench/vllm_lmcache_bench"
+VENV_DIR="${VENV_DIR:-$BENCH_USER_DIR/.venv}"
+UV_TOOLS_DIR="${UV_TOOLS_DIR:-$BENCH_USER_DIR/tools}"
 UGDS_PCI_SLOT="${UGDS_PCI_SLOT:-}"
 UGDS_DEVICE="${UGDS_DEVICE:-}"
 SKIP_SETUP="${SKIP_SETUP:-0}"
@@ -62,18 +67,19 @@ ensure_uv() {
         command -v uv
         return
     fi
-    if [[ -x "$BENCH_DIR/.tools/uv" ]]; then
-        printf '%s\n' "$BENCH_DIR/.tools/uv"
+    if [[ -x "$UV_TOOLS_DIR/uv" ]]; then
+        printf '%s\n' "$UV_TOOLS_DIR/uv"
         return
     fi
     command -v curl >/dev/null 2>&1 || die "curl is required to install uv"
-    printf '==> Installing uv locally under %s/.tools\n' "$BENCH_DIR" >&2
+    printf '==> Installing uv for the current user under %s\n' \
+        "$UV_TOOLS_DIR" >&2
     local installer
     installer="$(mktemp)"
     curl -LsSf https://astral.sh/uv/install.sh -o "$installer"
-    UV_UNMANAGED_INSTALL="$BENCH_DIR/.tools" sh "$installer"
+    UV_UNMANAGED_INSTALL="$UV_TOOLS_DIR" sh "$installer"
     rm -f "$installer"
-    printf '%s\n' "$BENCH_DIR/.tools/uv"
+    printf '%s\n' "$UV_TOOLS_DIR/uv"
 }
 
 select_new_ugds_node() {
@@ -104,26 +110,18 @@ printf 'PCI ID: %s:%s\n' "$(<"$PCI_DIR/vendor")" "$(<"$PCI_DIR/device")"
 printf 'Current driver: %s\n' "$(get_driver "$UGDS_PCI_SLOT")"
 check_target_not_mounted "$UGDS_PCI_SLOT"
 
-export UV_CACHE_DIR="${UV_CACHE_DIR:-$BENCH_DIR/.uv-cache}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$USER_CACHE_ROOT/ugds-bench/vllm_lmcache_bench/uv}"
 if [[ "$SKIP_SETUP" != "1" ]]; then
     UV_BIN="${UV_BIN:-$(ensure_uv)}"
     printf '==> Building and installing the software stack\n'
     UV_BIN="$UV_BIN" BUILD_UGDS_DRIVER=1 \
         UGDS_REPO="$UGDS_REPO" LMCACHE_REPO="$LMCACHE_REPO" \
-        VLLM_REPO="$VLLM_REPO" EXISTING_PYTHON="${EXISTING_PYTHON:-}" \
+        VLLM_REPO="$VLLM_REPO" VENV_DIR="$VENV_DIR" \
         CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" \
         "$BENCH_DIR/setup_env.sh"
 fi
 
-if [[ -n "${PYTHON_BIN:-}" ]]; then
-    :
-elif [[ -n "${EXISTING_PYTHON:-}" ]]; then
-    PYTHON_BIN="$EXISTING_PYTHON"
-elif [[ -f "$BENCH_DIR/.python-bin" ]]; then
-    PYTHON_BIN="$(<"$BENCH_DIR/.python-bin")"
-else
-    PYTHON_BIN="$BENCH_DIR/.venv/bin/python"
-fi
+PYTHON_BIN="$VENV_DIR/bin/python"
 [[ -x "$PYTHON_BIN" ]] || die "Python environment is not ready: $PYTHON_BIN"
 
 current_driver="$(get_driver "$UGDS_PCI_SLOT")"
@@ -159,11 +157,7 @@ snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])
 PY
 fi
 
-if [[ -n "${EXISTING_PYTHON:-}" ]]; then
-    USE_LOCAL_VLLM_SOURCE="${USE_LOCAL_VLLM_SOURCE:-0}"
-else
-    USE_LOCAL_VLLM_SOURCE="${USE_LOCAL_VLLM_SOURCE:-1}"
-fi
+USE_LOCAL_VLLM_SOURCE="${USE_LOCAL_VLLM_SOURCE:-1}"
 
 printf '==> Running vLLM + LMCache + uGDS end-to-end benchmark\n'
 env PYTHON_BIN="$PYTHON_BIN" MODEL="$MODEL" UGDS_DEVICE="$UGDS_DEVICE" \

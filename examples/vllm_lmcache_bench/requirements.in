@@ -1,0 +1,33 @@
+# Runtime dependencies shared by every user's benchmark environment.
+# Keep the CUDA-specific entries in sync with vllm/requirements/cuda.txt.
+# lock_requirements.sh records the current editable source versions and commits
+# in the generated requirements.txt header.
+-r ../../../vllm/requirements/common.txt
+-r ../../../LMCache/requirements/common.txt
+-r ../../../LMCache/requirements/cuda12_core.txt
+
+torch==2.13.0
+torchaudio==2.11.0
+torchvision==0.28.0
+torchcodec>=0.14
+numba==0.65.0
+PyNvVideoCodec==2.0.4
+flashinfer-python==0.6.16.post3
+apache-tvm-ffi==0.1.11
+tilelang==0.1.12
+nvidia-cudnn-frontend>=1.19.1
+nvtx==0.2.15
+fastsafetensors>=0.3.3
+nvidia-cutlass-dsl==4.6.2
+quack-kernels==0.6.4
+tokenspeed-mla==0.1.8; platform_system == "Linux"
+humming-kernels[cu12]==0.1.12
+
+# Native extension build dependencies. Pin these so source rebuilds are stable.
+cmake>=3.26.1
+ninja==1.13.0
+packaging==26.0
+setuptools==80.9.0
+setuptools-rust>=1.9.0
+setuptools-scm==10.2.0
+wheel==0.47.0

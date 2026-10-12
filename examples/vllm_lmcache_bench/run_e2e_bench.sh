@@ -6,10 +6,9 @@ UGDS_REPO="${UGDS_REPO:-$(cd -- "$BENCH_DIR/../.." && pwd)}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$(dirname -- "$UGDS_REPO")}"
 LMCACHE_REPO="${LMCACHE_REPO:-$WORKSPACE_DIR/LMCache}"
 VLLM_REPO="${VLLM_REPO:-$WORKSPACE_DIR/vllm}"
-if [[ -z "${PYTHON_BIN:-}" && -f "$BENCH_DIR/.python-bin" ]]; then
-    PYTHON_BIN="$(<"$BENCH_DIR/.python-bin")"
-fi
-PYTHON_BIN="${PYTHON_BIN:-$BENCH_DIR/.venv/bin/python}"
+USER_DATA_ROOT="${XDG_DATA_HOME:-${HOME:?HOME is required}/.local/share}"
+VENV_DIR="${VENV_DIR:-$USER_DATA_ROOT/ugds-bench/vllm_lmcache_bench/.venv}"
+PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 UGDS_DEVICE="${UGDS_DEVICE:-/dev/ugds_drv0}"
 UGDS_LIB_DIR="${UGDS_LIB_DIR:-$UGDS_REPO/build}"
