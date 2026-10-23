@@ -121,15 +121,32 @@ typedef struct uGDSDescr_t {
 
 typedef void* uGDSHandle_t;
 
+typedef void* uGDSStorage_t;
+
 uGDSError_t uGDSDriverOpen(void);
-
 uGDSError_t uGDSDriverClose(void);
-
 uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr);
 
 /* Return the usable NVMe namespace capacity in bytes for a registered handle. */
 uGDSError_t uGDSGetDeviceCapacity(uGDSHandle_t fh,
                                   uint64_t* capacity_bytes);
+
+/* A storage aggregates independently registered NVMe handles. It does not
+ * schedule I/O, so no striping, RAID, or load balancing is implied.
+ * Destroy storage before deregistering any member handle. */
+uGDSError_t uGDSStorageCreate(uGDSStorage_t* storage);
+uGDSError_t uGDSStorageAddHandle(uGDSStorage_t storage, uGDSHandle_t fh);
+uGDSError_t uGDSStorageGetDeviceCount(uGDSStorage_t storage,
+                                      uint32_t* device_count);
+uGDSError_t uGDSStorageGetCapacity(uGDSStorage_t storage,
+                                   uint64_t* capacity_bytes);
+uGDSError_t uGDSStorageGetDeviceCapacity(uGDSStorage_t storage,
+                                         uint32_t device_index,
+                                         uint64_t* capacity_bytes);
+uGDSError_t uGDSStorageGetHandle(uGDSStorage_t storage,
+                                 uint32_t device_index,
+                                 uGDSHandle_t* fh);
+void uGDSStorageDestroy(uGDSStorage_t storage);
 
 void uGDSHandleDeregister(uGDSHandle_t fh);
 

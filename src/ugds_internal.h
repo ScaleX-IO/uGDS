@@ -68,7 +68,7 @@ struct HandleState {
     nvm_dma_t*                  aq_dma;
     void*                       aq_buf;
     struct nvm_ctrl_info        ctrl_info;
-    struct nvm_ns_info          ns_info;
+    struct nvm_ns_info          ns_info;    /* Save NVMe namespace information */
     uint32_t                    ns_id;
     size_t                      block_size;
     size_t                      max_transfer_size;
@@ -85,8 +85,24 @@ struct HandleState {
     std::atomic<bool>           closing{false};        /* set by Deregister to block new ops */
 };
 
+struct StorageDevice {
+    uGDSHandle_t                 handle = nullptr; /* The NVMe handle exposed for external use */
+    std::shared_ptr<HandleState> handle_sp; /* A shared pointer to the corresponding HandleState */
+    uint64_t                     capacity_bytes = 0; /* The device capacity in bytes */
+};
+
+/* StorageState does not contain I/O queues or a scheduler.
+ * The actual I/O queues are stored in HandleState:
+ * std::vector<std::unique_ptr<IOQueuePair>> qps; */
+struct StorageState {
+    std::mutex                  lock; /* Protects the internal state of the current Storage.*/
+    std::vector<StorageDevice>  devices;
+    uint64_t                    capacity_bytes = 0;
+    bool                        closing = false; /* Indicates whether the Storage has entered the shutdown process. */
+};
+
 struct DriverState {
-    std::atomic<bool>                              initialized{false};
+    std::atomic<bool>                             initialized{false};
     std::mutex                                    lock;
     nvm_ctrl_t*                                   default_ctrl = nullptr;
 
@@ -95,6 +111,14 @@ struct DriverState {
      * destroy the HandleState while an IO entrypoint is dereferencing it. */
     std::unordered_map<HandleState*,
                        std::shared_ptr<HandleState>>  handle_registry;
+
+    /* Storage registry: maps raw pointer -> shared_ptr to keep storage instances alive. 
+     * storage_lookup acquires under g_driver.lock so Deregister cannot
+     * destroy the StorageState while an IO entrypoint is dereferencing it. 
+     * Trade-off: The current implementation prioritizes thread safety and implementation simplicity, 
+     * while temporarily accepting the potential performance overhead introduced by the global lock.*/
+    std::unordered_map<StorageState*,
+                       std::shared_ptr<StorageState>> storage_registry;
 
     /* Buffer registry with backend tracking for dual-backend dispatch.
      * in_flight counts active IO references to prevent use-after-free

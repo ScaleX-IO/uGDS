@@ -148,6 +148,7 @@ set(UGDS_SOURCES
     src/libnvm/rpc.cpp
     src/ugds_driver.cpp
     src/ugds_handle.cpp
+    src/ugds_storage.cpp
     src/ugds_buf.cpp
     src/ugds_io.cpp
     src/ugds_batch.cpp
@@ -224,6 +225,7 @@ set(FUNCTIONAL_TESTS
     test_cq_dw11
     test_interrupt_mode
     test_dmabuf_export
+    test_storage_multi_ssd
 )
 
 # RDMA/dmabuf tests -- only built/run when RDMA is enabled
@@ -290,6 +292,16 @@ if(UGDS_BACKEND_CUDA)
         )
         target_link_libraries(bench_ugds${CUDA_SUFFIX} ugds CUDA::cudart)
         set_target_properties(bench_ugds${CUDA_SUFFIX} PROPERTIES
+            CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+            BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        )
+
+        add_executable(bench_multi_ssd${CUDA_SUFFIX} test/perf/bench_multi_ssd.cu)
+        target_include_directories(bench_multi_ssd${CUDA_SUFFIX} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(bench_multi_ssd${CUDA_SUFFIX} ugds CUDA::cudart)
+        set_target_properties(bench_multi_ssd${CUDA_SUFFIX} PROPERTIES
             CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )
@@ -435,6 +447,17 @@ if(UGDS_BACKEND_HIP)
         target_link_libraries(bench_ugds${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS})
         target_compile_definitions(bench_ugds${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
         set_target_properties(bench_ugds${HIP_SUFFIX} PROPERTIES
+            HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
+            BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        )
+
+        add_executable(bench_multi_ssd${HIP_SUFFIX} test/perf/bench_multi_ssd.cu)
+        target_include_directories(bench_multi_ssd${HIP_SUFFIX} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(bench_multi_ssd${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS})
+        target_compile_definitions(bench_multi_ssd${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
+        set_target_properties(bench_multi_ssd${HIP_SUFFIX} PROPERTIES
             HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )

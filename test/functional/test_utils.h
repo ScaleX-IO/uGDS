@@ -70,6 +70,21 @@ static uGDSHandle_t open_handle() {
     return fh;
 }
 
+/* Given a device path, open the device file and register it as a uGDS Handle. */
+static uGDSHandle_t open_handle_at(const char* path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return nullptr;
+    uGDSDescr_t descr = {};
+    descr.type = UGDS_HANDLE_TYPE_OPAQUE_FD;
+    descr.handle.fd = fd;
+    uGDSHandle_t fh = nullptr;
+    if (uGDSHandleRegister(&fh, &descr).err != UGDS_SUCCESS) {
+        close(fd);
+        return nullptr;
+    }
+    return fh;
+}
+
 static int get_handle_fd(uGDSHandle_t fh) {
     if (!fh) return -1;
     return *reinterpret_cast<int*>(fh);

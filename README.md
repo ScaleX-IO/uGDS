@@ -40,24 +40,27 @@
 ## Architecture
 
 ```
-┌──────────────┐
-│  Application │    uGDSRead / uGDSWrite
-└──────┬───────┘
-       │
-┌──────▼───────┐
-│  libugds.so  │    NVMe command construction + SQ/CQ management
-└──────┬───────┘
-       │          DMA: SSD ←→ GPU memory (P2P over PCIe)
-┌──────▼───────┐
-│  ugds_drv.ko │    PCI BAR mapping + GPU page pinning
-└──────┬───────┘
-       │
-┌──────▼───────┐
-│   NVMe SSD   │
-└──────────────┘
+┌────────────────────┐
+│    Application     │    uGDSRead / uGDSWrite
+│                    │    uGDSStorageCreate / AddHandle
+└─────────┬──────────┘
+          │
+┌─────────▼──────────┐
+│    libugds.so      │    Storage aggregation + NVMe command construction
+│  Storage registry  │    SQ/CQ management for each registered handle
+└────┬───────────┬───┘
+     │           │       DMA: SSD ←→ GPU memory (P2P over PCIe)
+┌────▼─────┐ ┌───▼─────┐
+│ ugds_drv │ │ ugds_drv│    One independent handle per device
+│  + SSD 0 │ │  + SSD 1│
+└────┬─────┘ └───┬─────┘
+     │           │
+┌────▼─────┐ ┌───▼─────┐
+│  NVMe 0  │ │  NVMe 1 │
+└──────────┘ └─────────┘
 ```
 
-No kernel NVMe driver, no page cache — the CPU only touches doorbell registers and completion queue entries.
+The Storage API aggregates multiple independently registered handles and exposes their device count and aggregate capacity. Applications retrieve the handles by index and can issue concurrent per-device IO; automatic striping is a separate roadmap item. There is no kernel NVMe driver or page cache — the CPU only touches doorbell registers and completion queue entries.
 
 ## Performance
 
@@ -112,6 +115,31 @@ uGDSDriverClose();
 
 See [examples/01_basic_read_write.cu](examples/01_basic_read_write.cu) for a complete working example.
 
+To aggregate multiple uGDS devices, register each device independently and add the handles to a Storage object:
+
+```cpp
+uGDSHandle_t fh0; // registered from /dev/ugds_drv0
+uGDSHandle_t fh1; // registered from /dev/ugds_drv1
+
+uGDSStorage_t storage;
+uGDSStorageCreate(&storage);
+uGDSStorageAddHandle(storage, fh0);
+uGDSStorageAddHandle(storage, fh1);
+
+uint32_t device_count;
+uint64_t aggregate_capacity;
+uGDSStorageGetDeviceCount(storage, &device_count);
+uGDSStorageGetCapacity(storage, &aggregate_capacity);
+
+// Retrieve handles by index for explicit per-device or concurrent IO.
+uGDSHandle_t device0;
+uGDSHandle_t device1;
+uGDSStorageGetHandle(storage, 0, &device0);
+uGDSStorageGetHandle(storage, 1, &device1);
+
+uGDSStorageDestroy(storage);
+```
+
 For build instructions, environment setup, and driver management, see the **[Installation Guide](docs/installation.md)**.
 
 Run the [vLLM + LMCache + uGDS end-to-end benchmark](examples/vllm_lmcache_bench/README.md) to validate KV-cache offloading on a dedicated NVMe SSD.
@@ -148,6 +176,16 @@ scripts/run_tests.sh compare
 scripts/run_tests.sh all
 ```
 
+The functional test suite includes `test_storage_multi_ssd`. It validates multi-device handle aggregation and concurrent reads, and skips with code `77` when a second uGDS device is unavailable.
+
+For the dedicated multi-SSD performance benchmark, provide two distinct uGDS device paths explicitly:
+
+```bash
+build/bench_multi_ssd -f /dev/ugds_drv0 -F /dev/ugds_drv1 [-d 0] [-n 1024]
+```
+
+This benchmark validates storage aggregation and concurrent reads; it does not automatically stripe IO across devices.
+
 ## API Coverage
 
 | API | Status | Notes |
@@ -161,6 +199,7 @@ scripts/run_tests.sh all
 | `uGDSStreamRegister / Deregister` | ✅ | Optional (no-op, uGDS has no bounce buffer) |
 | `uGDSBufRegisterEx` | ✅ | Extended registration with backend selection and export flag |
 | `uGDSExportDmabuf` | ✅ | DMA-buf fd export for RDMA and dmabuf-aware consumers |
+| `uGDSStorageCreate / AddHandle / Get* / Destroy` | ✅ | Multi-device handle aggregation and capacity queries |
 
 ## Roadmap
 
@@ -174,7 +213,7 @@ scripts/run_tests.sh all
 | 4.5 | Dual CUDA/HIP backend + DMA-buf export | ✅ |
 | 5 | SGL support (scatter-gather lists) | 🔜 |
 | 6 | Interrupt mode (MSI-X + eventfd) | ✅ |
-| 7 | Multi-SSD support (multi-handle aggregation) | 🔜 |
+| 7 | Multi-SSD support (multi-handle aggregation) | ✅ |
 | 8 | Striping (automatic IO distribution across SSDs) | 🔜 |
 | 9 | Filesystem compatibility (POSIX file path support) | 🔜 |
 | 10 | [LMCache integration](https://github.com/ScaleX-IO/LMCache) (KV cache storage backend) | ✅ |

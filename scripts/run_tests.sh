@@ -151,6 +151,7 @@ run_functional() {
     local tests=(
         test_driver_lifecycle
         test_handle_register
+        test_storage_multi_ssd
         test_buf_register
         test_read_write_basic
         test_read_write_large
