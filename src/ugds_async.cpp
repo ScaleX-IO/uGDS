@@ -1,4 +1,5 @@
 #include "ugds_internal.h"
+#include "ugds_nvmeof.h"
 #if defined(_CUDA) && defined(__HIP_PLATFORM_AMD__)
 /* Dual-backend: avoid both cuda_runtime.h and hip_runtime.h in this TU
  * to prevent type conflicts. Functions are declared extern "C" below. */
@@ -32,8 +33,16 @@ static void async_io_callback(void* userData)
     off_t file_offset = *req->file_offset_p;
     off_t bufPtr_offset = *req->bufPtr_offset_p;
 
-    ssize_t ret = do_io_internal(req->fh, req->bufPtr_base, size,
-                                  file_offset, bufPtr_offset, req->opcode);
+    /* A CUDA host callback must not call cudaMemcpy. Remote I/O therefore
+     * passes on_lane=true: lane threads own the bounce and the pread, and
+     * this callback blocks until they finish. Local I/O stays in
+     * do_io_internal, which does not call CUDA. */
+    HandleState* hs = static_cast<HandleState*>(req->fh);
+    ssize_t ret = hs->is_remote
+        ? ugds_nvmeof_io(hs->remote_ep, req->bufPtr_base, size, file_offset,
+                         bufPtr_offset, req->opcode == NVM_IO_WRITE, true)
+        : do_io_internal(req->fh, req->bufPtr_base, size,
+                         file_offset, bufPtr_offset, req->opcode);
     *req->bytes_done_p = ret;
 
     /* Release the in-flight reference held by async_validate.
@@ -66,26 +75,30 @@ static uGDSError_t async_validate(uGDSHandle_t fh, void* bufPtr_base,
         return make_error(UGDS_INVALID_VALUE);
 
     std::lock_guard<std::mutex> drv_lock(g_driver.lock);
-    auto it = g_driver.buf_registry.find(bufPtr_base);
-    if (it == g_driver.buf_registry.end())
+    HandleState* hs = handle_lookup_locked(fh, hs_sp_out);
+    if (!hs)
         return make_error(UGDS_INVALID_VALUE);
+
+    auto it = g_driver.buf_registry.find(bufPtr_base);
+    /* Remote data is staged in a host bounce, so the GPU buffer does not
+     * need a uGDSBufRegister pinning entry. If the caller registered it
+     * anyway, hold the same in-flight reference the local path holds, so
+     * BufDeregister still waits for this callback. */
+    if (hs->is_remote) {
+        if (it != g_driver.buf_registry.end())
+            it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
+        return UGDS_OK;
+    }
+    if (it == g_driver.buf_registry.end()) {
+        handle_release(hs);
+        if (hs_sp_out) hs_sp_out->reset();
+        return make_error(UGDS_INVALID_VALUE);
+    }
 
     /* Hold in-flight reference from enqueue until callback completes.
      * This prevents uGDSBufDeregister from unmapping the buffer
      * while the async request is queued but not yet executed. */
     it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
-
-    /* Also hold a handle reference so HandleDeregister cannot free
-     * the HandleState (QPs, controller) while the async callback
-     * is pending. Use handle_lookup_locked since we already hold
-     * g_driver.lock from the buffer registry lookup above. */
-    HandleState* hs = handle_lookup_locked(fh, hs_sp_out);
-    if (!hs) {
-        /* Roll back buffer in_flight ref on handle acquire failure */
-        it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
-        return make_error(UGDS_INVALID_VALUE);
-    }
-
     return UGDS_OK;
 }
 

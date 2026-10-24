@@ -109,6 +109,9 @@ enum uGDSHandleType {
     UGDS_HANDLE_TYPE_OPAQUE_FD    = 1,
     UGDS_HANDLE_TYPE_OPAQUE_WIN32 = 2,
     UGDS_HANDLE_TYPE_USERSPACE_FS = 3,
+    /* Remote NVMe-oF device via kernel nvme-rdma initiator fd.
+     * Prefer uGDSHandleRegisterNvmeof(); kept in enum for forward compat. */
+    UGDS_HANDLE_TYPE_NVMEOF       = 4,
 };
 
 typedef struct uGDSDescr_t {
@@ -126,6 +129,40 @@ uGDSError_t uGDSDriverOpen(void);
 uGDSError_t uGDSDriverClose(void);
 
 uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr);
+
+/* Register a remote NVMe-oF namespace the kernel nvme-rdma initiator has
+ * already attached (fd from open("/dev/nvmeXnY", O_RDWR|O_DIRECT)).
+ *
+ * There is no GPU P2P mapping. uGDSRead/Write copy through a host bounce
+ * on the calling thread. BatchIO and Async add per-queue worker threads
+ * so more than one hardware queue is kept busy. uGDSBufRegister is not
+ * required. Offsets and lengths must be multiples of the logical block
+ * size. The caller keeps ownership of fd and closes it after deregister.
+ */
+
+uGDSError_t uGDSHandleRegisterNvmeof(uGDSHandle_t* fh, int fd);
+
+/* Flags for uGDSHandleRegisterNvmeofEx(). */
+enum {
+    /* Move data between GPU memory and the remote target with no host copy.
+     * uGDS opens its own NVMe-oF controller on the subsystem behind fd and
+     * registers each GPU allocation with the RDMA NIC (dma-buf) on first
+     * use; the target RDMA-reads and -writes GPU memory directly. Needs a
+     * build with UGDS_ENABLE_NVMEOF_CAPSULE and a GPU driver that exports
+     * dma-buf. Buffers passed to I/O must be CUDA device memory.
+     *
+     * As with local P2P handles, the NIC reads the buffer outside any CUDA
+     * stream: work that fills a buffer must have finished before uGDSWrite
+     * (synchronize the producing stream; a cudaMemcpy from pageable host
+     * memory can return before its data reaches the GPU).
+     * uGDSWriteAsync is ordered on its stream and needs no extra sync. */
+    UGDS_NVMEOF_GPU_DIRECT = 1u << 0,
+};
+
+/* uGDSHandleRegisterNvmeof() with flags. Returns UGDS_IO_NOT_SUPPORTED if a
+ * requested mode is not built in, and UGDS_INTERNAL_ERROR if the direct
+ * controller cannot be set up; it does not silently fall back. */
+uGDSError_t uGDSHandleRegisterNvmeofEx(uGDSHandle_t* fh, int fd, unsigned int flags);
 
 /* Return the usable NVMe namespace capacity in bytes for a registered handle. */
 uGDSError_t uGDSGetDeviceCapacity(uGDSHandle_t fh,
