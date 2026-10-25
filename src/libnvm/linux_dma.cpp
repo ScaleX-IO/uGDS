@@ -561,7 +561,17 @@ int nvm_dma_map_device_ex(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devp
         }
         else
         {
-            /* Standard NVIDIA CUDA path via kernel P2P */
+            /* Standard NVIDIA CUDA path via kernel P2P.
+             * Reject non-64KiB-aligned devptr: the kernel maps
+             * vaddr & GPU_PAGE_MASK (drv/map.c), so a misaligned
+             * base silently addresses the containing 64KiB page and
+             * ioaddrs[0] does not correspond to devptr. This is silent
+             * data corruption. */
+            if ((uintptr_t)devptr % ((size_t)1 << 16) != 0)
+            {
+                dprintf("CUDA P2P devptr %p not 64KiB-aligned\n", devptr);
+                return EINVAL;
+            }
             err = create_mapping_descriptor(&md, 1ULL << 16, MAP_TYPE_CUDA, devptr, size);
             if (err != 0)
             {
