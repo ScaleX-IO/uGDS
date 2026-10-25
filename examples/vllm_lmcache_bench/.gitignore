@@ -1,7 +1,6 @@
 .venv/
 .tools/
 .uv-cache/
-.python-bin
 artifacts/
 models/
 __pycache__/
