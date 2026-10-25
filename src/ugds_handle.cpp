@@ -53,24 +53,19 @@ static void cleanup_timeout_resources(HandleState* hs) {
     for (auto& qp_ptr : hs->qps) {
         IOQueuePair& qp = *qp_ptr;
         nvm_dma_t* timeout_dma = nullptr;
-        const void* registered_buf = nullptr;
+        SglRefOwner timeout_refs;
         {
             std::lock_guard<std::mutex> qp_lock(qp.lock);
             timeout_dma = qp.timeout_dma;
-            registered_buf = qp.timeout_registered_buf;
+            timeout_refs = std::move(qp.timeout_refs);
             qp.timeout_dma = nullptr;
-            qp.timeout_registered_buf = nullptr;
         }
 
         if (timeout_dma != nullptr)
             nvm_dma_unmap(timeout_dma);
 
-        if (registered_buf != nullptr) {
-            std::lock_guard<std::mutex> drv_lock(g_driver.lock);
-            auto it = g_driver.buf_registry.find(registered_buf);
-            if (it != g_driver.buf_registry.end())
-                it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
-        }
+        /* SglRefOwner destructor releases in_flight refs under
+         * g_driver.lock; the move left timeout_refs non-empty. */
     }
 }
 
