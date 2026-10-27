@@ -1,4 +1,5 @@
 #include "ugds_internal.h"
+#include "ugds_nvmeof.h"
 
 #include <cstring>
 #include <cerrno>
@@ -131,6 +132,21 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
     if (!hs)
         return make_error(UGDS_INVALID_VALUE);
 
+    /* Remote batches have no local batch_qp. Build the remote object
+     * before the batch_qp check below, and hand back a pointer whose
+     * first word is the 'RBN1' tag. Submit/GetStatus/Destroy test that
+     * tag first. */
+    if (hs->is_remote) {
+        void *raw = nullptr;
+        uGDSError_t re = ugds_nvmeof_batch_setup(&raw, hs, hs_sp, nr);
+        if (re.err != UGDS_SUCCESS) {
+            handle_release(hs);
+            return re;
+        }
+        *batch = raw;
+        return UGDS_OK;
+    }
+
     if (!hs->batch_qp) {
         handle_release(hs);
         return make_error(UGDS_INTERNAL_ERROR);
@@ -197,6 +213,8 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
 {
     if (batch == nullptr || iocb == nullptr || nr == 0)
         return make_error(UGDS_INVALID_VALUE);
+    if (ugds_nvmeof_is_batch(batch))
+        return ugds_nvmeof_batch_submit(batch, nr, iocb);
 
     BatchState* bs = static_cast<BatchState*>(batch);
     std::lock_guard<std::mutex> batch_lock(bs->lock);
@@ -460,6 +478,8 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
 {
     if (batch == nullptr || nr == nullptr || events == nullptr)
         return make_error(UGDS_INVALID_VALUE);
+    if (ugds_nvmeof_is_batch(batch))
+        return ugds_nvmeof_batch_status(batch, min_nr, nr, events, timeout);
 
     BatchState* bs = static_cast<BatchState*>(batch);
     HandleState* hs = bs->hs;
@@ -533,6 +553,10 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
 extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
 {
     if (batch == nullptr) return;
+    if (ugds_nvmeof_is_batch(batch)) {
+        ugds_nvmeof_batch_destroy(batch);
+        return;
+    }
 
     BatchState* bs = static_cast<BatchState*>(batch);
     HandleState* hs = bs->hs;

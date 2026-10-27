@@ -1,4 +1,5 @@
 #include "ugds_internal.h"
+#include "ugds_nvmeof.h"
 
 #include <cstring>
 #include <cstdio>
@@ -89,6 +90,11 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
     if (hs == nullptr || bufPtr_base == nullptr || size == 0) {
         return -EINVAL;
     }
+    /* Remote NVMe-oF. on_lane=false: this thread does the bounce and one
+     * pread/pwrite. The PRP / doorbell path below is local disks only. */
+    if (hs->is_remote)
+        return ugds_nvmeof_io(hs->remote_ep, bufPtr_base, size, file_offset,
+                              bufPtr_offset, opcode == NVM_IO_WRITE, false);
     if (file_offset < 0 || bufPtr_offset < 0) {
         return -EINVAL;
     }

@@ -63,6 +63,12 @@ struct IOQueuePairHuge {
 
 struct HandleState {
     int                         fd;
+    /* Kernel nvme-rdma block device. ctrl/aq/qps/batch_qp stay null.
+     * remote_ep owns the bounce path and, after the first Batch or Async
+     * call, the per-queue lane threads. */
+    bool                        is_remote = false;
+    struct ugds_nvmeof_ep*      remote_ep = nullptr;
+    uint64_t                    remote_capacity = 0;
     nvm_ctrl_t*                 ctrl;
     nvm_aq_ref                  aq_ref;
     nvm_dma_t*                  aq_dma;
@@ -204,6 +210,9 @@ struct BatchIOEntry {
 };
 
 struct BatchState {
+    /* Must stay first: remote batches start with a different tag, see
+     * ugds_nvmeof_is_batch(). */
+    uint32_t    tag           = 0x4C424E31u; /* 'LBN1' */
     unsigned    capacity      = 0;
     unsigned    n_entries     = 0;
     unsigned    n_completed   = 0;
@@ -240,6 +249,7 @@ struct AsyncRequest {
     off_t*          bufPtr_offset_p;
     ssize_t*        bytes_done_p;
     uint8_t         opcode;
+    bool            buf_ref;  /* holds an in_flight reference on bufPtr_base */
     std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive until callback */
 };
 
