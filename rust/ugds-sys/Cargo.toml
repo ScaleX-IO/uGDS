@@ -1,0 +1,18 @@
+[package]
+name = "ugds-sys"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Raw declarations and a runtime loader for the uGDS user-space GPUDirect Storage library"
+license = "BSD-3-Clause"
+repository = "https://github.com/ScaleX-IO/uGDS"
+readme = "README.md"
+keywords = ["gpudirect", "nvme", "storage", "gpu", "ffi"]
+categories = ["external-ffi-bindings"]
+include = ["src/**", "tests/**", "regen.sh", "README.md", "Cargo.toml"]
+# Publication and crates.io ownership are not decided yet.
+publish = false
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"
