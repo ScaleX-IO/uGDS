@@ -10,3 +10,6 @@ drv/*.order
 drv/*.symvers
 drv/.*.cmd
 drv/.tmp_versions/
+
+# Rust build artifacts
+rust/**/target/
