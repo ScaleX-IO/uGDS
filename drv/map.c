@@ -109,15 +109,14 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
     unsigned long i;
     struct map* map = NULL;
 
-    /* Prevent integer overflow in the flexible-array allocation.
-     * (n_pages - 1) * sizeof(uint64_t) must not overflow unsigned long. */
-    if (n_pages == 0 || n_pages > (ULONG_MAX - sizeof(struct map)) / sizeof(uint64_t) + 1)
+    /* Prevent integer overflow in the flexible-array allocation. */
+    if (n_pages == 0 || n_pages > (ULONG_MAX - sizeof(struct map)) / sizeof(uint64_t))
     {
         printk(KERN_ERR "n_pages overflow: %lu\n", n_pages);
         return ERR_PTR(-EINVAL);
     }
 
-    map = kvmalloc(sizeof(struct map) + (n_pages - 1) * sizeof(uint64_t), GFP_KERNEL);
+    map = kvmalloc(sizeof(struct map) + n_pages * sizeof(uint64_t), GFP_KERNEL);
     if (map == NULL)
     {
         printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
@@ -252,9 +251,10 @@ static long map_user_pages(struct map* map)
         if (retval != 0)
         {
             printk(KERN_ERR "Failed to map page for some reason\n");
-            /* n_dma_mapped tracks how many were successfully mapped,
+            /* dma_mapping_error() returns a flag, not a negative errno.
+             * n_dma_mapped tracks how many were successfully mapped,
              * so release_user_pages only unmaps those entries. */
-            return retval;
+            return -EIO;
         }
         map->n_dma_mapped++;
     }

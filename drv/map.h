@@ -41,7 +41,10 @@ struct map
     unsigned long       n_addrs;        /* Number of mapped pages */
     unsigned long       n_dma_mapped;   /* Successfully DMA-mapped pages (host backend) */
     atomic_t            invalid;        /* Set by dmabuf move_notify or NVIDIA force_release */
-    uint64_t            addrs[1];       /* Bus addresses */
+    /* Flexible array: create_descriptor() allocates n_addrs entries.
+     * Declaring one element here makes UBSAN reject valid multi-page maps
+     * even when the allocation includes the complete address table. */
+    uint64_t            addrs[];        /* Bus addresses */
 };
 
 
