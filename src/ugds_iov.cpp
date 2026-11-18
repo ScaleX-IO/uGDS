@@ -644,7 +644,7 @@ extern "C" ssize_t uGDSReadv(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
     try {
         return do_readv_writev(fh, segs, nr_segs, file_offset, NVM_IO_READ);
     } catch (...) {
-        return -UGDS_INTERNAL_ERROR;
+        return -EIO;
     }
 }
 
@@ -654,7 +654,7 @@ extern "C" ssize_t uGDSWritev(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
     try {
         return do_readv_writev(fh, segs, nr_segs, file_offset, NVM_IO_WRITE);
     } catch (...) {
-        return -UGDS_INTERNAL_ERROR;
+        return -EIO;
     }
 }
 
