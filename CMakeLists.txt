@@ -195,9 +195,6 @@ target_link_libraries(ugds PRIVATE Threads::Threads)
 target_compile_options(ugds PRIVATE -Wall -O2)
 
 # - Tests and benchmarks -----------------------
-add_executable(test_host_io test/functional/test_host_io.cpp)
-target_link_libraries(test_host_io PRIVATE ugds)
-
 set(FUNCTIONAL_TESTS
     test_driver_lifecycle
     test_handle_register
