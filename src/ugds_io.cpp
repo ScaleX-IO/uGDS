@@ -113,6 +113,8 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         std::lock_guard<std::mutex> drv_lock(g_driver.lock);
         auto it = g_driver.buf_registry.find(bufPtr_base);
         if (it != g_driver.buf_registry.end()) {
+            if (!it->second.supports_io(hs->ctrl, static_cast<size_t>(bufPtr_offset), size))
+                return -EINVAL;
             buf_dma = it->second.dma;
             it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
         }
@@ -281,6 +283,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
 
         result = static_cast<ssize_t>(bytes_done);
 
+    out:
         /* Transfer timeout resources to the QP while we still hold
          * qp.lock.  A concurrent force teardown also acquires qp.lock
          * in cleanup_timeout_resources(), so this prevents the race
@@ -294,7 +297,6 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             buf_dma = nullptr;
         }
 
-    out:;
     }
 
     if (timed_out) {

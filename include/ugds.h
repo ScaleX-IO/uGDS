@@ -68,6 +68,7 @@ typedef enum uGDSOpError {
     UGDS_RDMA_MR_STILL_ACTIVE        = UGDS_BASE_ERR + 41,
     UGDS_BUSY                        = UGDS_BASE_ERR + 42,
     UGDS_OUT_OF_MEMORY               = UGDS_BASE_ERR + 43,
+    UGDS_HOST_MEMORY_PINNING_FAILED  = UGDS_BASE_ERR + 44,
 } uGDSOpError;
 
 static inline const char* uGDS_status_error(uGDSOpError status) {
@@ -88,6 +89,7 @@ static inline const char* uGDS_status_error(uGDSOpError status) {
     case UGDS_HANDLE_NOT_REGISTERED:       return "handle not registered";
     case UGDS_INTERNAL_ERROR:              return "internal error";
     case UGDS_GPU_MEMORY_PINNING_FAILED:   return "GPU memory pinning failed";
+    case UGDS_HOST_MEMORY_PINNING_FAILED:  return "host memory pinning failed";
     case UGDS_BATCH_CAPACITY_EXCEEDED:     return "batch capacity exceeded";
 
     case UGDS_BUSY:                        return "resource busy, retry";
@@ -144,7 +146,15 @@ void uGDSHandleDeregister(uGDSHandle_t fh);
  * after a controller reset). */
 uGDSError_t uGDSHandleDeregisterEx(uGDSHandle_t fh, int timeout_sec);
 
+/* Register with the default controller selected by uGDSHandleRegister.
+ * For UGDS_REGISTER_HOST, use writable, system-page-aligned memory and
+ * keep it allocated until deregistration succeeds. Host buffers support
+ * synchronous and batch I/O on the controller that registered them.
+ * Buffer offsets must be page-aligned and I/O must fit within length. */
 uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, int flags);
+
+/* Host DMA registration; mutually exclusive with GPU registration flags. */
+#define UGDS_REGISTER_HOST    0x8
 
 /* Flag for uGDSBufRegister: use AMD HIP/dma-buf path */
 #define UGDS_REGISTER_DMABUF  NVM_MAP_DMABUF
@@ -233,6 +243,7 @@ typedef enum uGDSBatchStatus {
 } uGDSBatchStatus_t;
 
 typedef struct uGDSIOParams {
+    /* Base of a registered host or GPU buffer. */
     void*           devPtr_base;
     off_t           file_offset;
     off_t           devPtr_offset;

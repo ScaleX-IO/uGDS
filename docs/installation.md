@@ -2,6 +2,9 @@
 
 ## Prerequisites
 
+The CUDA and HIP configurations below also include host DRAM direct I/O.
+One installation can serve GPU and host buffers on the same NVMe handle.
+
 ### NVIDIA CUDA Backend
 
 | Dependency | Version | Notes |
@@ -69,8 +72,7 @@ For **dmabuf-export** buffers (registered with `uGDSBufRegisterEx()` using `UGDS
 **CUDA dma-buf:** The userspace CMake auto-detects CUDA dma-buf support (`HAVE_CUDA_DMABUF`). When enabled, the kernel module must also be built with the same flag:
 
 ```bash
-cd drv
-make BUILD_CUDA=1 HAVE_CUDA_DMABUF=1
+make -C drv BUILD_CUDA=1 HAVE_CUDA_DMABUF=1
 ```
 
 Without this flag, the kernel module will not include the `NVM_MAP_DMABUF_MEMORY` ioctl handler, and `uGDSBufRegisterEx()` with `UGDS_BACKEND_CUDA` for fd export will fail with `UGDS_IO_NOT_SUPPORTED`. Standard CUDA NVMe I/O (`uGDSRead`/`uGDSWrite`) does not require this flag.
@@ -79,13 +81,14 @@ Without this flag, the kernel module will not include the `NVM_MAP_DMABUF_MEMORY
 
 ## Step 1: Build the Kernel Module
 
-The kernel module (`ugds_drv.ko`) provides PCI BAR mapping and GPU page pinning for user-space NVMe access.
+The kernel module (`ugds_drv.ko`) provides PCI BAR mapping and DMA mappings for
+user-space NVMe access. Every build includes host DRAM mapping. The CUDA and HIP
+build options add GPU memory mapping for the selected backend.
 
 ### NVIDIA CUDA Backend (default)
 
 ```bash
-cd drv
-make
+make -C drv
 ```
 
 The Makefile auto-detects:
@@ -95,14 +98,13 @@ The Makefile auto-detects:
 If auto-detection fails, specify manually:
 
 ```bash
-make KERNEL=/path/to/kernel/build NVIDIA_DIR=/usr/src/nvidia-550.54.14
+make -C drv KERNEL=/path/to/kernel/build NVIDIA_DIR=/usr/src/nvidia-550.54.14
 ```
 
 ### AMD Infinity Storage (HIP) Backend
 
 ```bash
-cd drv
-make BUILD_HIP=1 BUILD_CUDA=0
+make -C drv BUILD_HIP=1 BUILD_CUDA=0
 ```
 
 No NVIDIA driver headers needed -- the HIP path uses standard Linux DMA-buf framework. Kernel headers (`/lib/modules/$(uname -r)/build`) are still required.
@@ -140,17 +142,15 @@ scripts/env_switch.sh status
 ### NVIDIA CUDA (default)
 
 ```bash
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+cmake -S . -B build
+cmake --build build -j "$(nproc)"
 ```
 
 ### AMD HIP/ROCm
 
 ```bash
-mkdir build && cd build
-cmake .. -DUGDS_BACKEND_CUDA=OFF -DUGDS_BACKEND_HIP=ON
-make -j$(nproc)
+cmake -S . -B build -DUGDS_BACKEND_CUDA=OFF -DUGDS_BACKEND_HIP=ON
+cmake --build build -j "$(nproc)"
 ```
 
 Build outputs:
@@ -174,8 +174,8 @@ Build outputs:
 To compare uGDS against NVIDIA GDS on the same hardware:
 
 ```bash
-cmake .. -DCUFILE_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcufile.so
-make -j$(nproc)
+cmake -S . -B build -DCUFILE_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcufile.so
+cmake --build build -j "$(nproc)"
 ```
 
 This builds `bench_gds` alongside `bench_ugds` for direct performance comparison.
@@ -186,9 +186,17 @@ Run the functional test suite:
 
 ```bash
 for t in build/test_*; do
+    case "${t##*/}" in test_host_gpu_sync*) continue ;; esac
     echo "=== $(basename $t) ==="
     $t /dev/ugds_drv0 0
 done
+```
+
+The mixed CUDA and DRAM test takes a separate scratch byte offset. Use a
+writable range on the designated NVMe test device:
+
+```bash
+build/test_host_gpu_sync /dev/ugds_drv0 "$scratch_offset" 0
 ```
 
 Run a quick performance check:
@@ -200,6 +208,22 @@ Run a quick performance check:
 # 16-thread 64KB read
 ./build/bench_ugds -f /dev/ugds_drv0 -l 256M -s 64K -t 16 -d 0 -m read
 ```
+
+## Use Host DRAM Direct I/O
+
+The standard CUDA and HIP builds support GPU and host I/O in the same
+program. Register the NVMe handle first. Allocate writable, system-page-aligned
+memory with `posix_memalign` or `mmap`, then register it with
+`uGDSBufRegister(host_buf, length, UGDS_REGISTER_HOST)`. Register GPU buffers
+with their usual GPU flags.
+
+Use the registered base with `uGDSRead`, `uGDSWrite`, or `uGDSBatchIOSubmit`.
+Both buffer types can run independently, use separate synchronous threads, or
+share a batch. Host buffer offsets must be page-aligned, sizes and namespace
+byte offsets must be LBA-aligned, and each request must fit within the registered
+byte length. Wait for completion before reusing the affected range. Keep the
+allocation alive until `uGDSBufDeregister` succeeds. GPU stream I/O requires a
+GPU buffer.
 
 ## Environment Switching
 

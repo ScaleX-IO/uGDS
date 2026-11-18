@@ -284,7 +284,9 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
         {
             std::lock_guard<std::mutex> drv_lock(g_driver.lock);
             auto it = g_driver.buf_registry.find(entry.devPtr_base);
-            if (it != g_driver.buf_registry.end()) {
+            if (it != g_driver.buf_registry.end() &&
+                it->second.supports_io(hs->ctrl, static_cast<size_t>(entry.devPtr_offset),
+                                       entry.size)) {
                 buf_dma = it->second.dma;
                 /* Hold in-flight reference until batch completions are drained
                  * or destroy finishes. Prevents Deregister from unmapping
