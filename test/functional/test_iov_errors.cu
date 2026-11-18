@@ -50,9 +50,11 @@ int main(int argc, char** argv) {
         if (ret != -EINVAL) TEST_FAIL("misaligned offset: %zd", ret);
     }
 
-    /* 4. Segment size not block-multiple rejection. */
+    /* 4. Segment size not block-multiple rejection.  Use a size that is
+     * unaligned under any LBA format (512B or 4K); a seg_size-512 style
+     * tweak only misaligns on 4K-LBA devices. */
     {
-        uGDSIoSegment_t odd = { d_buf, 0, seg_size - 512 };
+        uGDSIoSegment_t odd = { d_buf, 0, seg_size - 1 };
         ssize_t ret = uGDSReadv(fh, &odd, 1, 0);
         if (ret != -EINVAL) TEST_FAIL("odd size: %zd", ret);
     }
@@ -64,14 +66,17 @@ int main(int argc, char** argv) {
         if (ret != -EINVAL) TEST_FAIL("past-end offset: %zd", ret);
     }
 
-    /* 6. Batch vectored preflight: one bad entry fails as a terminal
-     * FAILED event with -EINVAL, not a submit error. */
+    /* 6. Batch vectored preflight: an entry whose values are well-formed
+     * and aligned but outside the registered buffer range fails as a
+     * terminal FAILED event with -EINVAL, not a submit error.  (A
+     * misaligned segment offset is a value error and is rejected at
+     * submit, matching the plain uGDSBatchIOSubmit contract.) */
     {
         uGDSBatchHandle_t batch = nullptr;
         st = uGDSBatchIOSetUp(&batch, fh, 4);
         ASSERT_OK(st, "BatchIOSetUp");
 
-        uGDSIoSegment_t bad_seg = { d_buf, 1, seg_size };  /* misaligned */
+        uGDSIoSegment_t bad_seg = { d_buf, alloc_size, seg_size };  /* past end */
         uGDSIOSegParams_t iocb;
         memset(&iocb, 0, sizeof(iocb));
         iocb.segs = &bad_seg;
