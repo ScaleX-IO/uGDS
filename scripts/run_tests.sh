@@ -175,6 +175,8 @@ run_functional() {
         test_dmabuf_export
         test_iov_basic
         test_iov_batch
+        test_iov_async
+        test_iov_errors
     )
 
     # RDMA tests (only if built)
