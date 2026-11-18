@@ -150,6 +150,7 @@ set(UGDS_SOURCES
     src/ugds_handle.cpp
     src/ugds_buf.cpp
     src/ugds_io.cpp
+    src/ugds_iov.cpp
     src/ugds_batch.cpp
     src/ugds_async.cpp
     src/ugds_rdma.cpp
@@ -224,6 +225,10 @@ set(FUNCTIONAL_TESTS
     test_cq_dw11
     test_interrupt_mode
     test_dmabuf_export
+    test_iov_basic
+    test_iov_batch
+    test_iov_async
+    test_iov_errors
 )
 
 # RDMA/dmabuf tests -- only built/run when RDMA is enabled
@@ -303,6 +308,20 @@ if(UGDS_BACKEND_CUDA)
             )
             target_link_libraries(bench_overlap${CUDA_SUFFIX} ugds CUDA::cudart)
             set_target_properties(bench_overlap${CUDA_SUFFIX} PROPERTIES
+                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+                BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+            )
+        endif()
+
+        # bench_iov: scalar vs vectored (scatter-gather) comparison
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_iov.cu)
+            add_executable(bench_iov${CUDA_SUFFIX} test/perf/bench_iov.cu)
+            target_include_directories(bench_iov${CUDA_SUFFIX} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+            )
+            target_link_libraries(bench_iov${CUDA_SUFFIX} ugds CUDA::cudart)
+            set_target_properties(bench_iov${CUDA_SUFFIX} PROPERTIES
                 CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
                 BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
             )
@@ -438,6 +457,30 @@ if(UGDS_BACKEND_HIP)
             HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )
+
+        # bench_iov (HIP): scalar vs vectored comparison
+        set(iov_src_orig ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_iov.cu)
+        if(EXISTS ${iov_src_orig})
+            if(UGDS_BACKEND_CUDA)
+                set(iov_src ${CMAKE_CURRENT_BINARY_DIR}/bench_iov.hip.cu)
+                configure_file(${iov_src_orig} ${iov_src} COPYONLY)
+                set_source_files_properties(${iov_src} PROPERTIES LANGUAGE HIP)
+            else()
+                set(iov_src ${iov_src_orig})
+                set_source_files_properties(${iov_src} PROPERTIES LANGUAGE HIP)
+            endif()
+            add_executable(bench_iov${HIP_SUFFIX} ${iov_src})
+            target_include_directories(bench_iov${HIP_SUFFIX} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+            )
+            target_link_libraries(bench_iov${HIP_SUFFIX} ugds ${UGDS_HIP_LIBS})
+            target_compile_definitions(bench_iov${HIP_SUFFIX} PRIVATE __HIP_PLATFORM_AMD__)
+            set_target_properties(bench_iov${HIP_SUFFIX} PROPERTIES
+                HIP_ARCHITECTURES "${UGDS_HIP_ARCHITECTURES}"
+                BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+            )
+        endif()
     else()
         message(WARNING "HIP compiler not found, HIP tests will not be built")
     endif()
