@@ -72,8 +72,7 @@ For **dmabuf-export** buffers (registered with `uGDSBufRegisterEx()` using `UGDS
 **CUDA dma-buf:** The userspace CMake auto-detects CUDA dma-buf support (`HAVE_CUDA_DMABUF`). When enabled, the kernel module must also be built with the same flag:
 
 ```bash
-cd drv
-make BUILD_CUDA=1 HAVE_CUDA_DMABUF=1
+make -C drv BUILD_CUDA=1 HAVE_CUDA_DMABUF=1
 ```
 
 Without this flag, the kernel module will not include the `NVM_MAP_DMABUF_MEMORY` ioctl handler, and `uGDSBufRegisterEx()` with `UGDS_BACKEND_CUDA` for fd export will fail with `UGDS_IO_NOT_SUPPORTED`. Standard CUDA NVMe I/O (`uGDSRead`/`uGDSWrite`) does not require this flag.
@@ -89,8 +88,7 @@ build options add GPU memory mapping for the selected backend.
 ### NVIDIA CUDA Backend (default)
 
 ```bash
-cd drv
-make
+make -C drv
 ```
 
 The Makefile auto-detects:
@@ -100,14 +98,13 @@ The Makefile auto-detects:
 If auto-detection fails, specify manually:
 
 ```bash
-make KERNEL=/path/to/kernel/build NVIDIA_DIR=/usr/src/nvidia-550.54.14
+make -C drv KERNEL=/path/to/kernel/build NVIDIA_DIR=/usr/src/nvidia-550.54.14
 ```
 
 ### AMD Infinity Storage (HIP) Backend
 
 ```bash
-cd drv
-make BUILD_HIP=1 BUILD_CUDA=0
+make -C drv BUILD_HIP=1 BUILD_CUDA=0
 ```
 
 No NVIDIA driver headers needed -- the HIP path uses standard Linux DMA-buf framework. Kernel headers (`/lib/modules/$(uname -r)/build`) are still required.
@@ -145,17 +142,15 @@ scripts/env_switch.sh status
 ### NVIDIA CUDA (default)
 
 ```bash
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+cmake -S . -B build
+cmake --build build -j "$(nproc)"
 ```
 
 ### AMD HIP/ROCm
 
 ```bash
-mkdir build && cd build
-cmake .. -DUGDS_BACKEND_CUDA=OFF -DUGDS_BACKEND_HIP=ON
-make -j$(nproc)
+cmake -S . -B build -DUGDS_BACKEND_CUDA=OFF -DUGDS_BACKEND_HIP=ON
+cmake --build build -j "$(nproc)"
 ```
 
 Build outputs:
@@ -179,8 +174,8 @@ Build outputs:
 To compare uGDS against NVIDIA GDS on the same hardware:
 
 ```bash
-cmake .. -DCUFILE_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcufile.so
-make -j$(nproc)
+cmake -S . -B build -DCUFILE_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcufile.so
+cmake --build build -j "$(nproc)"
 ```
 
 This builds `bench_gds` alongside `bench_ugds` for direct performance comparison.
@@ -229,18 +224,6 @@ byte offsets must be LBA-aligned, and each request must fit within the registere
 byte length. Wait for completion before reusing the affected range. Keep the
 allocation alive until `uGDSBufDeregister` succeeds. GPU stream I/O requires a
 GPU buffer.
-
-### Optional Build for Machines Without a GPU SDK
-
-Both GPU backends can be disabled on machines that only need host DRAM I/O.
-This configuration requires Linux kernel headers, a C++17 toolchain, and
-CMake 3.18 or newer.
-
-```bash
-make -C drv BUILD_CUDA=0 BUILD_HIP=0
-cmake -S . -B build-host -DUGDS_BACKEND_CUDA=OFF -DUGDS_BACKEND_HIP=OFF
-cmake --build build-host
-```
 
 ## Environment Switching
 
