@@ -173,6 +173,8 @@ run_functional() {
         test_interrupt_ioctls
         test_interrupt_mode
         test_dmabuf_export
+        test_iov_basic
+        test_iov_batch
     )
 
     # RDMA tests (only if built)
