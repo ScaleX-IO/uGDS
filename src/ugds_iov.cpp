@@ -649,3 +649,36 @@ extern "C" ssize_t uGDSWritev(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
 {
     return do_readv_writev(fh, segs, nr_segs, file_offset, NVM_IO_WRITE);
 }
+
+/* Phase 2/3 stubs: declared in the public header so the API surface is
+ * visible to consumers, but return UGDS_IO_NOT_SUPPORTED until their
+ * implementations land.  This keeps the library linkable without
+ * undefined-reference errors. */
+
+extern "C" uGDSError_t uGDSBatchIOSubmitv(uGDSBatchHandle_t /*batch*/,
+                                            unsigned /*nr*/,
+                                            uGDSIOSegParams_t* /*iocb*/,
+                                            unsigned /*flags*/)
+{
+    return uGDSError_t{UGDS_IO_NOT_SUPPORTED, 0};
+}
+
+extern "C" uGDSError_t uGDSReadvAsync(uGDSHandle_t /*fh*/,
+                                        uGDSIoSegment_t* /*segs*/,
+                                        unsigned /*nr_segs*/,
+                                        off_t* /*file_offset_p*/,
+                                        ssize_t* /*bytes_read_p*/,
+                                        void* /*stream*/)
+{
+    return uGDSError_t{UGDS_IO_NOT_SUPPORTED, 0};
+}
+
+extern "C" uGDSError_t uGDSWritevAsync(uGDSHandle_t /*fh*/,
+                                         uGDSIoSegment_t* /*segs*/,
+                                         unsigned /*nr_segs*/,
+                                         off_t* /*file_offset_p*/,
+                                         ssize_t* /*bytes_written_p*/,
+                                         void* /*stream*/)
+{
+    return uGDSError_t{UGDS_IO_NOT_SUPPORTED, 0};
+}
