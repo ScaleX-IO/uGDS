@@ -28,6 +28,9 @@
 #include <asm/io.h>
 #include <asm/errno.h>
 #include <asm/page.h>
+#if defined(UGDS_HAVE_DMABUF) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+#include <linux/dma-buf.h>
+#endif
 
 #define DRIVER_NAME         "ugds_drv"
 #define PCI_CLASS_NVME      0x010802
@@ -37,11 +40,7 @@
 MODULE_DESCRIPTION("UserSpace-GDS NVMe DMA helper");
 MODULE_LICENSE("Dual BSD/GPL");
 #if defined(UGDS_HAVE_DMABUF) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("DMA_BUF");
-#else
-MODULE_IMPORT_NS(DMA_BUF);
-#endif
 #endif
 MODULE_VERSION("1.0");
 
