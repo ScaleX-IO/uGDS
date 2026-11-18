@@ -622,12 +622,10 @@ static uGDSError_t async_validate_v(uGDSHandle_t fh,
     return UGDS_OK;
 }
 
-/* ---- async_iov_execute (section 6.3, callback body) ----
- * Must be effectively noexcept: the caller (async_iov_callback) is a
- * full exception boundary.  All work here is infallible except for
- * do_iov_engine, which is noexcept-by-contract (the engine's only
- * allocation-free path is the streaming cursor). */
-static void async_iov_execute(AsyncRequest* req) noexcept
+/* ---- async_iov_execute (callback body) ----
+ * Potentially throwing: do_iov_engine acquires std::mutex and may throw.
+ * The caller (async_iov_callback) is the noexcept exception boundary. */
+static void async_iov_execute(AsyncRequest* req)
 {
     /* 1. Late-bind offset/size from user_segs and file_offset_p.  These
      *    reads race with the producer only if the caller violates the
@@ -719,10 +717,10 @@ static void async_iov_callback(void* userData) noexcept
     try {
         async_iov_execute(req);
     } catch (...) {
-        /* Last-resort guard: async_iov_execute is noexcept-by-contract
-         * but the language does not enforce it.  Park the failure and
-         * free the request so the caller's bytes_done_p is writable
-         * exactly once. */
+        /* Real catch boundary: async_iov_execute is NOT noexcept,
+         * so exceptions from do_iov_engine or mutex acquisition
+         * arrive here. Park the failure and free the request so
+         * the caller's bytes_done_p is writable exactly once. */
         if (req->bytes_done_p != nullptr)
             *req->bytes_done_p = -EIO;
         if (req->hs_sp)
@@ -798,6 +796,12 @@ static uGDSError_t do_readv_writev_async(uGDSHandle_t fh,
      * deterministic value to the caller. */
     *bytes_done_p = 0;
 
+    /* Validate base pointers before any allocation. */
+    for (unsigned i = 0; i < nr_segs; ++i) {
+        if (segs[i].base == nullptr)
+            return make_error(UGDS_INVALID_VALUE);
+    }
+
     /* Allocate the request and its resolved[] storage BEFORE acquiring
      * any reference, so that allocation failure cannot strand an
      * in_flight or handle_in_flight counter.  resolved[] uses the
@@ -815,13 +819,15 @@ static uGDSError_t do_readv_writev_async(uGDSHandle_t fh,
 
     if (nr_segs <= 4) {
         req->resolved = req->inline_resolved;
+        /* resolved_owns_heap stays false (default). */
     } else {
         SegView* heap = new (std::nothrow) SegView[nr_segs];
         if (heap == nullptr) {
-            delete req;
+            delete req;  /* ~AsyncRequest frees heap[] if owned */
             return make_error(UGDS_OUT_OF_MEMORY);
         }
         req->resolved = heap;
+        req->resolved_owns_heap = true;  /* destructor owns it */
     }
 
     /* async_validate_v acquires in-flight refs + handle ref, fills
@@ -832,10 +838,8 @@ static uGDSError_t do_readv_writev_async(uGDSHandle_t fh,
                                       &req->owner, &req->hs_sp,
                                       &list_backend, &mixed);
     if (st.err != UGDS_SUCCESS) {
-        /* No refs acquired, no handle ref held.  Free the request and
-         * its heap storage (if any). */
-        if (req->resolved != req->inline_resolved)
-            delete[] req->resolved;
+        /* No refs acquired, no handle ref held.  Free the request; the
+         * destructor frees heap resolved[] if any. */
         delete req;
         return st;
     }
@@ -848,11 +852,10 @@ static uGDSError_t do_readv_writev_async(uGDSHandle_t fh,
                                                     stream_backend,
                                                     &launch_backend);
     if (lberr.err != UGDS_SUCCESS) {
-        /* Reject at enqueue: release refs + handle ref, then free. */
+        /* Reject at enqueue: release refs + handle ref, then free.
+         * The destructor frees heap resolved[] if owned. */
         req->owner.release();  /* idempotent: decrements in_flight */
         handle_release(req->hs_sp.get());
-        if (req->resolved != req->inline_resolved)
-            delete[] req->resolved;
         delete req;
         return lberr;
     }
@@ -863,10 +866,9 @@ static uGDSError_t do_readv_writev_async(uGDSHandle_t fh,
      * acquired and free the request. */
     uGDSError_t lc = iov_launch_host_func(stream, req);
     if (lc.err != UGDS_SUCCESS) {
+        /* The destructor frees heap resolved[] if owned. */
         req->owner.release();
         handle_release(req->hs_sp.get());
-        if (req->resolved != req->inline_resolved)
-            delete[] req->resolved;
         delete req;
         return lc;
     }
@@ -878,14 +880,26 @@ extern "C" uGDSError_t uGDSReadvAsync(uGDSHandle_t fh, uGDSIoSegment_t* segs,
                                         unsigned nr_segs, off_t* file_offset_p,
                                         ssize_t* bytes_read_p, void* stream)
 {
-    return do_readv_writev_async(fh, segs, nr_segs, file_offset_p,
-                                 bytes_read_p, stream, NVM_IO_READ);
+    try {
+        return do_readv_writev_async(fh, segs, nr_segs, file_offset_p,
+                                     bytes_read_p, stream, NVM_IO_READ);
+    } catch (const std::bad_alloc&) {
+        return make_error(UGDS_OUT_OF_MEMORY);
+    } catch (...) {
+        return make_error(UGDS_INTERNAL_ERROR);
+    }
 }
 
 extern "C" uGDSError_t uGDSWritevAsync(uGDSHandle_t fh, uGDSIoSegment_t* segs,
                                          unsigned nr_segs, off_t* file_offset_p,
                                          ssize_t* bytes_written_p, void* stream)
 {
-    return do_readv_writev_async(fh, segs, nr_segs, file_offset_p,
-                                 bytes_written_p, stream, NVM_IO_WRITE);
+    try {
+        return do_readv_writev_async(fh, segs, nr_segs, file_offset_p,
+                                     bytes_written_p, stream, NVM_IO_WRITE);
+    } catch (const std::bad_alloc&) {
+        return make_error(UGDS_OUT_OF_MEMORY);
+    } catch (...) {
+        return make_error(UGDS_INTERNAL_ERROR);
+    }
 }
