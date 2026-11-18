@@ -12,6 +12,10 @@ extern "C" uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, i
         return make_error(UGDS_INVALID_VALUE);
     }
 
+    const bool host = (flags & UGDS_REGISTER_HOST) != 0;
+    if (host && flags != UGDS_REGISTER_HOST)
+        return make_error(UGDS_INVALID_VALUE);
+
     std::lock_guard<std::mutex> guard(g_driver.lock);
 
     if (g_driver.buf_registry.find(bufPtr_base) != g_driver.buf_registry.end()) {
@@ -22,19 +26,30 @@ extern "C" uGDSError_t uGDSBufRegister(const void* bufPtr_base, size_t length, i
         return make_error(UGDS_DRIVER_NOT_INITIALIZED);
     }
 
+    const nvm_ctrl_t* ctrl = g_driver.default_ctrl;
     nvm_dma_t* dma = nullptr;
-    int status = nvm_dma_map_device_ex(&dma, g_driver.default_ctrl,
-                                       const_cast<void*>(bufPtr_base), length,
-                                       flags);
+    int status;
+    if (host) {
+        status = nvm_dma_map_host(&dma, ctrl, const_cast<void*>(bufPtr_base), length);
+        if (status == EINVAL || status == EOVERFLOW)
+            return make_error(UGDS_INVALID_VALUE);
+    } else {
+        status = nvm_dma_map_device_ex(&dma, ctrl, const_cast<void*>(bufPtr_base), length, flags);
+    }
     if (status != 0 || dma == nullptr) {
         if (status == ENOTSUP || status == EOPNOTSUPP)
             return make_error(UGDS_IO_NOT_SUPPORTED);
-        return make_error(UGDS_GPU_MEMORY_PINNING_FAILED);
+        return make_error(host ? UGDS_HOST_MEMORY_PINNING_FAILED : UGDS_GPU_MEMORY_PINNING_FAILED);
     }
 
-    g_driver.buf_registry[bufPtr_base].dma = dma;
-    g_driver.buf_registry[bufPtr_base].backend =
-        nvm_dma_is_hip_origin(dma) ? UGDS_BACKEND_HIP : UGDS_BACKEND_CUDA;
+    auto& entry = g_driver.buf_registry[bufPtr_base];
+    entry.dma = dma;
+    if (host) {
+        entry.host_ctrl = ctrl;
+        entry.host_length = length;
+    } else {
+        entry.backend = nvm_dma_is_hip_origin(dma) ? UGDS_BACKEND_HIP : UGDS_BACKEND_CUDA;
+    }
     return UGDS_OK;
 }
 

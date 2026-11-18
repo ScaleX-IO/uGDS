@@ -172,14 +172,16 @@ static void release_user_pages(struct map* map)
     pages = (struct page**) map->data;
     if (pages != NULL)
     {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+        unpin_user_pages_dirty_lock(pages, map->n_addrs, map->n_dma_mapped == map->n_addrs);
+#else
         for (i = 0; i < map->n_addrs; ++i)
         {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-            unpin_user_page(pages[i]);
-#else
+            if (map->n_dma_mapped == map->n_addrs)
+                set_page_dirty_lock(pages[i]);
             put_page(pages[i]);
-#endif
         }
+#endif
     }
 
     kvfree(map->data);
@@ -219,7 +221,7 @@ static long map_user_pages(struct map* map)
     {
         kvfree(pages);
         printk(KERN_ERR "get_user_pages() failed: %ld\n", retval);
-        return retval;
+        return retval ? retval : -EFAULT;
     }
 
     if (map->n_addrs != retval)
@@ -254,9 +256,13 @@ static long map_user_pages(struct map* map)
             printk(KERN_ERR "Failed to map page for some reason\n");
             /* n_dma_mapped tracks how many were successfully mapped,
              * so release_user_pages only unmaps those entries. */
-            return retval;
+            return -EIO;
         }
         map->n_dma_mapped++;
+        /* Userspace accesses the pages between completions without
+         * a kernel DMA sync per I/O. Bounce mappings also need sync. */
+        if (dma_need_sync(dev, map->addrs[i]))
+            return -EOPNOTSUPP;
     }
 
     return 0;

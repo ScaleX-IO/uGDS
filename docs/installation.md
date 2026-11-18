@@ -2,6 +2,43 @@
 
 ## Prerequisites
 
+### Host DRAM
+
+Host direct I/O requires Linux kernel headers, a C++17 toolchain, and CMake 3.18 or newer.
+The host path is available in CUDA and HIP builds. For a CPU-only build, use:
+
+```bash
+make -C drv BUILD_CUDA=0 BUILD_HIP=0
+cmake -S . -B build-host -DUGDS_BACKEND_CUDA=OFF -DUGDS_BACKEND_HIP=OFF
+cmake --build build-host
+```
+
+Register the NVMe handle first. Allocate writable, system-page-aligned memory
+with `posix_memalign` or `mmap`, then register it with
+`uGDSBufRegister(host_buf, length, UGDS_REGISTER_HOST)`. The flag is exclusive of
+GPU registration flags. The NVMe controller must support direct access to the
+mapped pages without a bounce buffer or per-transfer cache synchronization.
+
+Use the registered base with `uGDSRead`, `uGDSWrite`, or `uGDSBatchIOSubmit`.
+Buffer offsets must be page-aligned. Sizes and namespace byte offsets must be
+LBA-aligned, and each request must fit within the registered byte length.
+Wait for synchronous completion or drain batch results before reusing the
+affected range. Keep the allocation alive until `uGDSBufDeregister` succeeds.
+
+A CUDA or HIP program can use the same handle for a GPU buffer registered with
+its existing GPU flags and a DRAM buffer registered with `UGDS_REGISTER_HOST`.
+Use either buffer independently, submit synchronous calls from separate
+threads, or mix them in a batch. Host buffers are unsupported by the
+GPU stream I/O APIs.
+
+The functional test binaries require an explicit writable scratch byte offset
+on the designated test device:
+
+```bash
+build-host/test_host_io /dev/ugds_drv0 "$scratch_offset"
+build/test_host_gpu_sync /dev/ugds_drv0 "$scratch_offset" 0
+```
+
 ### NVIDIA CUDA Backend
 
 | Dependency | Version | Notes |

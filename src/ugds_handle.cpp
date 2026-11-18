@@ -97,7 +97,7 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
 
     const size_t page_size = hs->ctrl->page_size;
 
-    if (posix_memalign(&hs->aq_buf, 4096, page_size * 3) != 0) {
+    if (posix_memalign(&hs->aq_buf, page_size, page_size * 3) != 0) {
         nvm_ctrl_free(hs->ctrl);
         return make_error(UGDS_INTERNAL_ERROR);
     }
@@ -192,7 +192,7 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         auto qp = std::make_unique<IOQueuePair>();
 
         // CQ
-        if (posix_memalign(&qp->cq_buf, 4096, page_size) != 0)
+        if (posix_memalign(&qp->cq_buf, page_size, page_size) != 0)
             goto fail;
         std::memset(qp->cq_buf, 0, page_size);
         status = nvm_dma_map_host(&qp->cq_dma, hs->ctrl, qp->cq_buf, page_size);
@@ -223,7 +223,7 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         }
 
         // SQ
-        if (posix_memalign(&qp->sq_buf, 4096, page_size) != 0) goto fail;
+        if (posix_memalign(&qp->sq_buf, page_size, page_size) != 0) goto fail;
         std::memset(qp->sq_buf, 0, page_size);
         status = nvm_dma_map_host(&qp->sq_dma, hs->ctrl, qp->sq_buf, page_size);
         if (!nvm_ok(status)) goto fail;
@@ -236,7 +236,7 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         }
 
         // PRP list page
-        if (posix_memalign(&qp->prp_buf, 4096, page_size) != 0) goto fail;
+        if (posix_memalign(&qp->prp_buf, page_size, page_size) != 0) goto fail;
         std::memset(qp->prp_buf, 0, page_size);
         status = nvm_dma_map_host(&qp->prp_dma, hs->ctrl, qp->prp_buf, page_size);
         if (!nvm_ok(status)) goto fail;
@@ -312,7 +312,7 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         }
 
         // PRP list page for batch QP (regular 4KB page is fine)
-        if (posix_memalign(&bqp->qp.prp_buf, 4096, page_size) != 0)
+        if (posix_memalign(&bqp->qp.prp_buf, page_size, page_size) != 0)
             goto batch_fail;
         std::memset(bqp->qp.prp_buf, 0, page_size);
         status = nvm_dma_map_host(&bqp->qp.prp_dma, hs->ctrl,

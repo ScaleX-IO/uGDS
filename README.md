@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  uGDS is the first production-oriented user-space GPU Direct Storage library where the CPU constructs NVMe commands and the SSD DMAs data directly to/from GPU memory over PCIe, bypassing the kernel NVMe driver. With a GDS-compatible API, uGDS achieves up to 30.69x higher bandwidth and 51.9% lower 4KB latency (37.56μs vs 78.01μs) compared to NVIDIA GDS.
+  uGDS is a production-oriented user-space Direct Storage library where the CPU constructs NVMe commands and the SSD DMAs data directly to/from GPU or host memory over PCIe, bypassing the kernel NVMe driver. With a GDS-compatible API, uGDS achieves up to 30.69x higher bandwidth and 51.9% lower 4KB latency (37.56μs vs 78.01μs) compared to NVIDIA GDS.
 </p>
 
 ---

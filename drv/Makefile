@@ -6,6 +6,7 @@ export NVIDIA_DIR
 #   BUILD_HIP=1              -> AMD HIP backend (DMA-buf)
 #   BUILD_CUDA=1             -> NVIDIA CUDA backend (requires NVIDIA_DIR)
 #   BUILD_CUDA=0             -> explicitly disable CUDA (even if NVIDIA_DIR found)
+#   BUILD_CUDA=0 BUILD_HIP=0 -> DRAM-only build
 #   BUILD_HIP=1 BUILD_CUDA=1 -> Dual backend
 # Default: auto-detect NVIDIA_DIR for CUDA, no HIP unless BUILD_HIP=1
 ifeq ($(BUILD_HIP),1)
@@ -35,7 +36,6 @@ ifneq ($(KERNELRELEASE),)
 	# BUILD_CUDA: 1 = force enable, 0 = force disable, unset = auto (if NVIDIA_DIR found)
  ifneq ($(BUILD_CUDA),0)
   ifneq ($(strip $(NVIDIA_DIR)),)
-	ENABLE_CUDA := 1
 	ccflags-y += -D_CUDA -I$(NVIDIA_DIR)/nvidia
 	KBUILD_EXTRA_SYMBOLS += $(NVIDIA_DIR)/Module.symvers
   else
@@ -43,13 +43,6 @@ ifneq ($(KERNELRELEASE),)
 	$(error BUILD_CUDA=1 but NVIDIA_DIR not found. Install NVIDIA driver source or set NVIDIA_DIR=<path>)
   endif
   endif
- endif
-
-	# Error if neither backend is selected
- ifndef ENABLE_CUDA
- ifneq ($(BUILD_HIP),1)
-	$(error No GPU backend selected. Set BUILD_HIP=1 for AMD HIP, or install NVIDIA driver source for CUDA)
- endif
  endif
 
 	# dmabuf backend available when HIP is enabled, or when CUDA

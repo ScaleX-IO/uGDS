@@ -100,9 +100,16 @@ struct DriverState {
      * in_flight counts active IO references to prevent use-after-free
      * during concurrent Deregister. */
     struct BufEntry {
-        nvm_dma_t*           dma;
-        uGDSBackend_t        backend;
+        nvm_dma_t*           dma = nullptr;
+        uGDSBackend_t        backend = UGDS_BACKEND_DEFAULT;
+        const nvm_ctrl_t*    host_ctrl = nullptr;
+        size_t               host_length = 0;
         std::atomic<uint32_t> in_flight{0};
+
+        bool supports_io(const nvm_ctrl_t* ctrl, size_t offset, size_t size) const {
+            return host_ctrl == nullptr ||
+                   (host_ctrl == ctrl && offset <= host_length && size <= host_length - offset);
+        }
     };
     std::unordered_map<const void*, BufEntry>     buf_registry;
 

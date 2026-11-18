@@ -83,10 +83,6 @@ if(UGDS_BACKEND_HIP)
     endif()
 endif()
 
-if(NOT UGDS_BACKEND_CUDA AND NOT UGDS_BACKEND_HIP)
-    message(WARNING "No GPU backend selected, building library only")
-endif()
-
 # - RDMA support (optional) --------------------
 option(UGDS_ENABLE_RDMA "Enable tracked RDMA convenience API (libibverbs)" OFF)
 
@@ -199,6 +195,9 @@ target_link_libraries(ugds PRIVATE Threads::Threads)
 target_compile_options(ugds PRIVATE -Wall -O2)
 
 # - Tests and benchmarks -----------------------
+add_executable(test_host_io test/functional/test_host_io.cpp)
+target_link_libraries(test_host_io PRIVATE ugds)
+
 set(FUNCTIONAL_TESTS
     test_driver_lifecycle
     test_handle_register
@@ -247,7 +246,7 @@ if(UGDS_BACKEND_CUDA)
             set(CUDA_SUFFIX "")
         endif()
 
-        foreach(test_name ${FUNCTIONAL_TESTS})
+        foreach(test_name ${FUNCTIONAL_TESTS} test_host_gpu_sync)
             set(test_src ${CMAKE_CURRENT_SOURCE_DIR}/test/functional/${test_name}.cu)
             add_executable(${test_name}${CUDA_SUFFIX} ${test_src})
             target_include_directories(${test_name}${CUDA_SUFFIX} PRIVATE
@@ -260,6 +259,7 @@ if(UGDS_BACKEND_CUDA)
                 BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
             )
         endforeach()
+        target_link_libraries(test_host_gpu_sync${CUDA_SUFFIX} Threads::Threads)
 
         # RDMA tests (only when UGDS_ENABLE_RDMA is ON)
         if(UGDS_ENABLE_RDMA)
@@ -441,10 +441,6 @@ if(UGDS_BACKEND_HIP)
     else()
         message(WARNING "HIP compiler not found, HIP tests will not be built")
     endif()
-endif()
-
-if(NOT UGDS_BACKEND_CUDA AND NOT UGDS_BACKEND_HIP)
-    message(WARNING "No GPU backend enabled, tests will not be built")
 endif()
 
 # - RDMA Example --------------------------------

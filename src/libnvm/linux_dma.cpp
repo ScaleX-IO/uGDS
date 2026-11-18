@@ -143,11 +143,16 @@ int nvm_dma_map_host(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* vaddr, si
     struct ioctl_mapping* md = NULL;
     *handle = NULL;
 
-    size = NVM_CTRL_ALIGN(ctrl, size);
-    if (size == 0)
-    {
+    const size_t page_size = ctrl->page_size;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(vaddr);
+    if (addr == 0 || addr % page_size != 0 || size == 0)
         return EINVAL;
-    }
+    if (size > SIZE_MAX - (page_size - 1))
+        return EOVERFLOW;
+
+    size = NVM_CTRL_ALIGN(ctrl, size);
+    if (size > UINTPTR_MAX - addr)
+        return EOVERFLOW;
 
     if (_nvm_ctrl_type(ctrl) != DEVICE_TYPE_IOCTL)
     {

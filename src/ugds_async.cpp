@@ -10,7 +10,7 @@
 #define cudaError_t hipError_t
 #define cudaSuccess hipSuccess
 typedef hipStream_t cudaStream_t;
-#else
+#elif defined(_CUDA)
 #include <cuda_runtime.h>
 #endif
 #include <mutex>
@@ -25,6 +25,7 @@ static uGDSError_t async_check_stream_backend(void* stream, const void* bufPtr_b
  * or hipStream_t, which implicitly convert. Internal dispatch
  * selects the correct backend launch function at compile time. */
 
+#if defined(_CUDA) || defined(__HIP_PLATFORM_AMD__)
 static void async_io_callback(void* userData)
 {
     AsyncRequest* req = static_cast<AsyncRequest*>(userData);
@@ -69,6 +70,8 @@ static uGDSError_t async_validate(uGDSHandle_t fh, void* bufPtr_base,
     auto it = g_driver.buf_registry.find(bufPtr_base);
     if (it == g_driver.buf_registry.end())
         return make_error(UGDS_INVALID_VALUE);
+    if (it->second.host_ctrl != nullptr)
+        return make_error(UGDS_IO_NOT_SUPPORTED);
 
     /* Hold in-flight reference from enqueue until callback completes.
      * This prevents uGDSBufDeregister from unmapping the buffer
@@ -184,15 +187,6 @@ static uGDSError_t async_launch_host_func(ugsd_stream_t stream,
     return UGDS_OK;
 }
 
-#else
-/* No GPU backend: async IO not available */
-static uGDSError_t async_launch_host_func(ugsd_stream_t stream,
-                                           AsyncRequest* req, uint8_t opcode)
-{
-    (void)stream; (void)opcode;
-    delete req;
-    return make_error(UGDS_IO_NOT_SUPPORTED);
-}
 #endif
 
 static void async_release_inflight(void* bufPtr_base,
@@ -425,4 +419,33 @@ extern "C" uGDSError_t uGDSStreamDeregister(void* stream)
     return UGDS_OK;
 }
 #undef UGDS_ACTIVE_BACKEND
+#endif
+
+#else
+extern "C" uGDSError_t uGDSReadAsync(uGDSHandle_t, void*, size_t*, off_t*,
+                                      off_t*, ssize_t*, void*)
+{
+    return make_error(UGDS_IO_NOT_SUPPORTED);
+}
+
+extern "C" uGDSError_t uGDSWriteAsync(uGDSHandle_t, void*, size_t*, off_t*,
+                                       off_t*, ssize_t*, void*)
+{
+    return make_error(UGDS_IO_NOT_SUPPORTED);
+}
+
+extern "C" uGDSError_t uGDSStreamRegister(void*)
+{
+    return make_error(UGDS_IO_NOT_SUPPORTED);
+}
+
+extern "C" uGDSError_t uGDSStreamRegisterEx(void*, uGDSBackend_t)
+{
+    return make_error(UGDS_IO_NOT_SUPPORTED);
+}
+
+extern "C" uGDSError_t uGDSStreamDeregister(void*)
+{
+    return make_error(UGDS_IO_NOT_SUPPORTED);
+}
 #endif
