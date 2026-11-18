@@ -1,21 +1,36 @@
+/*
+ * Copyright (c) 2024, Guanyi Chen <felixlinker02@gmail.com>
+ * Copyright (c) 2017, Jonas Markauss <jonassm@ifi.uio.no>
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 /* uGDS SGL (scatter-gather) streaming engine and sync vectored API.
  *
- * Implements the pure streaming primitives (SglPageCursor, SglWindowCursor,
- * analytic counter), the fixed-capacity reference owner (SglRefOwner), the
- * shared windowed IO engine (do_iov_engine), and the public sync vectored
- * entry points (uGDSReadv/uGDSWritev).
+ * Public APIs implemented here:
+ *   - uGDSReadv / uGDSWritev       (sync vectored IO)
+ *
+ * Internal primitives implemented here (consumed by ugds_batch.cpp and
+ * ugds_async.cpp):
+ *   - SglRefOwner                  (fixed-capacity in-flight ref owner)
+ *   - SglWindowCursor / SglPageCursor / sgl_count_windows_analytic
+ *   - do_iov_engine                (shared streaming windowed IO engine)
+ *
+ * Implements the pure streaming primitives (SglPageCursor,
+ * SglWindowCursor, analytic counter), the fixed-capacity reference
+ * owner (SglRefOwner), the shared windowed IO engine (do_iov_engine),
+ * and the public sync vectored entry points (uGDSReadv/uGDSWritev).
  *
  * Design constraints honored here:
  *  - SglWindowCursor yields one CmdWindow at a time into caller-local
- *    storage; no array of windows is ever materialized (independent M-2).
+ *    storage; no array of windows is ever materialized.
  *  - SglRefOwner is fixed-capacity for UGDS_IOV_MAX and never allocates;
- *    it is noexcept move-only so timeout parking is a bounded array move
- *    (independent M-3, section 6.4).
+ *    it is noexcept move-only so timeout parking is a bounded array move.
  *  - HandleOpGuard owns the handle-operation reference from immediately
  *    after handle_lookup through engine return, closing the OOM-strand
- *    window (V6-M-1).
+ *    window.
  *  - Exact registered-length bounds and controller affinity are checked
- *    under g_driver.lock before the first cursor.next() (sections 5.1/5.3).
+ *    under g_driver.lock before the first cursor.next().
  */
 
 #include "ugds_internal.h"
@@ -204,6 +219,10 @@ static size_t compute_split_unit(size_t mps, size_t block_size) noexcept
     return (mps / a) * block_size;
 }
 
+/* Initialize a cursor for a resolved SegView array.  Returns false
+ * (reject) if window_cap, page_size, block_size, or nr_segs is zero.
+ * The cursor holds no storage of its own; 'segs' must outlive the
+ * cursor walk. */
 bool sgl_cursor_init(SglWindowCursor& c, const SegView* segs, uint32_t nr_segs,
                      size_t window_cap, size_t page_size, size_t block_size)
 {
@@ -355,9 +374,12 @@ bool sgl_count_windows_analytic(const uGDSIoSegment_t* segs,
 }
 
 /* ========================================================================
- * SglPageCursor (section 3.2)
+ * SglPageCursor
  * ======================================================================== */
 
+/* Initialize a page cursor for one CmdWindow.  The caller then calls
+ * sgl_page_cursor_next() exactly CmdWindow::n_pages times to walk the
+ * MPS-granular bus addresses across segment boundaries. */
 void sgl_page_cursor_init(SglPageCursor& c, const SegView* segs,
                           uint32_t first_seg, size_t first_seg_page_off,
                           uint32_t n_segs, size_t n_pages) noexcept
@@ -385,6 +407,9 @@ void sgl_page_cursor_init(SglPageCursor& c, const SegView* segs,
     (void)first_seg_page_off;
 }
 
+/* Return the current segment's ioaddr and advance the cursor across
+ * segment boundaries.  Total calls bounded by CmdWindow::n_pages.
+ * Returns 0 only on misuse (caller overran n_pages). */
 uint64_t sgl_page_cursor_next(SglPageCursor& c) noexcept
 {
     /* Walk the segment slices in order, emitting MPS-granular bus addresses.
@@ -573,23 +598,38 @@ IovEngineResult do_iov_engine(HandleState* hs, SegView* segs, uint32_t nr_segs,
 }
 
 /* ========================================================================
- * uGDSReadv / uGDSWritev (sections 1.2, 6.1, 8.1)
+ * uGDSReadv / uGDSWritev
  * ======================================================================== */
 
 /* Common validation + engine dispatch for vectored read/write.
- * opcode is NVM_IO_READ or NVM_IO_WRITE.
- * Returns total bytes or -errno. */
+ *
+ * Performs, in order:
+ *   1. Malformed-call checks (null segs, nr_segs == 0, nr_segs >
+ *      UGDS_IOV_MAX) per the value matrix.
+ *   2. handle_lookup + HandleOpGuard so every early return releases
+ *      the handle-operation reference exactly once.
+ *   3. Per-segment value validation (base/size nonzero, offset >= 0,
+ *      offset MPS-aligned, size block-multiple, overflow-safe total).
+ *   4. file_offset alignment and window_cap == 0 rejection.
+ *   5. SglRefOwner::acquire under g_driver.lock (registration +
+ *      controller affinity + exact-length bound, all-or-nothing).
+ *   6. do_iov_engine dispatch.
+ *   7. owner.release() (no-op if the engine parked it on timeout) and
+ *      handle_guard.release().
+ *
+ * 'opcode' is NVM_IO_READ or NVM_IO_WRITE.  Returns total bytes or
+ * -errno. */
 static ssize_t do_readv_writev(uGDSHandle_t fh, const uGDSIoSegment_t* segs,
                                unsigned nr_segs, off_t file_offset,
                                uint8_t opcode)
 {
-    /* --- Malformed-call checks (8.1 value rows) --- */
+    /* --- Malformed-call checks --- */
     if (segs == nullptr || nr_segs == 0)
         return -EINVAL;
     if (nr_segs > UGDS_IOV_MAX)
         return -EINVAL;
 
-    /* handle_lookup + HandleOpGuard (V6-M-1) */
+    /* handle_lookup + HandleOpGuard */
     std::shared_ptr<HandleState> hs_sp;
     HandleState* hs = handle_lookup(fh, &hs_sp);
     if (!hs)
